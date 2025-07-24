@@ -1,9 +1,10 @@
 const WebSocket = require('ws');
-// Bind to ALL interfaces so any device on LAN/WAN can connect:
-const port = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ host: '0.0.0.0', port, clientTracking: true });
 
-console.log(`[WS] Server running on ws://0.0.0.0:${port}`);
+const port = process.env.PORT; // Don't fallback to 8080 in production
+const wss = new WebSocket.Server({ port, clientTracking: true });
+
+console.log(`[WS] Server running on ws://localhost:${port}`);
+
 
 
 const clients = new Set();
