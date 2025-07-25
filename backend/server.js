@@ -9,16 +9,17 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(express.static(path.join(__dirname, 'public')));
 
-// =======================
-// HEALTH CHECK (CRITICAL FOR AZURE)
-// =======================
-app.get('/health', (req, res) => {
+// Handle both /health and /health/
+app.get(['/health', '/health/'], (req, res) => {
   res.status(200).json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    websocketClients: wss?.clients?.size || 0
+    uptime: process.uptime()
   });
 });
+
+// Serve static files
+app.use(express.static('public'));
 
 // =======================
 // HTTP SERVER SETUP
