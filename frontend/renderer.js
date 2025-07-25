@@ -274,14 +274,19 @@ function clearMessages() {
 // === WebRTC Logic ===
 function createPeerConnection() {
   stopStream(); // Ensure clean state before creating new connection
-
+ 
   const pc = new RTCPeerConnection({
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
       { urls: 'stun:stun2.l.google.com:19302' },
       { urls: 'stun:stun3.l.google.com:19302' },
-      { urls: 'stun:stun4.l.google.com:19302' }
+      { urls: 'stun:stun4.l.google.com:19302' },
+      {
+        urls: 'turn:relay1.expressturn.com:3480',
+        username: '00000002068692408',
+        credential: 'pd93cTNQ4Wa0Er7v3k5pLF+14+w='
+      }
     ],
     iceTransportPolicy: 'all'
   });
