@@ -5,53 +5,53 @@ name: Build and deploy Node.js app to Azure Web App - xr-messagibg
 
 on:
   push:
-    branches:
-      - production
+    branches: [production]
   workflow_dispatch:
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20.19.4'
+          cache: 'npm'
 
-      # Frontend preparation
-      - name: Prepare frontend files
-        working-directory: frontend
-        run: |
-          # Create the public directory in backend if it doesn't exist
-          mkdir -p ../backend/public
-          # Copy all frontend files to backend's public directory
-          cp -r ./* ../backend/public/
+      # Install root dependencies (if any)
+      - name: Install root dependencies
+        run: npm install
 
-      # Backend setup
+      # Install backend dependencies
       - name: Install backend dependencies
         working-directory: backend
-        run: npm ci
+        run: npm install
 
-      - name: Ensure correct package.json
-        working-directory: backend
+      # Install frontend dependencies
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install
+
+      # Start application (simulating local workflow)
+      - name: Run application
+        run: npm start
+
+      # Prepare backend with frontend files
+      - name: Prepare deployment package
         run: |
-          # Only modify package.json if needed, preserving other settings
-          if [ ! -f package.json ]; then
-            echo '{"name": "xr-backend", "version": "1.0.0", "main": "server.js", "scripts": {"start": "node server.js"}}' > package.json
-          else
-            # Ensure start script exists
-            npm pkg set scripts.start="node server.js"
-          fi
+          mkdir -p backend/public
+          cp frontend/index.html frontend/main.js frontend/renderer.js frontend/styles.css backend/public/
 
-      # Deployment
+      # Deploy to Azure
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v2
         with:
-          app-name: xr-messagibg  # Fixed typo from original
+          app-name: xr-messaging
           slot-name: Production
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_F686C13FE2954C6FAEF2D327F4D8339B }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE }}
           package: ./backend
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_F686C13FE2954C6FAEF2D327F4D8339B }}
