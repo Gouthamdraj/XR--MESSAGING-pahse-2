@@ -1,4 +1,3 @@
-
 name: Build and deploy Node.js backend to Azure Web App - xr-messagibg
 
 on:
@@ -20,29 +19,30 @@ jobs:
         with:
           node-version: '20.19.4'
 
-       # Debug: Confirm npm-run-all is installed
-      - name: 📦 Install root dependencies (npm-run-all)
+      - name: Install root dependencies
         run: npm install
 
-      # Install frontend dependencies
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm install --force
 
-      # Copy frontend assets to backend/public
+      - name: Build frontend (if you have a build step)
+        working-directory: frontend
+        run: npm run build  # Add this if you have a build step
+
       - name: Copy frontend assets to backend
         run: |
           mkdir -p backend/public
-          cp frontend/index.html frontend/*.js frontend/*.css backend/public/
-      # Install backend dependencies (includes npm-run-all)
+          cp -r frontend/* backend/public/
+
       - name: Install backend dependencies
         working-directory: backend
         run: npm install --force
 
-      # Zip backend folder for deployment
       - name: Zip backend for deployment
-        working-directory: backend
-        run: zip -r ../release.zip .
+        run: |
+          cd backend
+          zip -r ../release.zip .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -60,16 +60,10 @@ jobs:
         with:
           name: backend-release
 
-      - name: Unzip artifact
-        run: unzip release.zip
-
-      - name: Remove zip file
-        run: rm release.zip
-
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'xr-messagibg'
           slot-name: 'Production'
+          package: release.zip
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_B13970A649E545C293BE9252353C16B1 }}
-          package: .
