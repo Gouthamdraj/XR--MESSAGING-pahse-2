@@ -114,8 +114,14 @@ function createPeerConnection() {
       { urls: 'stun:stun1.l.google.com:19302' },
       { urls: 'stun:stun2.l.google.com:19302' },
       { urls: 'stun:stun3.l.google.com:19302' },
-      { urls: 'stun:stun4.l.google.com:19302' }
-    ]
+      { urls: 'stun:stun4.l.google.com:19302' },
+      {
+        urls: 'turn:relay1.expressturn.com:3480',
+        username: '000000002069048368',
+        credential: 'YfRx0QJ+vdWvu1dLjXPqcU5vKgY='
+      }
+    ],
+    iceTransportPolicy: 'all'
   });
 
   pc.ontrack = (event) => {
