@@ -2,7 +2,7 @@
   "name": "xr-messaging-root",
   "version": "1.0.0",
   "scripts": {
-    "start": "npm-run-all --parallel start:server start:frontend",
+    "start": "npm-run-all --parallel start:backend start:frontend",
     "start:server": "cd backend && npm start",
     "start:frontend": "cd frontend && npm start"
   },
