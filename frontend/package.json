@@ -4,7 +4,6 @@
   "description": "XR Messaging Web Frontend",
   "scripts": {
     "start": "npx serve .",
-    "build": "ng build"
   },
   "devDependencies": {
     "serve": "^14.2.0"
