@@ -1,12 +1,10 @@
 {
   "name": "xr-messaging-frontend",
   "version": "1.0.0",
-  "description": "XR Messaging Web Frontend",
   "scripts": {
-    "start": "npx serve .",
-    "build": "react-scripts build"
+    "start": "serve -l 3000"
   },
-  "devDependencies": {
+  "dependencies": {
     "serve": "^14.2.0"
   }
 }
