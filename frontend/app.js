@@ -1,27 +1,3 @@
-// ================= SIGNALING SERVER URL LOGIC ===================
-
-// We'll declare these at the top, and only connectWebSocket() once URL is known
-let SIGNALING_SERVER_URL = '';
-let ws = null;
-
-// Helper: Dynamically get ngrok url if NOT localhost, using backend /ngrok-url endpoint
-async function getSignalingServerUrl() {
-  if (window.location.hostname === 'localhost') {
-    return "wss://f4e7709c8830.ngrok-free.app";
-  }
-  try {
-    // Correct endpoint for your Express backend!
-    const res = await fetch('/ngrok-url');
-    const data = await res.json();
-    return data.signalingUrl; // { "signalingUrl": "wss://xxxxx.ngrok-free.app" }
-  } catch (e) {
-    console.error("Couldn't fetch ngrok URL; defaulting to hardcoded value");
-    return "wss://888bb8eeff9b.ngrok-free.app";
-  }
-}
-
-// =================== REST OF YOUR APP.JS ========================
-
 // === DOM Elements ===
 const videoElement = document.getElementById('xrVideo');
 const statusElement = document.getElementById('status');
@@ -38,12 +14,18 @@ const videoOverlay = document.getElementById('videoOverlay');
 const openEmulatorBtn = document.getElementById('openEmulator');
 const clearMessagesBtn = document.getElementById('clearMessagesBtn');
 
+let ws = null;
 let peerConnection = null;
 let remoteStream = null;
 let clearedMessages = new Set();
 let pendingIceCandidates = [];
 let isStreamActive = false;
 let allowAutoPlay = false;
+
+// ========== CONFIG =============
+// Change this to your Azure/production server as needed!
+const SIGNALING_SERVER_URL = 'wss://xr-messaging-geexbheshbghhab7.centralindia-01.azurewebsites.net'
+// ===============================
 
 // === Helper: Update status badge text and class ===
 function setStatus(status) {
@@ -72,11 +54,7 @@ function connectWebSocket() {
   ws.onopen = () => {
     setStatus('Connected');
     // Register desktop with ID
-    ws.send(JSON.stringify({
-      type: "identification",
-      xrId: xrIdInput.value || "XR-1238",
-      deviceName: usernameInput.value || "Desktop"
-    }));
+    ws.send(JSON.stringify({ type: "identification", xrId: xrIdInput.value || "XR-1238", deviceName: usernameInput.value || "Desktop" }));
   };
 
   ws.onclose = () => setStatus('Disconnected');
@@ -136,14 +114,8 @@ function createPeerConnection() {
       { urls: 'stun:stun1.l.google.com:19302' },
       { urls: 'stun:stun2.l.google.com:19302' },
       { urls: 'stun:stun3.l.google.com:19302' },
-      { urls: 'stun:stun4.l.google.com:19302' },
-      {
-        urls: 'turn:relay1.expressturn.com:3480',
-        username: '000000002069048368',
-        credential: 'YfRx0QJ+vdWvu1dLjXPqcU5vKgY='
-      }
-    ],
-    iceTransportPolicy: 'all'
+      { urls: 'stun:stun4.l.google.com:19302' }
+    ]
   });
 
   pc.ontrack = (event) => {
@@ -469,8 +441,7 @@ if (videoOverlay) {
   });
 }
 
-// Connect on load - ***Use async signaling URL logic***
-window.addEventListener('load', async () => {
-  SIGNALING_SERVER_URL = await getSignalingServerUrl();
+// Connect on load
+window.addEventListener('load', () => {
   connectWebSocket();
 });
