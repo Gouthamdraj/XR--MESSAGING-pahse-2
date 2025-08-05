@@ -45,20 +45,45 @@ function connectWebSocket() {
   setStatus('Connecting');
   ws = new WebSocket(SIGNALING_SERVER_URL);
  
+  // ws.onopen = () => {
+  //   console.log('[WS] Connected');
+  //   setStatus('Connected');
+  //   ws.send(JSON.stringify({
+  //     type: "identification",
+  //     xrId: xrIdInput.value || "XR-1238",
+  //     deviceName: usernameInput.value || "Desktop"
+  //   }));
+  //   if (reconnectTimeout) {
+  //     clearTimeout(reconnectTimeout);
+  //     reconnectTimeout = null;
+  //   }
+  //   startHeartbeat();
+  // };
+
   ws.onopen = () => {
-    console.log('[WS] Connected');
-    setStatus('Connected');
-    ws.send(JSON.stringify({
-      type: "identification",
-      xrId: xrIdInput.value || "XR-1238",
-      deviceName: usernameInput.value || "Desktop"
-    }));
-    if (reconnectTimeout) {
-      clearTimeout(reconnectTimeout);
-      reconnectTimeout = null;
-    }
-    startHeartbeat();
+  console.log('[WS] Connected');
+  setStatus('Connected');
+
+  // Send identification info
+  const identificationMsg = {
+    type: "identification",
+    xrId: xrIdInput.value || "XR-1238",
+    deviceName: usernameInput.value || "Desktop"
   };
+  ws.send(JSON.stringify(identificationMsg));
+  console.log('[WS] Sent identification:', identificationMsg);
+
+  // Immediately request device list for instant UI update
+  const deviceListRequest = { type: "request_device_list" };
+  ws.send(JSON.stringify(deviceListRequest));
+  console.log('[WS] Sent device list request:', deviceListRequest);
+
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+  startHeartbeat();
+};
  
   ws.onclose = () => {
     console.warn('[WS] Connection closed');
