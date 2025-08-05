@@ -427,7 +427,7 @@ wss.on('connection', (ws) => {
         ws.deviceName = deviceName || 'Unknown';
         ws.xrId = xrId || null;
 
-        
+        // === NEW: Enforce 1:1 Desktop Connection ===
         if (ws.deviceName.startsWith('Desktop') || ws.xrId === 'XR-1238') {
           if (desktopClients.has(ws.xrId)) {
             console.log(`[BLOCKED] Duplicate desktop tab for ${ws.xrId}`);
@@ -441,7 +441,6 @@ wss.on('connection', (ws) => {
           desktopClients.set(ws.xrId, ws);
         }
 
-          
         console.log(`[IDENTIFIED] ${ws.deviceName} (${ws.xrId || 'no-id'}) just connected.`);
         broadcastDeviceList();
         logCurrentDevices();
@@ -621,3 +620,4 @@ function shutdown() {
 process.on('uncaughtException', (err) => {
   console.error('[FATAL ERROR] Uncaught exception occurred:', err);
 });
+
