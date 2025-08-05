@@ -115,11 +115,6 @@ wss.on('connection', (ws) => {
         logCurrentDevices();
         break;
 
-      case 'request_device_list':
-        console.log(`[DEVICE LIST] Device list requested by: ${ws.deviceName || 'Unknown'} (${ws.xrId || 'no-id'})`);
-        broadcastDeviceList();
-        break;
-
       case 'message':
         const fullMessage = {
           ...data,
@@ -134,7 +129,7 @@ wss.on('connection', (ws) => {
       case 'clear-messages':
         console.log(`[MESSAGE] Clear requested by ${data.by}`);
         broadcastAll({
-          type: 'clear-messages',
+          type: 'message-cleared',
           by: data.by,
           messageId: Date.now()
         });
