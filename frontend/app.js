@@ -496,8 +496,8 @@ let reconnectTimeout = null;
 let heartbeatInterval = null;
 
 // CONFIG
-// const SIGNALING_SERVER_URL = 'wss://914a075c3b07.ngrok-free.app';
-const SIGNALING_SERVER_URL = 'wss://xr-messaging-geexbheshbghhab7.centralindia-01.azurewebsites.net';
+const SIGNALING_SERVER_URL = 'wss://914a075c3b07.ngrok-free.app';
+// const SIGNALING_SERVER_URL = 'wss://xr-messaging-geexbheshbghhab7.centralindia-01.azurewebsites.net';
 
 function setStatus(status) {
   console.log('[STATUS] Updated:', status);
@@ -603,8 +603,7 @@ function connectWebSocket() {
     }
 
     // === 🔴 Block duplicate desktop tabs ===
-    // if (data.type === 'error' && data.message?.includes('Duplicate desktop')) {
-      if (data.type === 'duplicate_tab') {
+    if (data.type === 'error' && data.message?.includes('Duplicate desktop')) {
       console.warn('[WS] 🚫 Duplicate desktop tab detected. Blocking UI...');
       alert('This desktop session is inactive. Please close other tabs.');
       document.body.innerHTML = `
@@ -619,7 +618,6 @@ function connectWebSocket() {
     handleSocketMessage(data);
   };
 }
-
 
 function startHeartbeat() {
   if (heartbeatInterval) clearInterval(heartbeatInterval);
@@ -1056,6 +1054,3 @@ window.addEventListener('load', () => {
   console.log('[APP] Window loaded. Connecting WebSocket...');
   connectWebSocket();
 });
-
-
-
