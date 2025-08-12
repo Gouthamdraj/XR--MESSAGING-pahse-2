@@ -525,6 +525,23 @@ function showClickToPlayOverlay() {
 // --------------------------
 // Devices list UI
 // --------------------------
+// function updateDeviceList(devices) {
+//   logFnEntry('updateDeviceList');
+//   if (!Array.isArray(devices)) {
+//     console.error("Device list is not an array:", devices);
+//     return;
+//   }
+
+//   console.log('[DEVICES] Updating device list with', devices.length, 'devices');
+//   deviceListElement.innerHTML = '';
+//   devices.forEach(device => {
+//     const name = device.deviceName || device.name || 'Unknown';
+//     console.log(`[DEVICE] Adding device: ${name} (${device.xrId})`);
+//     const li = document.createElement('li');
+//     li.textContent = `${name} (${device.xrId})`;
+//     deviceListElement.appendChild(li);
+//   });
+// }
 function updateDeviceList(devices) {
   logFnEntry('updateDeviceList');
   if (!Array.isArray(devices)) {
@@ -534,14 +551,31 @@ function updateDeviceList(devices) {
 
   console.log('[DEVICES] Updating device list with', devices.length, 'devices');
   deviceListElement.innerHTML = '';
+
+  let androidOnline = false;
+
   devices.forEach(device => {
     const name = device.deviceName || device.name || 'Unknown';
     console.log(`[DEVICE] Adding device: ${name} (${device.xrId})`);
     const li = document.createElement('li');
     li.textContent = `${name} (${device.xrId})`;
     deviceListElement.appendChild(li);
+
+    // ✅ Check if Android target is live
+    if (device.xrId === ANDROID_ID) {
+      androidOnline = true;
+    }
   });
+
+  // ✅ Pair only when Android is online
+  if (androidOnline && !currentRoom) {
+    console.log(`[PAIR] Android (${ANDROID_ID}) is online — pairing now`);
+    pairWith(ANDROID_ID);
+  } else if (!androidOnline) {
+    console.log(`[PAIR] Android (${ANDROID_ID}) is not online yet — waiting`);
+  }
 }
+
 
 // --------------------------
 // Chat send

@@ -47,7 +47,7 @@ if (!staticPathFound) {
 
 // TURN injection into HTML
 function injectTurnConfig(html) {
-  console.log('[TURN] Injecting TURN configuration into HTML');
+  console.log('[TURN] injectTurnConfig() called');
   const configScript = `
     <script>
       window.TURN_CONFIG = {
@@ -57,6 +57,7 @@ function injectTurnConfig(html) {
       };
     </script>
   `;
+  console.log('[TURN] TURN config built');
   return html.replace('</body>', `${configScript}\n</body>`);
 }
 
@@ -93,51 +94,63 @@ app.get('*', (req, res) => {
 // Socket.IO logic
 const clients = new Map();         // xrId → socket
 const desktopClients = new Map();  // xrId → socket (desktop sockets)
-const messageHistory = [];         // simple in-memory message history (last 100)
+const messageHistory = [];        // simple in-memory message history (last 100)
+const onlineDevices = new Map();  // xrId → socket (convenience map)
 
 // Pairing / rooms
-// For now: an in-memory allowlist. Replace with DB query later.
+// In-memory allowlist (replace with DB later)
 const allowedPairs = new Set([
- normalizePair('XR-1234', 'XR-1238'),
+  normalizePair('XR-1234', 'XR-1238'),
 ]);
+console.log('[SOCKET.IO] Allowed pairs initialized:', Array.from(allowedPairs));
 
-console.log('[SOCKET.IO] Data structures initialized');
+// Pairings map for auto-pairing (bidirectional). Replace with DB later.
+// Example: ANDROID <-> DESKTOP
+const PAIRINGS_MAP = new Map([
+  // key -> partner
+  ['XR-1234', 'XR-1238'],
+  ['XR-1238', 'XR-1234']
+]);
+console.log('[SOCKET.IO] Pairings map initialized:', Array.from(PAIRINGS_MAP.entries()));
 
 // Utility: canonical pair key (order-independent)
 function normalizePair(a, b) {
+  console.log('[PAIR] normalizePair()', a, b);
   return [a, b].sort().join('|');
 }
 
 // Whether pair is allowed (async-ready for DB later)
 async function isPairAllowed(a, b) {
-  console.log('[PAIR] Checking allowed pair for:', a, b);
-  // Replace this with a DB lookup in production.
+  console.log('[PAIR] isPairAllowed() checking allowed pair for:', a, b);
   const key = normalizePair(a, b);
   const allowed = allowedPairs.has(key);
-  console.log('[PAIR] Allowed?', allowed, 'key=', key);
+  console.log('[PAIR] isPairAllowed() =>', allowed, 'key=', key);
   return allowed;
 }
 
 // Build device list for broadcasts
 function buildDeviceList() {
-  console.log('[DEVICE_LIST] Building device list');
-  return [...clients.entries()].map(([xrId, s]) => ({
+  console.log('[DEVICE_LIST] buildDeviceList()');
+  const list = [...clients.entries()].map(([xrId, s]) => ({
     xrId,
     deviceName: s?.data?.deviceName || 'Unknown'
   }));
+  console.log('[DEVICE_LIST] Device list built with', list.length, 'entries');
+  return list;
 }
 
 function broadcastDeviceList() {
-  console.log('[DEVICE_LIST] Broadcasting device list to all clients');
+  console.log('[DEVICE_LIST] broadcastDeviceList() called');
   const deviceList = Array.from(clients.entries()).map(([xrId, socket]) => ({
     xrId,
     deviceName: socket.data.deviceName || 'Unknown'
   }));
   io.emit('device_list', deviceList);
+  console.log('[DEVICE_LIST] device_list emitted to all clients');
 }
 
 function logCurrentDevices() {
-  console.log('[DEVICES] Current connected devices:');
+  console.log('[DEVICES] logCurrentDevices()');
   if (clients.size === 0) {
     console.log('   (none)');
     return;
@@ -148,24 +161,26 @@ function logCurrentDevices() {
 }
 
 function broadcastToDesktop(type, data) {
-  console.log(`[BROADCAST] Sending to desktop clients: ${type}`);
+  console.log(`[BROADCAST] broadcastToDesktop(): Sending ${type} to desktop clients`);
   for (const socket of desktopClients.values()) {
     socket.emit(type, data);
   }
+  console.log('[BROADCAST] broadcastToDesktop() done');
 }
 
 function broadcastToTarget(to, type, data) {
-  console.log(`[TARGET] Sending to ${to}: ${type}`);
+  console.log(`[TARGET] broadcastToTarget(): Sending ${type} to ${to}`);
   const target = clients.get(to);
   if (target) {
     target.emit(type, data);
+    console.log('[TARGET] Message emitted to target', to);
   } else {
     console.warn(`[TARGET] Target not found: ${to}`);
   }
 }
 
 function addToMessageHistory(message) {
-  console.log('[MESSAGE_HISTORY] Adding message to history');
+  console.log('[MESSAGE_HISTORY] addToMessageHistory() called');
   messageHistory.push({
     ...message,
     id: Date.now(),
@@ -176,28 +191,116 @@ function addToMessageHistory(message) {
     console.log('[MESSAGE_HISTORY] Trimming message history');
     messageHistory.shift();
   }
+  console.log('[MESSAGE_HISTORY] message added, length now:', messageHistory.length);
 }
 
 // Helper: compute deterministic room id for a pair
 function getRoomIdForPair(a, b) {
+  console.log('[ROOM] getRoomIdForPair()', a, b);
   const [one, two] = [a, b].sort();
-  return `pair:${one}:${two}`;
+  const roomId = `pair:${one}:${two}`;
+  console.log('[ROOM] getRoomIdForPair() =>', roomId);
+  return roomId;
 }
 
 // Helper: get room members' xrIds (returns string array)
 function listRoomMembers(roomId) {
-  console.log('[ROOM] Listing members for', roomId);
+  console.log('[ROOM] listRoomMembers() for', roomId);
   const set = io.sockets.adapter.rooms.get(roomId);
-  if (!set) return [];
-  return Array.from(set).map(sid => {
+  if (!set) {
+    console.log('[ROOM] No room set found');
+    return [];
+  }
+  const members = Array.from(set).map(sid => {
     const s = io.sockets.sockets.get(sid);
     return s?.data?.xrId || sid;
   });
+  console.log('[ROOM] Members:', members);
+  return members;
+}
+
+// Try to auto-pair when both sides are online
+async function tryAutoPair(deviceId) {
+  console.log('[AUTO_PAIR] tryAutoPair() called for', deviceId);
+
+  try {
+    if (!deviceId) {
+      console.warn('[AUTO_PAIR] No deviceId provided');
+      return false;
+    }
+
+    // Check mapping for partner
+    const partnerId = PAIRINGS_MAP.get(deviceId);
+    console.log('[AUTO_PAIR] PartnerId lookup =>', partnerId);
+
+    if (!partnerId) {
+      console.log('[AUTO_PAIR] No configured partner for', deviceId);
+      return false;
+    }
+
+    // Both must be online
+    const meSocket = clients.get(deviceId);
+    const partnerSocket = clients.get(partnerId);
+    console.log('[AUTO_PAIR] meSocket?', !!meSocket, 'partnerSocket?', !!partnerSocket);
+
+    if (!meSocket || !partnerSocket) {
+      console.log('[AUTO_PAIR] One or both endpoints are offline; cannot auto-pair yet');
+      return false;
+    }
+
+    // Validate allowed pairing (policy)
+    const allowed = await isPairAllowed(deviceId, partnerId);
+    if (!allowed) {
+      console.warn('[AUTO_PAIR] Pairing not allowed per policy:', deviceId, partnerId);
+      return false;
+    }
+
+    const roomId = getRoomIdForPair(deviceId, partnerId);
+    console.log('[AUTO_PAIR] Computed roomId:', roomId);
+
+    // Check room membership
+    const room = io.sockets.adapter.rooms.get(roomId);
+    const memberCount = room ? room.size : 0;
+    console.log('[AUTO_PAIR] Current memberCount for', roomId, ':', memberCount);
+
+    if (memberCount >= 2) {
+      console.log('[AUTO_PAIR] Room already full; not auto-pairing', roomId);
+      return false;
+    }
+
+    // If either socket already in a different room, log and proceed carefully
+    if (meSocket.data?.roomId && meSocket.data.roomId !== roomId) {
+      console.warn('[AUTO_PAIR] meSocket already in room:', meSocket.data.roomId);
+    }
+    if (partnerSocket.data?.roomId && partnerSocket.data.roomId !== roomId) {
+      console.warn('[AUTO_PAIR] partnerSocket already in room:', partnerSocket.data.roomId);
+    }
+
+    // Join both sockets into the room server-side (if not already)
+    console.log('[AUTO_PAIR] Joining sockets into room:', roomId);
+    await meSocket.join(roomId);
+    await partnerSocket.join(roomId);
+    meSocket.data.roomId = roomId;
+    partnerSocket.data.roomId = roomId;
+    console.log('[AUTO_PAIR] Both sockets joined', roomId);
+
+    // Build members list
+    const members = listRoomMembers(roomId);
+    console.log('[AUTO_PAIR] room_joined will be emitted for', roomId, 'members=', members);
+
+    io.to(roomId).emit('room_joined', { roomId, members });
+    console.log('[AUTO_PAIR] room_joined emitted');
+
+    return true;
+  } catch (err) {
+    console.error('[AUTO_PAIR] Error in tryAutoPair():', err);
+    return false;
+  }
 }
 
 // When server starts: listen for connections
 io.on('connection', (socket) => {
-  console.log(`🔌 [CONNECTION] New connection: ${socket.id}`);
+  console.log(`🔌 [CONNECTION] New connection: socket.id=${socket.id}`);
 
   // If we have message history, send last few messages
   if (messageHistory.length > 0) {
@@ -210,21 +313,30 @@ io.on('connection', (socket) => {
 
   // Simple join (legacy)
   socket.on('join', (xrId) => {
-    console.log(`[JOIN] Request from ${socket.id} to join as ${xrId}`);
-    socket.data.xrId = xrId;
-    clients.set(xrId, socket);
-    console.log(`✅ [JOIN] Successfully joined as ${xrId}`);
-    broadcastDeviceList();
-    logCurrentDevices();
+    console.log(`[JOIN] Request from socket ${socket.id} to join as ${xrId}`);
+    try {
+      socket.data.xrId = xrId;
+      clients.set(xrId, socket);
+      onlineDevices.set(xrId, socket);
+      console.log(`✅ [JOIN] Successfully joined as ${xrId}`);
+      broadcastDeviceList();
+      logCurrentDevices();
+    } catch (e) {
+      console.error('[JOIN] Error:', e);
+    }
   });
 
   // Identification (deviceName + xrId)
-  socket.on('identify', ({ deviceName, xrId }) => {
-    console.log(`[IDENTIFY] Request from ${socket.id}: ${deviceName} (${xrId})`);
+  socket.on('identify', async ({ deviceName, xrId }) => {
+    console.log(`[IDENTIFY] Request from socket ${socket.id}: deviceName=${deviceName} xrId=${xrId}`);
     try {
       socket.data.deviceName = deviceName || 'Unknown';
       socket.data.xrId = xrId;
+
+      // Save into maps
       clients.set(xrId, socket);
+      onlineDevices.set(xrId, socket);
+      console.log(`[IDENTIFY] clients and onlineDevices updated for ${xrId}`);
 
       // Desktop detection
       if (deviceName?.toLowerCase().includes('desktop') || xrId === 'XR-1238') {
@@ -236,6 +348,7 @@ io.on('connection', (socket) => {
           return;
         }
         desktopClients.set(xrId, socket);
+        console.log(`[IDENTIFY] desktopClients updated for ${xrId}`);
       }
 
       console.log(`[IDENTIFY] Successfully identified: ${deviceName} (${xrId})`);
@@ -244,8 +357,16 @@ io.on('connection', (socket) => {
       const list = buildDeviceList();
       io.emit('device_list', list);
       socket.emit('device_list', list);
+      console.log('[IDENTIFY] device_list emitted after identify');
+
+      // Attempt server-driven auto-pairing (if configured)
+      console.log('[IDENTIFY] Attempting auto-pair for', xrId);
+      await tryAutoPair(xrId);
+
     } catch (e) {
       console.error('[IDENTIFY] Error handling identify:', e);
+    } finally {
+      logCurrentDevices();
     }
   });
 
@@ -289,7 +410,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Join the room
+      // Join the room (only the requesting socket; assume other side will join or server auto-join)
       socket.join(roomId);
       socket.data.roomId = roomId;
       console.log(`[PAIR] Socket ${socket.id} (xrId=${me}) joined room ${roomId}`);
@@ -461,30 +582,26 @@ io.on('connection', (socket) => {
       // If socket was in a private room, notify room members and remove membership
       if (roomId) {
         console.log(`[DISCONNECT] Socket was in room ${roomId} - notifying other members`);
-        // remove socket from room (socket.leave happens automatically on disconnect, but we still notify)
+        // notify remaining members that peer left
         io.to(roomId).emit('peer_left', { xrId: xrId || socket.id, roomId, timestamp: new Date().toISOString() });
 
-        // After disconnect, check the remaining members: if none or only one (desktop left), handle cleanup if needed
+        // After disconnect, check the remaining members: if none or only one, handle cleanup if needed
         const remaining = io.sockets.adapter.rooms.get(roomId);
         const remainingCount = remaining ? remaining.size : 0;
         console.log(`[DISCONNECT] Remaining members in ${roomId}: ${remainingCount}`);
-        // Note: If desktop disconnects, remaining XR should be disconnected or notified depending on policy.
-        // We'll let room linger until both leave—clients should re-pair when desktop comes back.
       }
 
       if (xrId) {
         clients.delete(xrId);
+        onlineDevices.delete(xrId);
         if (desktopClients.get(xrId) === socket) {
           desktopClients.delete(xrId);
           console.log(`[DISCONNECT] Removed desktop client: ${xrId}`);
-          // When desktop disconnects, it's a policy decision: we can optionally notify the paired XR(s).
-          // Find any rooms involving this desktop and notify members that room is terminated.
-          // We'll attempt to find rooms where this xrId is a member (as one side of pair).
-          // Build naive cleanup: iterate rooms and inform others
+
+          // Notify pair rooms if needed
           for (const [rid, sids] of io.sockets.adapter.rooms) {
             if (!rid.startsWith('pair:')) continue;
             const members = listRoomMembers(rid);
-            // if desktop xrId is part of this pair, emit room_terminated
             if (members.includes(xrId)) {
               console.log(`[DISCONNECT] Emitting room_terminated for ${rid}`);
               io.to(rid).emit('room_terminated', { roomId: rid, reason: 'desktop_disconnected' });
@@ -507,7 +624,9 @@ io.on('connection', (socket) => {
   socket.on('error', (err) => {
     console.error(`[SOCKET_ERROR] ${socket.id}:`, err);
   });
+
 });
+
 
 // Start server
 server.listen(PORT, '0.0.0.0', () => {
