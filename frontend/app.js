@@ -1630,8 +1630,12 @@ function createPeerConnection() {
       remoteStream.addTrack(event.track);
     }
     videoElement.play().catch((e) => {
-      console.warn('[WEBRTC] Video play error:', e);
-      showClickToPlayOverlay();
+      if (e && e.name === 'AbortError') {
+        console.debug('[WEBRTC] play() aborted (teardown race) — safe to ignore');
+      } else {
+        console.warn('[WEBRTC] Video play error:', e);
+        showClickToPlayOverlay();
+      }
     });
   };
 
@@ -1962,17 +1966,50 @@ function clearMessages() {
   addSystemMessage(`🧹 Cleared messages locally by ${DEVICE_NAME}`);
 }
 
+/* =========================
+   🔔 WebRTC offer helpers (NEW)
+   ========================= */
+function requestOfferFromPeer() {
+  const to = currentPeerId();
+  if (!socket?.connected || !to) {
+    console.warn('[CONTROL] Cannot request_offer: socket connected?', !!socket?.connected, 'peer=', to);
+    return;
+  }
+  console.log('[CONTROL] Requesting SDP offer from peer:', to);
+  socket.emit('control', { to, command: 'request_offer' });
+}
+
+function ensurePeerReadyThenRequestOffer() {
+  if (!peerConnection) {
+    console.log('[CONTROL] No RTCPeerConnection; creating before request_offer');
+    peerConnection = createPeerConnection();
+  }
+  requestOfferFromPeer();
+}
+
 // ---------------- Remote control / commands ----------------
 function handleControlCommand(data) {
   console.log('[CONTROL] Received control command:', data?.command);
   const command = (data?.command || '').toLowerCase();
 
-  if (!isStreamActive && command !== 'stop_stream') {
-    console.log('[CONTROL] Stream not active - ignoring command');
+  // allow start_stream (and request_offer) even if stream is not yet active
+  if (!isStreamActive && !['start_stream', 'request_offer', 'stop_stream'].includes(command)) {
+    console.log('[CONTROL] Stream not active - ignoring command:', command);
     return;
   }
 
   switch (command) {
+    case 'start_stream':
+      console.log('[CONTROL] Executing start_stream command');
+      addSystemMessage('🎥 Start stream requested');
+      ensurePeerReadyThenRequestOffer();  // prepare PC and ask peer to send an SDP offer
+      break;
+
+    case 'request_offer': // optional round‑trip support if peer asks us to prompt again
+      console.log('[CONTROL] Executing request_offer');
+      ensurePeerReadyThenRequestOffer();
+      break;
+
     case 'mute':
       console.log('[CONTROL] Executing mute command');
       if (muteBadge) muteBadge.style.display = 'block';
