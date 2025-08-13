@@ -1,687 +1,8 @@
-// // const express = require('express');
-// // const http = require('http');
-// // const path = require('path');
-// // const fs = require('fs');
-// // const cors = require('cors');
-// // const { Server } = require('socket.io');
-// // require('dotenv').config();
-
-// // console.log('[INIT] Starting server initialization...');
-
-// // // Configuration
-// // const PORT = process.env.PORT || 8080;
-// // console.log(`[CONFIG] Using port: ${PORT}`);
-
-// // const app = express();
-// // const server = http.createServer(app);
-// // console.log('[HTTP] Server created');
-
-// // const io = new Server(server, {
-// //   cors: { origin: '*', methods: ['GET', 'POST'] }
-// // });
-// // console.log('[SOCKET.IO] Socket.IO server initialized');
-
-// // // Middleware
-// // app.use(cors());
-// // app.use(express.json());
-// // console.log('[MIDDLEWARE] CORS and JSON middleware applied');
-
-// // // Static file handling
-// // const staticPaths = [
-// //   path.join(__dirname, 'public'),
-// //   path.join(__dirname, '../frontend')
-// // ];
-
-// // console.log('[STATIC] Checking for static paths...');
-// // let staticPathFound = null;
-// // staticPaths.forEach((dir) => {
-// //   if (fs.existsSync(dir)) {
-// //     app.use(express.static(dir));
-// //     staticPathFound = dir;
-// //     console.log(`[STATIC] Serving from ${dir}`);
-// //   }
-// // });
-// // if (!staticPathFound) {
-// //   console.warn('⚠️ [STATIC] No static path found.');
-// // }
-
-// // // TURN injection into HTML
-// // function injectTurnConfig(html) {
-// //   console.log('[TURN] Injecting TURN configuration into HTML');
-// //   const configScript = `
-// //     <script>
-// //       window.TURN_CONFIG = {
-// //         urls: '${process.env.TURN_URL || ''}',
-// //         username: '${process.env.TURN_USERNAME || ''}',
-// //         credential: '${process.env.TURN_CREDENTIAL || ''}'
-// //       };
-// //     </script>
-// //   `;
-// //   return html.replace('</body>', `${configScript}\n</body>`);
-// // }
-
-// // // HTTP routes
-// // app.get('/health', (req, res) => {
-// //   console.log('[HEALTH] Health check requested');
-// //   res.status(200).json({
-// //     status: 'healthy',
-// //     timestamp: new Date().toISOString(),
-// //     connectedClients: clients.size
-// //   });
-// // });
-
-// // app.get('/', (req, res) => {
-// //   console.log('[ROUTE] Serving root path');
-// //   if (!staticPathFound) {
-// //     console.warn('[ROUTE] Static path not found for root');
-// //     return res.status(404).send('Static not found');
-// //   }
-// //   const html = fs.readFileSync(path.join(staticPathFound, 'index.html'), 'utf8');
-// //   res.send(injectTurnConfig(html));
-// // });
-
-// // app.get('*', (req, res) => {
-// //   console.log(`[ROUTE] Catch-all route for: ${req.path}`);
-// //   if (!staticPathFound) {
-// //     console.warn('[ROUTE] Static path not found for catch-all');
-// //     return res.status(404).send('Static not found');
-// //   }
-// //   const html = fs.readFileSync(path.join(staticPathFound, 'index.html'), 'utf8');
-// //   res.send(injectTurnConfig(html));
-// // });
-
-// // // Socket.IO logic
-// // const clients = new Map();         // xrId → socket
-// // const desktopClients = new Map();  // xrId → socket
-// // const messageHistory = [];
-// // console.log('[SOCKET.IO] Data structures initialized');
-
-// // function buildDeviceList() {
-// //   return [...clients.entries()].map(([xrId, s]) => ({
-// //     xrId,
-// //     deviceName: s?.data?.deviceName || 'Unknown'
-// //   }));
-// // }
-
-
-// // function broadcastDeviceList() {
-// //   console.log('[DEVICE_LIST] Broadcasting device list');
-// //   const deviceList = Array.from(clients.entries()).map(([xrId, socket]) => ({
-// //     xrId,
-// //     deviceName: socket.data.deviceName || 'Unknown'
-// //   }));
-// //   io.emit('device_list', deviceList); // emit array of { deviceName, xrId }
-// // }
-
-// // function logCurrentDevices() {
-// //   console.log('[DEVICES] Current connected devices:');
-// //   if (clients.size === 0) {
-// //     console.log('   (none)');
-// //     return;
-// //   }
-// //   for (const [xrId, socket] of clients.entries()) {
-// //     console.log(`   - ${socket.data.deviceName || 'Unknown'} (${xrId})`);
-// //   }
-// // }
-
-// // function broadcastToDesktop(type, data) {
-// //   console.log(`[BROADCAST] Sending to desktop clients: ${type}`);
-// //   for (const socket of desktopClients.values()) {
-// //     socket.emit(type, data);
-// //   }
-// // }
-
-// // function broadcastToTarget(to, type, data) {
-// //   console.log(`[TARGET] Sending to ${to}: ${type}`);
-// //   const target = clients.get(to);
-// //   if (target) {
-// //     target.emit(type, data);
-// //   } else {
-// //     console.warn(`[TARGET] Target not found: ${to}`);
-// //   }
-// // }
-
-// // function addToMessageHistory(message) {
-// //   console.log('[MESSAGE_HISTORY] Adding message to history');
-// //   messageHistory.push({
-// //     ...message,
-// //     id: Date.now(),
-// //     timestamp: new Date().toISOString()
-// //   });
-
-// //   if (messageHistory.length > 100) {
-// //     console.log('[MESSAGE_HISTORY] Trimming message history');
-// //     messageHistory.shift();
-// //   }
-// // }
-
-// // io.on('connection', (socket) => {
-// //   console.log(`🔌 [CONNECTION] New connection: ${socket.id}`);
-
-// //   // Send recent message history to new connections
-// //   if (messageHistory.length > 0) {
-// //     console.log(`[MESSAGE_HISTORY] Sending ${messageHistory.length} messages to new connection`);
-// //     socket.emit('message_history', {
-// //       type: 'message_history',
-// //       messages: messageHistory.slice(-10)
-// //     });
-// //   }
-
-// //   socket.on('join', (xrId) => {
-// //     console.log(`[JOIN] Request from ${socket.id} to join as ${xrId}`);
-// //     socket.data.xrId = xrId;
-// //     clients.set(xrId, socket);
-// //     console.log(`✅ [JOIN] Successfully joined as ${xrId}`);
-// //     broadcastDeviceList();
-// //     logCurrentDevices();
-// //   });
-
-// //   // socket.on('identify', ({ deviceName, xrId }) => {
-// //   //   console.log(`[IDENTIFY] Request from ${socket.id}: ${deviceName} (${xrId})`);
-// //   //   socket.data.deviceName = deviceName || 'Unknown';
-// //   //   socket.data.xrId = xrId;
-// //   //   clients.set(xrId, socket);
-
-// //   //   if (deviceName?.toLowerCase().includes('desktop') || xrId === 'XR-1238') {
-// //   //     console.log(`[IDENTIFY] Detected desktop client: ${xrId}`);
-// //   //     if (desktopClients.has(xrId)) {
-// //   //       console.warn(`[IDENTIFY] Duplicate desktop tab detected: ${xrId}`);
-// //   //       socket.emit('error', { message: 'Duplicate desktop tab' });
-// //   //       socket.disconnect();
-// //   //       return;
-// //   //     }
-// //   //     desktopClients.set(xrId, socket);
-// //   //   }
-
-// //   //   console.log(`[IDENTIFY] Successfully identified: ${deviceName} (${xrId})`);
-// //   //   broadcastDeviceList();
-// //   // });
-
-// //   /////////////////////////////////////////////// Identification and Device Management ///////////////////////////////////////////////
-// //    socket.on('identify', ({ deviceName, xrId }) => {
-// //   console.log(`[IDENTIFY] Request from ${socket.id}: ${deviceName} (${xrId})`);
-// //   socket.data.deviceName = deviceName || 'Unknown';
-// //   socket.data.xrId = xrId;
-// //   clients.set(xrId, socket);
-
-// //   if (deviceName?.toLowerCase().includes('desktop') || xrId === 'XR-1238') {
-// //     console.log(`[IDENTIFY] Detected desktop client: ${xrId}`);
-// //     if (desktopClients.has(xrId)) {
-// //       console.warn(`[IDENTIFY] Duplicate desktop tab detected: ${xrId}`);
-// //       socket.emit('error', { message: 'Duplicate desktop tab' });
-// //       socket.disconnect();
-// //       return;
-// //     }
-// //     desktopClients.set(xrId, socket);
-// //   }
-
-// //   console.log(`[IDENTIFY] Successfully identified: ${deviceName} (${xrId})`);
-
-// //   // 🔽 NEW: send list to everyone + immediate echo to this client
-// //   const list = buildDeviceList();
-// //   io.emit('device_list', list);
-// //   socket.emit('device_list', list);
-// // });
-
-
-// //   // WebRTC signaling
-// //   socket.on('signal', ({ type, from, to, data }) => {
-// //     console.log(`📡 [SIGNAL] ${type} signal from ${from} to ${to}`);
-// //     // Keep payload shape { type, from, data } — desktop code expects 'data' for offer/ICE
-// //     if (!to) {
-// //       console.warn(`[SIGNAL] Missing 'to' in signal from ${from}`);
-// //       return;
-// //     }
-// //     broadcastToTarget(to, 'signal', { type, from, data });
-// //   });
-
-// //   // Control commands
-// //   socket.on('control', ({ command, from, to, message }) => {
-// //     console.log(`🎮 [CONTROL] ${command} command from ${from} to ${to || 'all'}`);
-// //     const payload = { command, from, message };
-// //     if (to) {
-// //       broadcastToTarget(to, 'control', payload);
-// //     } else {
-// //       io.emit('control', payload);
-// //     }
-// //   });
-
-// //   // Messaging system
-// //   socket.on('message', ({ from, to, text, urgent }) => {
-// //     console.log(`[MESSAGE] Received message from ${from} to ${to || 'all'}: ${text}`);
-// //     const msg = {
-// //       type: 'message',
-// //       from,
-// //       to,
-// //       text,
-// //       urgent,
-// //       sender: socket.data.deviceName || from || 'unknown',
-// //       xrId: from,
-// //       timestamp: new Date().toISOString()
-// //     };
-
-// //     addToMessageHistory(msg);
-
-// //     if (to) {
-// //       broadcastToTarget(to, 'message', msg);
-// //     } else {
-// //       socket.broadcast.emit('message', msg);
-// //     }
-// //   });
-
-// //   socket.on('clear-messages', ({ by }) => {
-// //     console.log(`[CLEAR] Request to clear messages by ${by}`);
-// //     const payload = { type: 'message-cleared', by, messageId: Date.now() };
-// //     io.emit('message-cleared', payload);
-// //   });
-
-// //   socket.on('clear_confirmation', ({ device }) => {
-// //     console.log(`[CLEAR_CONFIRM] Confirmation from ${device}`);
-// //     const payload = {
-// //       type: 'message_cleared',
-// //       by: device,
-// //       timestamp: new Date().toISOString()
-// //     };
-// //     broadcastToDesktop('message_cleared', payload);
-// //   });
-
-// //   socket.on('status_report', ({ from, status }) => {
-// //     console.log(`[STATUS_REPORT] Received from ${from}: ${status}`);
-// //     const payload = {
-// //       type: 'status_report',
-// //       from,
-// //       status,
-// //       timestamp: new Date().toISOString()
-// //     };
-// //     broadcastToDesktop('status_report', payload);
-// //   });
-
-// //   socket.on('message_history', () => {
-// //     console.log(`[MESSAGE_HISTORY] Request from ${socket.id}`);
-// //     socket.emit('message_history', {
-// //       type: 'message_history',
-// //       messages: messageHistory.slice(-10)
-// //     });
-// //   });
-
-// //   socket.on('disconnect', () => {
-// //     const xrId = socket.data.xrId;
-// //     if (xrId) {
-// //       clients.delete(xrId);
-// //       if (desktopClients.get(xrId) === socket) {
-// //         desktopClients.delete(xrId);
-// //         console.log(`[DISCONNECT] Removed desktop client: ${xrId}`);
-// //       }
-// //       console.log(`❎ [DISCONNECT] ${socket.data.deviceName || 'Unknown'} (${xrId}) disconnected`);
-// //     } else {
-// //       console.log(`❎ [DISCONNECT] Anonymous ${socket.id} disconnected`);
-// //     }
-
-// //     broadcastDeviceList();
-// //     logCurrentDevices();
-// //   });
-
-// //   socket.on('error', (err) => {
-// //     console.error(`[SOCKET_ERROR] ${socket.id}:`, err);
-// //   });
-// // });
-
-// // // Start server
-// // server.listen(PORT, '0.0.0.0', () => {
-// //   console.log(`🚀 [SERVER] Running on http://0.0.0.0:${PORT}`);
-// // });
-
-// // // Graceful shutdown
-// // process.on('uncaughtException', (err) => {
-// //   console.error('[FATAL_ERROR] Uncaught exception:', err);
-// // });
-
-// // process.on('SIGINT', shutdown);
-// // process.on('SIGTERM', shutdown);
-
-// // function shutdown() {
-// //   console.log('\n[SHUTDOWN] Graceful shutdown initiated...');
-
-// //   // Disconnect all sockets
-// //   const socketCount = io.sockets.sockets.size;
-// //   console.log(`[SHUTDOWN] Disconnecting ${socketCount} sockets...`);
-// //   io.sockets.sockets.forEach(socket => {
-// //     socket.disconnect(true);
-// //   });
-
-// //   // Close Socket.IO
-// //   io.close(() => {
-// //     console.log('[SHUTDOWN] Socket.IO server closed');
-
-// //     // Close HTTP server
-// //     server.close(() => {
-// //       console.log('[SHUTDOWN] HTTP server closed');
-// //       process.exit(0);
-// //     });
-// //   });
-// // }
-
-// // console.log('[INIT] Server initialization complete');
-
-// // --------------------------------------------refresh--------------------------------------------------
-
-// // -------------------------------------- server.js --------------------------------------
-// // -----------------------------------------------
-// // backend/server.js (drop-in, multi-instance ready)
-// // -----------------------------------------------
-
-// const express = require('express');
-// const http = require('http');
-// const path = require('path');
-// const fs = require('fs');
-// const cors = require('cors');
-// const { Server } = require('socket.io');
-// const { createClient } = require('redis');
-// const { createAdapter } = require('@socket.io/redis-adapter');
-// require('dotenv').config();
-
-// // One-time instrumentation: prove which worker you hit
-// console.log('[BOOT] Instance:', process.env.WEBSITE_INSTANCE_ID || process.pid);
-// console.log('[INIT] Starting server initialization...');
-
-// // Configuration
-// const PORT = process.env.PORT || 8080;
-// console.log(`[CONFIG] Using port: ${PORT}`);
-
-// const app = express();
-// const server = http.createServer(app);
-// console.log('[HTTP] Server created');
-
-// const io = new Server(server, {
-//   cors: { origin: '*', methods: ['GET', 'POST'] },
-//   // keep default Socket.IO path unless clients expect a custom one:
-//   // path: '/socket.io'
-// });
-// console.log('[SOCKET.IO] Socket.IO server initialized');
-
-// // In-memory message history (per instance OK)
-// const messageHistory = [];
-// console.log('[STATE] Message history initialized');
-
-// // Middleware
-// app.use(cors());
-// app.use(express.json());
-// console.log('[MIDDLEWARE] CORS and JSON middleware applied');
-
-// // Static file handling
-// const staticPaths = [
-//   path.join(__dirname, 'public'),
-//   path.join(__dirname, '../frontend')
-// ];
-
-// console.log('[STATIC] Checking for static paths...');
-// let staticPathFound = null;
-// for (const dir of staticPaths) {
-//   if (fs.existsSync(dir)) {
-//     app.use(express.static(dir));
-//     staticPathFound = dir;
-//     console.log(`[STATIC] Serving from ${dir}`);
-//   }
-// }
-// if (!staticPathFound) {
-//   console.warn('⚠️ [STATIC] No static path found.');
-// }
-
-// // TURN injection into HTML
-// function injectTurnConfig(html) {
-//   const cfg = `
-//     <script>
-//       window.TURN_CONFIG = {
-//         urls: '${process.env.TURN_URL || ''}',
-//         username: '${process.env.TURN_USERNAME || ''}',
-//         credential: '${process.env.TURN_CREDENTIAL || ''}'
-//       };
-//     </script>`;
-//   return html.replace('</body>', `${cfg}\n</body>`);
-// }
-
-// // -------- Presence helpers (global via adapter) --------
-// function roomOf(xrId) {
-//   return `xr:${xrId}`;
-// }
-
-// // Build device list across ALL instances (thanks to Redis adapter / fetchSockets)
-// async function buildDeviceListGlobal() {
-//   const sockets = await io.fetchSockets(); // RemoteSocket[] across nodes
-//   return sockets
-//     .filter(s => s.data && s.data.xrId)
-//     .map(s => ({
-//       xrId: s.data.xrId,
-//       deviceName: s.data.deviceName || 'Unknown'
-//     }));
-// }
-
-// async function broadcastDeviceList() {
-//   console.log('[DEVICE_LIST] Broadcasting device list');
-//   try {
-//     const list = await buildDeviceListGlobal();
-//     io.emit('device_list', list);
-//   } catch (e) {
-//     console.warn('[DEVICE_LIST] Failed to build list:', e.message);
-//   }
-// }
-
-// function addToMessageHistory(message) {
-//   messageHistory.push({
-//     ...message,
-//     id: Date.now(),
-//     timestamp: new Date().toISOString()
-//   });
-//   if (messageHistory.length > 100) {
-//     messageHistory.shift();
-//   }
-// }
-
-// // -------- Health & routes --------
-// app.get('/health', async (req, res) => {
-//   console.log('[HEALTH] Health check requested');
-//   try {
-//     const sockets = await io.fetchSockets();
-//     res.status(200).json({
-//       status: 'healthy',
-//       timestamp: new Date().toISOString(),
-//       instanceId: process.env.WEBSITE_INSTANCE_ID || process.pid,
-//       connectedClients: sockets.length
-//     });
-//   } catch {
-//     res.status(200).json({
-//       status: 'healthy',
-//       timestamp: new Date().toISOString(),
-//       instanceId: process.env.WEBSITE_INSTANCE_ID || process.pid,
-//       connectedClients: 'unknown'
-//     });
-//   }
-// });
-
-// app.get('/', (req, res) => {
-//   console.log('[ROUTE] Serving root path');
-//   if (!staticPathFound) return res.status(404).send('Static not found');
-//   const html = fs.readFileSync(path.join(staticPathFound, 'index.html'), 'utf8');
-//   res.send(injectTurnConfig(html));
-// });
-
-// app.get('*', (req, res) => {
-//   console.log(`[ROUTE] Catch-all route for: ${req.path}`);
-//   if (!staticPathFound) return res.status(404).send('Static not found');
-//   const html = fs.readFileSync(path.join(staticPathFound, 'index.html'), 'utf8');
-//   res.send(injectTurnConfig(html));
-// });
-
-// // -------- Attach Redis adapter (optional but recommended on Azure) --------
-// (async () => {
-//   try {
-//     const REDIS_URL = process.env.REDIS_URL;
-//     if (!REDIS_URL) {
-//       console.warn('[SOCKET.IO] No REDIS_URL set. Running single-instance/in-memory.');
-//     } else {
-//       const useTls = (process.env.REDIS_TLS || 'true').toLowerCase() === 'true';
-//       const pub = createClient({ url: REDIS_URL, socket: { tls: useTls } });
-//       const sub = pub.duplicate();
-//       await Promise.all([pub.connect(), sub.connect()]);
-//       io.adapter(createAdapter(pub, sub));
-//       console.log('[SOCKET.IO] Redis adapter attached');
-//     }
-//   } catch (e) {
-//     console.error('[SOCKET.IO] Redis adapter failed, continuing in-memory:', e.message);
-//   }
-// })();
-
-// // -------- Socket.IO logic --------
-// io.on('connection', (socket) => {
-//   console.log(`🔌 [CONNECTION] ${socket.id}`);
-
-//   // Send recent message history to new connections
-//   if (messageHistory.length > 0) {
-//     socket.emit('message_history', {
-//       type: 'message_history',
-//       messages: messageHistory.slice(-10)
-//     });
-//   }
-
-//   // Lightweight presence (no local Map reliance)
-//   socket.on('join', (xrId) => {
-//     socket.data.xrId = xrId;
-//     socket.join(roomOf(xrId));
-//     console.log(`[JOIN] ${socket.id} joined as ${xrId}`);
-//     // Echo list to just-joined client
-//     (async () => {
-//       socket.emit('device_list', await buildDeviceListGlobal());
-//       await broadcastDeviceList();
-//     })().catch(() => {});
-//   });
-
-//   // Identification and Device Management
-//   socket.on('identify', async ({ deviceName, xrId }) => {
-//     socket.data.deviceName = deviceName || 'Unknown';
-//     socket.data.xrId = xrId;
-//     socket.join(roomOf(xrId));
-//     console.log(`[IDENTIFY] ${socket.data.deviceName} (${xrId}) at ${socket.id}`);
-
-//     // 1) Echo list to this client
-//     socket.emit('device_list', await buildDeviceListGlobal());
-//     // 2) Broadcast updated list to everyone
-//     await broadcastDeviceList();
-//   });
-
-//   // On-demand device list (useful after reconnect)
-//   socket.on('request_device_list', async () => {
-//     socket.emit('device_list', await buildDeviceListGlobal());
-//   });
-
-//   // WebRTC signaling (cross-node targeting by xrId via room)
-//   socket.on('signal', ({ type, from, to, data }) => {
-//     if (!to) {
-//       console.warn(`[SIGNAL] Missing 'to' in signal from ${from}`);
-//       return;
-//     }
-//     console.log(`📡 [SIGNAL] ${type} from ${from} -> ${to}`);
-//     io.to(roomOf(to)).emit('signal', { type, from, data });
-//   });
-
-//   // Control commands
-//   socket.on('control', ({ command, from, to, message }) => {
-//     console.log(`🎮 [CONTROL] ${command} from ${from} -> ${to || 'all'}`);
-//     const payload = { command, from, message };
-//     if (to) io.to(roomOf(to)).emit('control', payload);
-//     else io.emit('control', payload);
-//   });
-
-//   // Messaging system
-//   socket.on('message', ({ from, to, text, urgent }) => {
-//     console.log(`[MESSAGE] ${from} -> ${to || 'all'}: ${text}`);
-//     const msg = {
-//       type: 'message',
-//       from,
-//       to,
-//       text,
-//       urgent,
-//       sender: socket.data.deviceName || from || 'unknown',
-//       xrId: from,
-//       timestamp: new Date().toISOString()
-//     };
-
-//     addToMessageHistory(msg);
-
-//     if (to) io.to(roomOf(to)).emit('message', msg);
-//     else socket.broadcast.emit('message', msg);
-//   });
-
-//   // Clear/messages + status (broadcast to all)
-//   socket.on('clear-messages', ({ by }) => {
-//     const payload = { type: 'message-cleared', by, messageId: Date.now() };
-//     io.emit('message-cleared', payload);
-//   });
-
-//   socket.on('clear_confirmation', ({ device }) => {
-//     const payload = {
-//       type: 'message_cleared',
-//       by: device,
-//       timestamp: new Date().toISOString()
-//     };
-//     io.emit('message_cleared', payload);
-//   });
-
-//   socket.on('status_report', ({ from, status }) => {
-//     const payload = { type: 'status_report', from, status, timestamp: new Date().toISOString() };
-//     io.emit('status_report', payload);
-//   });
-
-//   socket.on('message_history', () => {
-//     socket.emit('message_history', {
-//       type: 'message_history',
-//       messages: messageHistory.slice(-10)
-//     });
-//   });
-
-//   socket.on('disconnect', async () => {
-//     console.log(`❎ [DISCONNECT] ${socket.data.deviceName || 'Unknown'} (${socket.data.xrId || 'n/a'})`);
-//     try { await broadcastDeviceList(); } catch {}
-//   });
-
-//   socket.on('error', (err) => {
-//     console.error(`[SOCKET_ERROR] ${socket.id}:`, err);
-//   });
-// });
-
-// // Start server
-// server.listen(PORT, '0.0.0.0', () => {
-//   console.log(`🚀 [SERVER] Running on http://0.0.0.0:${PORT}`);
-// });
-
-// // Graceful shutdown
-// process.on('uncaughtException', (err) => {
-//   console.error('[FATAL_ERROR] Uncaught exception:', err);
-// });
-
-// process.on('SIGINT', shutdown);
-// process.on('SIGTERM', shutdown);
-
-// function shutdown() {
-//   console.log('\n[SHUTDOWN] Graceful shutdown initiated...');
-//   const socketCount = io.sockets.sockets.size;
-//   console.log(`[SHUTDOWN] Disconnecting ${socketCount} sockets...`);
-//   io.sockets.sockets.forEach(s => s.disconnect(true));
-
-//   io.close(() => {
-//     console.log('[SHUTDOWN] Socket.IO server closed');
-//     server.close(() => {
-//       console.log('[SHUTDOWN] HTTP server closed');
-//       process.exit(0);
-//     });
-//   });
-// }
-
-// console.log('[INIT] Server initialization complete');
-
-// =======================================================================================================================================
-
-
-// backend/server.js
+// ===========================================redis with room concept=================================================================
+ 
+// server.js (room-concept merged + verbose debug logs)
+ 
+// // -------------------- Imports & Env --------------------
 const express = require('express');
 const http = require('http');
 const path = require('path');
@@ -690,67 +11,98 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 const { createClient } = require('redis');
 const { createAdapter } = require('@socket.io/redis-adapter');
-
-// -------- Load .env (backend/.env OR root/.env) --------
+ 
 const dotenv = require('dotenv');
 const envCandidates = [
-  path.resolve(__dirname, '.env'),        // backend/.env
-  path.resolve(__dirname, '..', '.env'),  // root/.env
+  path.resolve(__dirname, '.env'),
+  path.resolve(__dirname, '..', '.env'),
 ];
 let loadedFrom = null;
 for (const p of envCandidates) {
-  if (fs.existsSync(p)) { dotenv.config({ path: p }); loadedFrom = p; break; }
+  if (fs.existsSync(p)) {
+    dotenv.config({ path: p });
+    loadedFrom = p;
+    break;
+  }
 }
 console.log('[ENV] .env loaded from:', loadedFrom || 'process.env only');
-
-// One-time instrumentation: prove which worker you hit
 console.log('[BOOT] Instance:', process.env.WEBSITE_INSTANCE_ID || process.pid);
+ 
+// -------------------- Debug helpers --------------------
+const DEBUG_LOGS = (process.env.DEBUG_LOGS || 'true').toLowerCase() === 'true';
+ 
+function dlog(...args) {
+  if (DEBUG_LOGS) console.log(...['[DEBUG]'].concat(args));
+}
+function dwarn(...args) {
+  console.warn(...['[WARN]'].concat(args));
+}
+function derr(...args) {
+  console.error(...['[ERROR]'].concat(args));
+}
+function trimStr(s, max = 140) {
+  if (typeof s !== 'string') return s;
+  return s.length > max ? `${s.slice(0, max)}…(${s.length})` : s;
+}
+function safeDataPreview(obj) {
+  try {
+    const s = JSON.stringify(obj);
+    return trimStr(s, 300);
+  } catch {
+    return '[unserializable]';
+  }
+}
+ 
+// -------------------- Config & Servers --------------------
 console.log('[INIT] Starting server initialization...');
-
-// Configuration
 const PORT = process.env.PORT || 8080;
 console.log(`[CONFIG] Using port: ${PORT}`);
-
+ 
 const app = express();
 const server = http.createServer(app);
 console.log('[HTTP] Server created');
-
+ 
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
-  transports: ['websocket'],    // Azure-friendly (no long-poll)
+  transports: ['websocket'], // Azure-friendly
   pingInterval: 25000,
   pingTimeout: 30000,
 });
 console.log('[SOCKET.IO] Socket.IO server initialized');
-
-// In-memory message history (per instance OK)
-const messageHistory = [];
-console.log('[STATE] Message history initialized');
-
-// Middleware
+ 
+// -------------------- Middleware --------------------
 app.use(cors());
 app.use(express.json());
-console.log('[MIDDLEWARE] CORS and JSON middleware applied');
-
-// Static file handling
+console.log('[MIDDLEWARE] CORS + JSON enabled');
+ 
+// -------------------- Static --------------------
 const staticPaths = [
   path.join(__dirname, 'public'),
   path.join(__dirname, '../frontend'),
 ];
-
-console.log('[STATIC] Checking for static paths...');
 let staticPathFound = null;
 for (const dir of staticPaths) {
   if (fs.existsSync(dir)) {
     app.use(express.static(dir));
     staticPathFound = dir;
-    console.log(`[STATIC] Serving from ${dir}`);
+    console.log(`[STATIC] Serving static from ${dir}`);
+  } else {
+    dlog('[STATIC] Not found:', dir);
   }
 }
-if (!staticPathFound) console.warn('⚠️ [STATIC] No static path found.');
-
-// TURN injection into HTML
+if (!staticPathFound) dwarn('⚠️ No static path found.');
+// Route for cockpit page
+app.get('/scribe-cockpit', (req, res) => {
+  const cockpitPath = path.join(__dirname, '../frontend/scribe-cockpit.html');
+  console.log('[ROUTE] /scribe-cockpit hit');
+  res.sendFile(cockpitPath);
+});
+ 
+ 
+ 
+// -------------------- TURN Injection --------------------
 function injectTurnConfig(html) {
+  dlog('[TURN] injectTurnConfig start');
   const cfg = `
     <script>
       window.TURN_CONFIG = {
@@ -759,14 +111,94 @@ function injectTurnConfig(html) {
         credential: '${process.env.TURN_CREDENTIAL || ''}'
       };
     </script>`;
+  dlog('[TURN] injectTurnConfig done');
   return html.replace('</body>', `${cfg}\n</body>`);
 }
-
-// -------- Presence helpers (global via adapter) --------
-function roomOf(xrId) { return `xr:${xrId}`; }
-
-// Build device list across ALL instances (dedup by xrId; last wins)
+ 
+// -------------------- Room Concept State --------------------
+const clients = new Map();        // xrId -> socket
+const desktopClients = new Map(); // xrId -> desktop socket
+const onlineDevices = new Map();  // xrId -> socket (convenience)
+dlog('[ROOM] State maps initialized');
+ 
+const allowedPairs = new Set([normalizePair('XR-1234', 'XR-1238')]);
+const PAIRINGS_MAP = new Map([
+  ['XR-1234', 'XR-1238'],
+  ['XR-1238', 'XR-1234'],
+]);
+dlog('[ROOM] allowedPairs:', Array.from(allowedPairs));
+dlog('[ROOM] PAIRINGS_MAP:', Array.from(PAIRINGS_MAP.entries()));
+ 
+function normalizePair(a, b) {
+  return [a, b].sort().join('|');
+}
+async function isPairAllowed(a, b) {
+  const key = normalizePair(a, b);
+  const allowed = allowedPairs.has(key);
+  dlog('[PAIR] isPairAllowed?', a, b, '=>', allowed, 'key=', key);
+  return allowed;
+}
+function getRoomIdForPair(a, b) {
+  const [one, two] = [a, b].sort();
+  const roomId = `pair:${one}:${two}`;
+  dlog('[ROOM] getRoomIdForPair', a, b, '=>', roomId);
+  return roomId;
+}
+function listRoomMembers(roomId) {
+  const set = io.sockets.adapter.rooms.get(roomId);
+  if (!set) {
+    dlog('[ROOM] listRoomMembers: empty for', roomId);
+    return [];
+  }
+  const members = Array.from(set).map((sid) => {
+    const s = io.sockets.sockets.get(sid);
+    return s?.data?.xrId || sid;
+  });
+  dlog('[ROOM] listRoomMembers', roomId, '=>', members);
+  return members;
+}
+async function tryAutoPair(deviceId) {
+  dlog('[AUTO_PAIR] attempt for', deviceId);
+  const partnerId = PAIRINGS_MAP.get(deviceId);
+  dlog('[AUTO_PAIR] partnerId:', partnerId);
+  if (!partnerId) return false;
+ 
+  const meSocket = clients.get(deviceId);
+  const partnerSocket = clients.get(partnerId);
+  dlog('[AUTO_PAIR] me?', !!meSocket, 'partner?', !!partnerSocket);
+  if (!meSocket || !partnerSocket) return false;
+ 
+  const allowed = await isPairAllowed(deviceId, partnerId);
+  if (!allowed) return false;
+ 
+  const roomId = getRoomIdForPair(deviceId, partnerId);
+  const room = io.sockets.adapter.rooms.get(roomId);
+  const memberCount = room ? room.size : 0;
+  dlog('[AUTO_PAIR] roomId:', roomId, 'current members:', memberCount);
+  if (memberCount >= 2) return false;
+ 
+  await meSocket.join(roomId);
+  await partnerSocket.join(roomId);
+  meSocket.data.roomId = roomId;
+  partnerSocket.data.roomId = roomId;
+  dlog('[AUTO_PAIR] joined both to', roomId);
+ 
+  const members = listRoomMembers(roomId);
+  io.to(roomId).emit('room_joined', { roomId, members });
+  dlog('[AUTO_PAIR] room_joined emitted for', roomId, 'members:', members);
+  return true;
+}
+ 
+// -------------------- Utilities --------------------
+function roomOf(xrId) {
+  return `xr:${xrId}`;
+}
+ 
+const messageHistory = [];
+dlog('[STATE] messageHistory initialized');
+ 
 async function buildDeviceListGlobal() {
+  dlog('[DEVICE_LIST] building (global via fetchSockets)');
   const sockets = await io.fetchSockets();
   const byId = new Map();
   for (const s of sockets) {
@@ -774,205 +206,423 @@ async function buildDeviceListGlobal() {
     if (!id) continue;
     byId.set(id, { xrId: id, deviceName: s.data.deviceName || 'Unknown' });
   }
-  return [...byId.values()];
+  const list = [...byId.values()];
+  dlog('[DEVICE_LIST] built:', list);
+  return list;
 }
-
 async function broadcastDeviceList() {
-  console.log('[DEVICE_LIST] Broadcasting device list');
+  dlog('[DEVICE_LIST] broadcast start');
   try {
-    io.emit('device_list', await buildDeviceListGlobal());
+    const list = await buildDeviceListGlobal();
+    io.emit('device_list', list);
+    dlog('[DEVICE_LIST] broadcast done (size:', list.length, ')');
   } catch (e) {
-    console.warn('[DEVICE_LIST] Failed to build list:', e.message);
+    dwarn('[DEVICE_LIST] Failed to build list:', e.message);
   }
 }
-
 function addToMessageHistory(message) {
   messageHistory.push({ ...message, id: Date.now(), timestamp: new Date().toISOString() });
-  if (messageHistory.length > 100) messageHistory.shift();
+  if (messageHistory.length > 100) {
+    messageHistory.shift();
+  }
+  dlog('[MSG_HISTORY] added; len=', messageHistory.length);
 }
-
-// -------- Health & routes --------
+ 
+// -------------------- Routes --------------------
 app.get('/health', async (_req, res) => {
-  console.log('[HEALTH] Health check requested');
+  dlog('[HEALTH] request');
   try {
     const sockets = await io.fetchSockets();
     res.status(200).json({
       status: 'healthy',
       timestamp: new Date().toISOString(),
       instanceId: process.env.WEBSITE_INSTANCE_ID || process.pid,
-      connectedClients: sockets.length
+      connectedClients: sockets.length,
     });
   } catch {
     res.status(200).json({
       status: 'healthy',
       timestamp: new Date().toISOString(),
       instanceId: process.env.WEBSITE_INSTANCE_ID || process.pid,
-      connectedClients: 'unknown'
+      connectedClients: 'unknown',
     });
   }
 });
-
+ 
 app.get('/', (_req, res) => {
-  console.log('[ROUTE] Serving root path');
+  dlog('[ROUTE] /');
   if (!staticPathFound) return res.status(404).send('Static not found');
   const html = fs.readFileSync(path.join(staticPathFound, 'index.html'), 'utf8');
   res.send(injectTurnConfig(html));
 });
-
 app.get('*', (req, res) => {
-  console.log(`[ROUTE] Catch-all route for: ${req.path}`);
+  dlog('[ROUTE] *', req.path);
   if (!staticPathFound) return res.status(404).send('Static not found');
   const html = fs.readFileSync(path.join(staticPathFound, 'index.html'), 'utf8');
   res.send(injectTurnConfig(html));
 });
-
-// -------- Attach Redis adapter (recommended on Azure) --------
+ 
+// -------------------- Redis Adapter --------------------
 (async () => {
   try {
     const REDIS_URL = process.env.REDIS_URL;
-    if (!REDIS_URL) {
-      console.warn('[SOCKET.IO] No REDIS_URL set. Running single-instance/in-memory.');
-    } else {
+    if (REDIS_URL) {
       const useTls = (process.env.REDIS_TLS || 'true').toLowerCase() === 'true';
+      dlog('[REDIS] connecting', { REDIS_URL: trimStr(REDIS_URL, 80), useTls });
       const pub = createClient({ url: REDIS_URL, socket: { tls: useTls } });
       const sub = pub.duplicate();
       await Promise.all([pub.connect(), sub.connect()]);
       io.adapter(createAdapter(pub, sub));
       console.log('[SOCKET.IO] Redis adapter attached');
+    } else {
+      dwarn('[SOCKET.IO] No REDIS_URL set. Running without Redis adapter.');
     }
   } catch (e) {
-    console.error('[SOCKET.IO] Redis adapter failed, continuing in-memory:', e.message);
+    derr('[SOCKET.IO] Redis adapter failed; continuing in-memory:', e.message);
   }
 })();
-
-// -------- Socket.IO logic --------
+ 
+// -------------------- Socket.IO Handlers --------------------
 io.on('connection', (socket) => {
   console.log(`🔌 [CONNECTION] ${socket.id}`);
-
-  // Send recent message history to new connections
+  dlog('[CONNECTION] handshake.query:', safeDataPreview(socket.handshake?.query));
+ 
+  // Send recent message history
   if (messageHistory.length > 0) {
-    socket.emit('message_history', {
-      type: 'message_history',
-      messages: messageHistory.slice(-10),
-    });
+    const recent = messageHistory.slice(-10);
+    dlog('[CONNECTION] sending message_history size=', recent.length);
+    socket.emit('message_history', { type: 'message_history', messages: recent });
   }
-
-  // Lightweight presence
+ 
+  // -------- join --------
   socket.on('join', (xrId) => {
+    dlog('[EVENT] join', xrId);
     socket.data.xrId = xrId;
     socket.join(roomOf(xrId));
-    console.log(`[JOIN] ${socket.id} joined as ${xrId}`);
+    clients.set(xrId, socket);
+    onlineDevices.set(xrId, socket);
     (async () => {
-      socket.emit('device_list', await buildDeviceListGlobal());
-      await broadcastDeviceList();
-    })().catch(() => {});
+      try {
+        const list = await buildDeviceListGlobal();
+        socket.emit('device_list', list);
+        await broadcastDeviceList();
+      } catch (e) {
+        derr('[join] broadcast err:', e.message);
+      }
+    })();
   });
-
-  // Identification and Device Management
+ 
+  // -------- identify --------
+  // socket.on('identify', async ({ deviceName, xrId }) => {
+  //   dlog('[EVENT] identify', { deviceName, xrId });
+  //   socket.data.deviceName = deviceName || 'Unknown';
+  //   socket.data.xrId = xrId;
+ 
+  //   socket.join(roomOf(xrId));
+  //   clients.set(xrId, socket);
+  //   onlineDevices.set(xrId, socket);
+ 
+  //   if (deviceName?.toLowerCase().includes('desktop') || xrId === 'XR-1238') {
+  //     desktopClients.set(xrId, socket);
+  //     dlog('[IDENTIFY] desktop client tracked', xrId);
+  //   }
+ 
+  //   try {
+  //     const list = await buildDeviceListGlobal();
+  //     socket.emit('device_list', list);
+  //     await broadcastDeviceList();
+  //   } catch (e) {
+  //     derr('[identify] device_list error:', e.message);
+  //   }
+ 
+  //   try {
+  //     await tryAutoPair(xrId);
+  //   } catch (e) {
+  //     derr('[identify] tryAutoPair error:', e.message);
+  //   }
+  // });
   socket.on('identify', async ({ deviceName, xrId }) => {
-    socket.data.deviceName = deviceName || 'Unknown';
-    socket.data.xrId = xrId;
-    socket.join(roomOf(xrId));
-    console.log(`[IDENTIFY] ${socket.data.deviceName} (${xrId}) at ${socket.id}`);
-    socket.emit('device_list', await buildDeviceListGlobal()); // echo to this client
-    await broadcastDeviceList();                                // and broadcast to all
-  });
-
-  // On-demand device list (useful after reconnect)
+  dlog('[EVENT] identify', { deviceName, xrId });
+ 
+  // Basic identity
+  socket.data.deviceName = deviceName || 'Unknown';
+  socket.data.xrId = xrId;
+ 
+  // Always join personal room and register in maps
+  try {
+    await socket.join(roomOf(xrId));
+  } catch (e) {
+    dwarn('[IDENTIFY] failed to join personal room:', e?.message || e);
+  }
+  clients.set(xrId, socket);
+  onlineDevices.set(xrId, socket);
+ 
+  // ---- Refresh-safe desktop handling ----
+  // If this is the desktop client, replace any existing desktop socket for the same xrId
+  if ((deviceName?.toLowerCase().includes('desktop')) || xrId === 'XR-1238') {
+    const existing = desktopClients.get(xrId);
+ 
+    if (existing && existing.id !== socket.id) {
+      dlog('[IDENTIFY] Detected existing desktop session for', xrId, '— replacing (likely refresh)');
+      const prevRoomId = existing?.data?.roomId;
+ 
+      // Move new socket into the previous room (if any) BEFORE disconnecting old one.
+      if (prevRoomId) {
+        try {
+          await socket.join(prevRoomId);
+          socket.data.roomId = prevRoomId;
+          const members = listRoomMembers(prevRoomId);
+          dlog('[IDENTIFY] Migrated new socket into previous room', prevRoomId, 'members:', members);
+          io.to(prevRoomId).emit('room_joined', { roomId: prevRoomId, members });
+        } catch (e) {
+          dwarn('[IDENTIFY] Failed to migrate room on refresh:', e?.message || e);
+          // If migration fails, fall back to auto-pair later.
+          socket.data.roomId = null;
+        }
+      }
+ 
+      // Politely notify and disconnect the old socket
+      try { existing.emit('error', { message: 'Replaced by new session (refresh)' }); } catch {}
+      try { existing.disconnect(true); } catch (e) { dwarn('[IDENTIFY] error disconnecting old desktop socket:', e?.message || e); }
+    }
+ 
+    // Track (or re-track) the desktop socket
+    desktopClients.set(xrId, socket);
+    dlog('[IDENTIFY] desktop client tracked', xrId);
+  }
+ 
+  // Echo list to this client and broadcast updated global list
+  try {
+    const list = await buildDeviceListGlobal();
+    socket.emit('device_list', list);
+    await broadcastDeviceList();
+  } catch (e) {
+    derr('[identify] device_list error:', e.message);
+  }
+ 
+  // If not already in a migrated room, attempt server-driven auto-pairing
+  try {
+    if (!socket.data?.roomId) {
+      await tryAutoPair(xrId);
+    } else {
+      dlog('[IDENTIFY] Skipping tryAutoPair; already in room', socket.data.roomId);
+    }
+  } catch (e) {
+    derr('[identify] tryAutoPair error:', e.message);
+  }
+});
+ 
+  // -------- request_device_list --------
   socket.on('request_device_list', async () => {
-    try { socket.emit('device_list', await buildDeviceListGlobal()); }
-    catch (e) { console.warn('[DEVICE_LIST] request failed', e.message); }
+    dlog('[EVENT] request_device_list');
+    try {
+      socket.emit('device_list', await buildDeviceListGlobal());
+    } catch (e) {
+      dwarn('[request_device_list] failed:', e.message);
+    }
   });
-
-  // WebRTC signaling (cross-node targeting by xrId via room)
+ 
+  // -------- pair_with --------
+  socket.on('pair_with', async ({ peerId }) => {
+    dlog('[EVENT] pair_with', { me: socket.data?.xrId, peerId });
+    try {
+      const me = socket.data?.xrId;
+      if (!me || !peerId) {
+        dwarn('[pair_with] missing me or peerId');
+        socket.emit('pair_error', { message: 'Identify and provide peerId' });
+        return;
+      }
+      const allowed = await isPairAllowed(me, peerId);
+      if (!allowed) {
+        dwarn('[pair_with] not allowed', me, peerId);
+        socket.emit('pair_error', { message: 'Pairing not allowed' });
+        return;
+      }
+      const roomId = getRoomIdForPair(me, peerId);
+      await socket.join(roomId);
+      socket.data.roomId = roomId;
+ 
+      const members = listRoomMembers(roomId);
+      io.to(roomId).emit('room_joined', { roomId, members });
+      dlog('[pair_with] room_joined emitted', { roomId, members });
+    } catch (err) {
+      derr('[pair_with] error:', err.message);
+      socket.emit('pair_error', { message: 'Internal server error during pairing' });
+    }
+  });
+ 
+  // -------- signal --------
   socket.on('signal', ({ type, from, to, data }) => {
-    if (!to) return console.warn(`[SIGNAL] Missing 'to' in signal from ${from}`);
-    console.log(`📡 [SIGNAL] ${type} from ${from} -> ${to}`);
-    io.to(roomOf(to)).emit('signal', { type, from, data });
+    dlog('📡 [EVENT] signal', { type, from, to, dataPreview: safeDataPreview(data) });
+    try {
+      if (to) {
+        dlog('[signal] direct target routing to', to);
+        io.to(roomOf(to)).emit('signal', { type, from, data });
+        return;
+      }
+      const roomId = socket.data?.roomId;
+      if (!roomId) {
+        dwarn('[signal] no "to" and no roomId; ignoring');
+        socket.emit('signal_error', { message: 'No room joined and no "to" specified' });
+        return;
+      }
+      dlog('[signal] room forward', roomId);
+      socket.to(roomId).emit('signal', { type, from, data });
+    } catch (err) {
+      derr('[signal] handler error:', err.message);
+    }
   });
-
-  // Control commands
+ 
+  // -------- control --------
   socket.on('control', ({ command, from, to, message }) => {
-    console.log(`🎮 [CONTROL] ${command} from ${from} -> ${to || 'all'}`);
+    dlog('🎮 [EVENT] control', { command, from, to, message: trimStr(message || '') });
     const payload = { command, from, message };
-    if (to) io.to(roomOf(to)).emit('control', payload);
-    else io.emit('control', payload);
+    try {
+      if (to) {
+        dlog('[control] direct to', to);
+        io.to(roomOf(to)).emit('control', payload);
+      } else {
+        const roomId = socket.data?.roomId;
+        if (roomId) {
+          dlog('[control] room emit', roomId);
+          io.to(roomId).emit('control', payload);
+        } else {
+          dlog('[control] global emit');
+          io.emit('control', payload);
+        }
+      }
+    } catch (err) {
+      derr('[control] handler error:', err.message);
+    }
   });
-
-  // Messaging system
+ 
+  // -------- message --------
   socket.on('message', ({ from, to, text, urgent }) => {
-    console.log(`[MESSAGE] ${from} -> ${to || 'all'}: ${text}`);
-    const msg = {
-      type: 'message',
-      from, to, text, urgent,
-      sender: socket.data.deviceName || from || 'unknown',
-      xrId: from,
-      timestamp: new Date().toISOString(),
-    };
-    addToMessageHistory(msg);
-    if (to) io.to(roomOf(to)).emit('message', msg);
-    else socket.broadcast.emit('message', msg);
+    dlog('[EVENT] message', { from, to, urgent, text: trimStr(text || '') });
+    try {
+      const msg = {
+        type: 'message',
+        from,
+        to,
+        text,
+        urgent,
+        sender: socket.data.deviceName || from || 'unknown',
+        xrId: from,
+        timestamp: new Date().toISOString(),
+      };
+      addToMessageHistory(msg);
+ 
+      if (to) {
+        dlog('[message] direct to', to);
+        io.to(roomOf(to)).emit('message', msg);
+      } else {
+        const roomId = socket.data?.roomId;
+        if (roomId) {
+          dlog('[message] room emit', roomId);
+          io.to(roomId).emit('message', msg);
+        } else {
+          dlog('[message] global broadcast (excluding sender)');
+          socket.broadcast.emit('message', msg);
+        }
+      }
+    } catch (err) {
+      derr('[message] handler error:', err.message);
+    }
   });
-
-  // Clear/messages + status (broadcast to all)
+ 
+  // -------- clear-messages --------
   socket.on('clear-messages', ({ by }) => {
+    dlog('[EVENT] clear-messages', { by });
     const payload = { type: 'message-cleared', by, messageId: Date.now() };
     io.emit('message-cleared', payload);
   });
-
+ 
+  // -------- clear_confirmation --------
   socket.on('clear_confirmation', ({ device }) => {
+    dlog('[EVENT] clear_confirmation', { device });
     const payload = { type: 'message_cleared', by: device, timestamp: new Date().toISOString() };
     io.emit('message_cleared', payload);
   });
-
+ 
+  // -------- status_report --------
   socket.on('status_report', ({ from, status }) => {
-    const payload = { type: 'status_report', from, status, timestamp: new Date().toISOString() };
-    io.emit('status_report', payload);
+    dlog('[EVENT] status_report', { from, status: trimStr(status || '') });
+    const payload = {
+      type: 'status_report',
+      from,
+      status,
+      timestamp: new Date().toISOString(),
+    };
+    const roomId = socket.data?.roomId;
+    if (roomId) {
+      dlog('[status_report] room emit', roomId);
+      io.to(roomId).emit('status_report', payload);
+    } else {
+      dlog('[status_report] global emit');
+      io.emit('status_report', payload);
+    }
   });
-
+ 
+  // -------- message_history (on demand) --------
   socket.on('message_history', () => {
+    dlog('[EVENT] message_history request');
     socket.emit('message_history', {
       type: 'message_history',
       messages: messageHistory.slice(-10),
     });
   });
-
-  socket.on('disconnect', async () => {
-    console.log(`❎ [DISCONNECT] ${socket.data.deviceName || 'Unknown'} (${socket.data.xrId || 'n/a'})`);
-    try { await broadcastDeviceList(); } catch {}
+ 
+  // -------- disconnect --------
+  socket.on('disconnect', async (reason) => {
+    dlog('❎ [EVENT] disconnect', { reason, xrId: socket.data?.xrId, device: socket.data?.deviceName });
+    try {
+      const xrId = socket.data?.xrId;
+      if (xrId) {
+        clients.delete(xrId);
+        onlineDevices.delete(xrId);
+        if (desktopClients.get(xrId) === socket) {
+          desktopClients.delete(xrId);
+          dlog('[disconnect] removed desktop client:', xrId);
+        }
+      }
+      await broadcastDeviceList();
+    } catch (err) {
+      derr('[disconnect] cleanup error:', err.message);
+    }
   });
-
+ 
+  // -------- error --------
   socket.on('error', (err) => {
-    console.error(`[SOCKET_ERROR] ${socket.id}:`, err);
+    derr(`[SOCKET_ERROR] ${socket.id}:`, err?.message || err);
   });
 });
-
-// Start server
+ 
+// -------------------- Start & Shutdown --------------------
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 [SERVER] Running on http://0.0.0.0:${PORT}`);
 });
-
-// Graceful shutdown
+ 
 process.on('uncaughtException', (err) => {
-  console.error('[FATAL_ERROR] Uncaught exception:', err);
+  derr('[FATAL] uncaughtException:', err?.stack || err?.message || err);
 });
-
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
-
+ 
 function shutdown() {
-  console.log('\n[SHUTDOWN] Graceful shutdown initiated...');
-  const socketCount = io.sockets.sockets.size;
-  console.log(`[SHUTDOWN] Disconnecting ${socketCount} sockets...`);
-  io.sockets.sockets.forEach(s => s.disconnect(true));
-
-  io.close(() => {
-    console.log('[SHUTDOWN] Socket.IO server closed');
-    server.close(() => {
-      console.log('[SHUTDOWN] HTTP server closed');
-      process.exit(0);
+  console.log('\n[SHUTDOWN] Starting graceful shutdown…');
+  try {
+    const socketCount = io.sockets.sockets.size;
+    dlog('[SHUTDOWN] active sockets:', socketCount);
+    io.sockets.sockets.forEach((s) => s.disconnect(true));
+    io.close(() => {
+      console.log('[SHUTDOWN] Socket.IO closed');
+      server.close(() => {
+        console.log('[SHUTDOWN] HTTP server closed');
+        process.exit(0);
+      });
     });
-  });
+  } catch (e) {
+    derr('[SHUTDOWN] error:', e.message);
+    process.exit(1);
+  }
 }
-
-console.log('[INIT] Server initialization complete');
