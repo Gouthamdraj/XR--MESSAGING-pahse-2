@@ -30,16 +30,16 @@ jobs:
         run: npm install --force
 
       # Create the build directory structure that 'serve' expects
-      # - name: Prepare frontend files
-      #   working-directory: frontend
-      #   run: |
-      #     mkdir -p build
-      #     cp index.html *.js *.css build/
       - name: Prepare frontend files
         working-directory: frontend
         run: |
           mkdir -p build
-          cp -r * build/
+          cp *.html *.js *.css build/
+      # - name: Prepare frontend files
+      #   working-directory: frontend
+      #   run: |
+      #     mkdir -p build
+      #     cp -r * build/
 
       # Copy frontend to backend/public (for your backend to serve)
       - name: Copy frontend to backend
@@ -79,4 +79,5 @@ jobs:
           slot-name: 'Production'
           package: release.zip
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_B711FBC961CA4D669DFD7810D502A2DE }}
+
 
