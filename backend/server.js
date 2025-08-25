@@ -64,11 +64,41 @@ console.log('[SOCKET.IO] Socket.IO server initialized');
 app.use(cors());
 app.use(express.json());
 console.log('[MIDDLEWARE] CORS + JSON enabled');
+// // -------------------- Static --------------------
+// const staticPaths = [
+//   path.join(__dirname, 'public'),
+//   path.join(__dirname, '../frontend'),
+// ];
+// let staticPathFound = null;
+// for (const dir of staticPaths) {
+//   if (fs.existsSync(dir)) {
+//     app.use(express.static(dir));
+//     staticPathFound = dir;
+//     console.log(`[STATIC] Serving static from ${dir}`);
+//   } else {
+//     dlog('[STATIC] Not found:', dir);
+//   }
+// }
+// if (!staticPathFound) dwarn('⚠️ No static path found.');
+ 
+// // Route for cockpit page (works with backend/public or ../frontend)
+// app.get(['/scribe-cockpit', '/scribe-cockpit.html'], (req, res) => {
+//   const candidates = [
+//     path.join(__dirname, 'public', 'scribe-cockpit.html'),
+//     path.join(__dirname, '..', 'frontend', 'scribe-cockpit.html'),
+//   ];
+//   const hit = candidates.find(p => fs.existsSync(p));
+//   console.log('[ROUTE] /scribe-cockpit hit. Candidates:', candidates, 'Chosen:', hit);
+//   if (!hit) return res.status(404).send('scribe-cockpit.html not found');
+//   res.sendFile(hit);
+// });
+
 // -------------------- Static --------------------
 const staticPaths = [
   path.join(__dirname, 'public'),
-  path.join(__dirname, '../frontend'),
+  path.join(__dirname, '../frontend'),  // or '../frontend/dist' if build output
 ];
+
 let staticPathFound = null;
 for (const dir of staticPaths) {
   if (fs.existsSync(dir)) {
@@ -76,24 +106,32 @@ for (const dir of staticPaths) {
     staticPathFound = dir;
     console.log(`[STATIC] Serving static from ${dir}`);
   } else {
-    dlog('[STATIC] Not found:', dir);
+    console.log('[STATIC] Not found:', dir);
   }
 }
-if (!staticPathFound) dwarn('⚠️ No static path found.');
- 
-// Route for cockpit page (works with backend/public or ../frontend)
+if (!staticPathFound) console.warn('⚠️ No static path found.');
+
+// -------------------- Cockpit Route --------------------
 app.get(['/scribe-cockpit', '/scribe-cockpit.html'], (req, res) => {
   const candidates = [
     path.join(__dirname, 'public', 'scribe-cockpit.html'),
     path.join(__dirname, '..', 'frontend', 'scribe-cockpit.html'),
+    path.join(__dirname, '..', 'frontend', 'dist', 'scribe-cockpit.html'), // 👈 include dist if you build frontend
   ];
+
   const hit = candidates.find(p => fs.existsSync(p));
   console.log('[ROUTE] /scribe-cockpit hit. Candidates:', candidates, 'Chosen:', hit);
-  if (!hit) return res.status(404).send('scribe-cockpit.html not found');
+
+  if (!hit) {
+    return res.status(404).send('scribe-cockpit.html not found');
+  }
   res.sendFile(hit);
 });
 
-
+// -------------------- 404 handler (MUST be last) --------------------
+app.use((req, res) => {
+  res.status(404).send('Not Found');
+});
  
 // -------------------- TURN Injection --------------------
 function injectTurnConfig(html) {
