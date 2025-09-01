@@ -34,7 +34,7 @@ jobs:
         working-directory: frontend
         run: |
           mkdir -p build
-          cp *.html *.js *.css build/
+          cp -r * build/
       # - name: Prepare frontend files
       #   working-directory: frontend
       #   run: |
@@ -79,5 +79,6 @@ jobs:
           slot-name: 'Production'
           package: release.zip
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_B711FBC961CA4D669DFD7810D502A2DE }}
+
 
 
