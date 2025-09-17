@@ -14,48 +14,49 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Step 1: Checkout code
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Step 2: Set up Node.js
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20.19.4'
 
-      # Install root dependencies (if you have any root-level scripts)
+      # Step 3: Install root dependencies (if any)
       - name: Install root dependencies
         run: npm install
 
-      # Install frontend dependencies
+      # Step 4: Install frontend dependencies and build frontend
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm install --force
 
-      # Copy all frontend files (HTML, CSS, JS, PNG, fonts, etc.)
-      - name: Prepare frontend files
+      - name: Build frontend
         working-directory: frontend
         run: |
           mkdir -p build
           cp *.html *.js *.css *.png build/
 
-      # Copy frontend build into backend/public
+      # Step 5: Copy frontend build into backend/public
       - name: Copy frontend to backend
         run: |
           mkdir -p backend/public
           cp -r frontend/build/* backend/public/
 
-      # Install backend dependencies
+      # Step 6: Install backend dependencies (without including node_modules in zip)
       - name: Install backend dependencies
         working-directory: backend
         run: npm install --force
 
-      # Zip backend for deployment
+      # Step 7: Zip backend for deployment (exclude node_modules)
       - name: Zip backend for deployment
         run: |
           cd backend
           zip -r ../release.zip . -x "node_modules/*"
 
-      # Deploy directly to Azure (no artifact upload!)
+      # Step 8: Deploy to Azure Web App
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
@@ -64,6 +65,7 @@ jobs:
           package: release.zip
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_B711FBC961CA4D669DFD7810D502A2DE }}
           enable-oryx-build: true
+
 
 
 
