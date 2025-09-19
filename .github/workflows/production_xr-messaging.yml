@@ -62,8 +62,9 @@ jobs:
         with:
           app-name: 'xr-messaging'
           slot-name: 'Production'
-          package: release.zip
+          package: .
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_B711FBC961CA4D669DFD7810D502A2DE }}
+
 
 
 
