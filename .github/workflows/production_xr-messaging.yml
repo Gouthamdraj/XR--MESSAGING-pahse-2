@@ -14,58 +14,41 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Checkout code
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2: Set up Node.js
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.19.0'
+          node-version: 20
 
-      # ===== Desktop Web =====
-      - name: Install frontend dependencies (desktop)
-        working-directory: desktop-web/frontend
+      # Install root dependencies (for npm-run-all)
+      - name: Install root dependencies
         run: npm install --force
 
-      - name: Build frontend (desktop)
-        working-directory: desktop-web/frontend
-        run: npm run build || npm run build:prod || echo "No build script found"
-
-      - name: Copy desktop build to backend
+      # Install and build desktop-web backend
+      - name: Install desktop-web backend
         run: |
-          mkdir -p desktop-web/backend/public
-          cp -r desktop-web/frontend/build/* desktop-web/backend/public/ || true
+          cd desktop-web/backend
+          npm install --force
 
-      - name: Install backend dependencies (desktop)
-        working-directory: desktop-web/backend
-        run: npm install --force
-
-      # ===== Device PWA =====
-      - name: Install frontend dependencies (device)
-        working-directory: device-pwa/frontend
-        run: npm install --force
-
-      - name: Build frontend (device)
-        working-directory: device-pwa/frontend
-        run: npm run build || npm run build:prod || echo "No build script found"
-
-      - name: Copy device build to backend
+      # Install and build device-pwa backend
+      - name: Install device-pwa backend
         run: |
-          mkdir -p device-pwa/backend/public
-          cp -r device-pwa/frontend/build/* device-pwa/backend/public/ || true
+          cd device-pwa/backend
+          npm install --force
 
-      - name: Install backend dependencies (device)
-        working-directory: device-pwa/backend
-        run: npm install --force
+      # Optional: run your combined build or start scripts
+      - name: Run build (if needed)
+        run: npm run bootstrap
 
-      # ===== Deploy combined app =====
+      # Zip & deploy both apps
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
-          app-name: 'xr-messaging'
-          slot-name: 'Production'
+          app-name: xr-messaging
+          slot-name: production
           package: .
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_D6D0F44F5A774D408C405532F9EA0817 }}
+
 
