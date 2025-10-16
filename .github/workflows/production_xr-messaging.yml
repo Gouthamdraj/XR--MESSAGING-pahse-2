@@ -1,7 +1,7 @@
 # Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
 # More GitHub Actions for Azure: https://github.com/Azure/actions
 
-name: Build and deploy both Node.js apps to Azure Web App - xr-messaging
+name: Build and deploy Node.js apps to Azure Web App - xr-messaging
 
 on:
   push:
@@ -24,22 +24,22 @@ jobs:
         with:
           node-version: '20.19.0'
 
-      # ===== Desktop Webapp =====
+      # ===== Desktop Web =====
       - name: Install frontend dependencies (desktop)
-        working-directory: descotop-webapp/frontend
+        working-directory: desktop-web/frontend
         run: npm install --force
 
       - name: Build frontend (desktop)
-        working-directory: descotop-webapp/frontend
+        working-directory: desktop-web/frontend
         run: npm run build || npm run build:prod || echo "No build script found"
 
       - name: Copy desktop build to backend
         run: |
-          mkdir -p descotop-webapp/backend/public
-          cp -r descotop-webapp/frontend/build/* descotop-webapp/backend/public/ || true
+          mkdir -p desktop-web/backend/public
+          cp -r desktop-web/frontend/build/* desktop-web/backend/public/ || true
 
       - name: Install backend dependencies (desktop)
-        working-directory: descotop-webapp/backend
+        working-directory: desktop-web/backend
         run: npm install --force
 
       # ===== Device PWA =====
@@ -68,3 +68,4 @@ jobs:
           slot-name: 'Production'
           package: .
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_D6D0F44F5A774D408C405532F9EA0817 }}
+
