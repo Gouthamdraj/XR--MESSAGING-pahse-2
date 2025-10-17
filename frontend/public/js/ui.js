@@ -16,12 +16,7 @@ import { Message, appendMessage } from './messages.js';
 // ----------------- Constants (parity) -----------------
 const ANDROID_XR_ID = (window.XR_DEVICE_ID || 'XR-1234');
 const DEFAULT_DESKTOP_ID = (window.XR_OPERATOR_ID || 'XR-1238');
-// Prefer centrally-configured hub when present, but keep old behavior as-is
-const SERVER_URL =
-    (window.XR_CONFIG && window.XR_CONFIG.HUB_URL) || // e.g., 'http://localhost:8080' (optional)
-    window.HUB_URL ||                                 // optional alias if you set it
-    window.SIGNAL_URL ||                              // your existing global (unchanged)
-    location.origin;
+const SERVER_URL = (window.SIGNAL_URL || location.origin);
 
 // Speech settings
 const PARTIAL_THROTTLE_MS = 800;

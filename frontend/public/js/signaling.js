@@ -20,13 +20,7 @@ export class SignalingClient {
       const override = qp.get('signal');
       const injected = window.__SIGNAL_URL__;
       let stored = null; try { stored = localStorage.getItem('signal_url') || null; } catch { }
-      // Prefer centrally-configured HUB_URL if present (opt-in), but keep existing behavior
-      const hinted =
-        (window.XR_CONFIG && window.XR_CONFIG.HUB_URL) ||  // e.g., 'http://localhost:8080'
-        window.HUB_URL ||                                  // optional alias you might set
-        window.SIGNAL_URL ||                               // your existing global
-        null;
-
+      const hinted = window.SIGNAL_URL || null;
       const same = window.location?.origin || null;
 
       resolvedUrl = override || injected || stored || hinted || same || resolvedUrl || null;
@@ -64,15 +58,15 @@ export class SignalingClient {
     }
 
     // bind once
-    this._onConnect = this._onConnect.bind(this);
-    this._onDisconnect = this._onDisconnect.bind(this);
-    this._onConnectError = this._onConnectError.bind(this); // ← FIX: make sure method exists below
-    this._onSignal = this._onSignal.bind(this);
-    this._onDeviceList = this._onDeviceList.bind(this);
-    this._onPeerLeft = this._onPeerLeft.bind(this);
-    this._onMessage = this._onMessage.bind(this);
-    this._onMessageHistory = this._onMessageHistory.bind(this);
-    this._onControl = this._onControl.bind(this);      // ← NEW: control passthrough
+    this._onConnect       = this._onConnect.bind(this);
+    this._onDisconnect    = this._onDisconnect.bind(this);
+    this._onConnectError  = this._onConnectError.bind(this); // ← FIX: make sure method exists below
+    this._onSignal        = this._onSignal.bind(this);
+    this._onDeviceList    = this._onDeviceList.bind(this);
+    this._onPeerLeft      = this._onPeerLeft.bind(this);
+    this._onMessage       = this._onMessage.bind(this);
+    this._onMessageHistory= this._onMessageHistory.bind(this);
+    this._onControl       = this._onControl.bind(this);      // ← NEW: control passthrough
   }
 
   /** Establish the Socket.IO connection. Mirrors Android options. */
@@ -94,21 +88,21 @@ export class SignalingClient {
     this.socket = this.io(this.serverUrl, opts);
 
     // Core lifecycle
-    this.socket.on('connect', this._onConnect);
-    this.socket.on('disconnect', this._onDisconnect);
-    this.socket.on('connect_error', this._onConnectError);
+    this.socket.on('connect',        this._onConnect);
+    this.socket.on('disconnect',     this._onDisconnect);
+    this.socket.on('connect_error',  this._onConnectError);
 
     // Signaling + presence
-    this.socket.on('signal', this._onSignal);
-    this.socket.on('device_list', this._onDeviceList);
-    this.socket.on('peer_left', this._onPeerLeft);
+    this.socket.on('signal',         this._onSignal);
+    this.socket.on('device_list',    this._onDeviceList);
+    this.socket.on('peer_left',      this._onPeerLeft);
 
     // Optional passthroughs
-    this.socket.on('message', this._onMessage);
-    this.socket.on('message_history', this._onMessageHistory);
+    this.socket.on('message',        this._onMessage);
+    this.socket.on('message_history',this._onMessageHistory);
 
     // NEW: forward control events to UI (APK parity)
-    this.socket.on('control', this._onControl);
+    this.socket.on('control',        this._onControl);
   }
 
   /** Disable/enable automatic reconnection like Android setReconnectionEnabled(). */
@@ -136,15 +130,15 @@ export class SignalingClient {
     try { this.socket.io?.reconnection(false); } catch { /* no-op */ }
 
     // Remove listeners
-    this.socket.off('connect', this._onConnect);
-    this.socket.off('disconnect', this._onDisconnect);
-    this.socket.off('connect_error', this._onConnectError);
-    this.socket.off('signal', this._onSignal);
-    this.socket.off('device_list', this._onDeviceList);
-    this.socket.off('peer_left', this._onPeerLeft);
-    this.socket.off('message', this._onMessage);
+    this.socket.off('connect',         this._onConnect);
+    this.socket.off('disconnect',      this._onDisconnect);
+    this.socket.off('connect_error',   this._onConnectError);
+    this.socket.off('signal',          this._onSignal);
+    this.socket.off('device_list',     this._onDeviceList);
+    this.socket.off('peer_left',       this._onPeerLeft);
+    this.socket.off('message',         this._onMessage);
     this.socket.off('message_history', this._onMessageHistory);
-    this.socket.off('control', this._onControl);
+    this.socket.off('control',         this._onControl);
 
     try { this.socket.disconnect(); } catch { /* no-op */ }
     this.socket = null;
@@ -292,9 +286,9 @@ export class SignalingClient {
   }
 
   // --- Optional convenience (APK parity) ---
-  sendMessage(payload) { this._send('message', payload); }
-  sendControl(payload) { this._send('control', payload); }
-  sendTelemetry(payload) { this._send('telemetry', payload); }
+  sendMessage(payload)  { this._send('message', payload); }
+  sendControl(payload)  { this._send('control', payload); }
+  sendTelemetry(payload){ this._send('telemetry', payload); }
 
   _send(event, data) {
     const s = this.socket;
