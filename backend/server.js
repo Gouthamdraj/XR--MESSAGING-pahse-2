@@ -10,6 +10,8 @@ const { Server } = require('socket.io');
 const { createClient } = require('redis');
 const { createAdapter } = require('@socket.io/redis-adapter');
 const axios = require('axios'); // for SOAP note generation
+const sql = require('mssql');   // MSSQL driver
+const { Sequelize } = require('sequelize');
 
 
 const dotenv = require('dotenv');
@@ -82,92 +84,73 @@ app.use(cors());
 app.use(express.json());
 console.log('[MIDDLEWARE] CORS + JSON enabled');
 
+// -------------------- UI routes (migrated from frontend/server.js) --------------------
+// Point these to your FRONTEND folders on disk:
+const VIEWS_DIR = path.join(__dirname, '../frontend/views');
+const PUBLIC_DIR = path.join(__dirname, '../frontend/public');
 
-// Block any /dashboard/* on 8080
-// app.use((req, res, next) => {
-//   const p = (req.path || '').toLowerCase();
-//   if (p === '/dashboard' || p === '/dashboard.html' || p.startsWith('/dashboard/')) {
-//     return res.status(404).type('text/plain').send('Not Found');
-//   }
-//   next();
-// });
+// Serve static assets (CSS/JS/images) under /public
+app.use('/public', express.static(PUBLIC_DIR));
+
+// Keep HTML fresh (optional, safe for XR flows)
+app.use((req, res, next) => {
+  if (req.method === 'GET' && (req.headers.accept || '').includes('text/html')) {
+    res.set('Cache-Control', 'no-store');
+  }
+  next();
+});
+
+const sendView = (name) => (_req, res) => res.sendFile(path.join(VIEWS_DIR, name));
+const sendPublic = (name) => (_req, res) => res.sendFile(path.join(PUBLIC_DIR, name));
+
+// PWA top-level files (keep at root paths)
+app.get('/manifest.webmanifest', sendPublic('manifest.webmanifest'));
+// ✅ Fix: alias /sw.js → use existing file public/js/sw-device.js
+app.get('/sw.js', (req, res) => {
+  res.type('application/javascript');
+  res.sendFile(path.join(PUBLIC_DIR, 'js', 'sw-device.js'));
+});
+
+// PWA (Device-only) files
+app.get('/device.webmanifest', (req, res) => {
+  res.type('webmanifest');
+  res.sendFile(path.join(PUBLIC_DIR, 'device.webmanifest'));
+});
+
+app.get('/device/sw.js', (req, res) => {
+  // scope service worker to /device/
+  res.set('Service-Worker-Allowed', '/device/');
+  res.type('application/javascript');
+  res.sendFile(path.join(PUBLIC_DIR, 'js', 'sw-device.js'));
+});
 
 
-// Block /dashboard/* only when users hit this app directly on :8080
-// Block /dashboard/* only in development when users hit :8080 directly
-if (!IS_PROD) {
-  app.use((req, res, next) => {
-    const p = (req.originalUrl || '').split('?')[0].toLowerCase();
-    const host = (req.headers.host || '').toLowerCase();
-    const isDirect8080 =
-      host.endsWith(':8080') ||
-      req.socket?.localPort === 8080 ||
-      req.socket?.address()?.port === 8080;
-    const isDashboard = p === '/dashboard' || p === '/dashboard.html' || p.startsWith('/dashboard/');
-    if (isDirect8080 && isDashboard) {
-      return res.status(404).type('text/plain').send('Not Found');
-    }
-    next();
-  });
-}
+
+// Pretty routes → views
+app.get(['/device', '/device/'], sendView('device.html'));
+app.get(['/dashboard', '/dashboard/'], sendView('dashboard.html'));
+app.get(['/scribe-cockpit', '/scribe-cockpit/'], sendView('scribe-cockpit.html'));
+// (optional legacy)
+app.get(['/operator', '/operator/'], sendView('operator.html'));
 
 
+
+// Root route → views/index.html
+app.get('/', sendView('index.html'));
 
 
 
 
 
 // -------------------- Static --------------------
-
-// // -------------------- Static (serve FRONTEND) --------------------
-// const ROOT = path.resolve(__dirname, '..');                 // repo root
-// const FRONTEND_PUBLIC = path.join(ROOT, 'frontend', 'public');
-// const BACKEND_PUBLIC = path.join(__dirname, 'public');     // optional backend-only assets
-
-// // Serve frontend assets (html, js, css, images, manifest, service worker)
-// if (fs.existsSync(FRONTEND_PUBLIC)) {
-//   app.use(express.static(FRONTEND_PUBLIC, { index: false, maxAge: IS_PROD ? '1h' : 0 }));
-//   console.log(`[STATIC] Serving frontend/public from ${FRONTEND_PUBLIC}`);
-// } else {
-//   console.warn('[STATIC] frontend/public not found');
-// }
-
-// // (optional) keep backend/public if you really have backend-only assets
-// if (fs.existsSync(BACKEND_PUBLIC)) {
-//   app.use(express.static(BACKEND_PUBLIC, { index: false }));
-//   console.log(`[STATIC] Also serving backend/public from ${BACKEND_PUBLIC}`);
-// }
-
-// // -------------------- HTML routes (extensionless paths) --------------------
-// const sendFront = (res, file) => res.sendFile(path.join(FRONTEND_PUBLIC, file));
-
-// app.get('/', (_req, res) => sendFront(res, 'index.html'));
-// app.get('/device', (_req, res) => sendFront(res, 'device.html'));
-// app.get('/operator', (_req, res) => sendFront(res, 'operator.html'));
-// app.get('/dashboard', (_req, res) => sendFront(res, 'dashboard.html'));
-// app.get('/scribe-cockpit', (_req, res) => sendFront(res, 'scribe-cockpit.html'));
-
-// -------------------- Static (serve FRONTEND) --------------------
-const LOCAL_FRONTEND = path.join(__dirname, '..', 'frontend', 'public');
-const BACKEND_PUBLIC = path.join(__dirname, 'public');
-
-//  Choose path dynamically: use frontend/public in local, backend/public in Azure
-const STATIC_PATH = fs.existsSync(LOCAL_FRONTEND) ? LOCAL_FRONTEND : BACKEND_PUBLIC;
-
-app.use(express.static(STATIC_PATH, { index: false, maxAge: IS_PROD ? '1h' : 0 }));
-console.log(`[STATIC] Serving static files from ${STATIC_PATH}`);
-
-// -------------------- HTML routes (extensionless paths) --------------------
-const sendFront = (res, file) => res.sendFile(path.join(STATIC_PATH, file));
-
-app.get('/', (_req, res) => sendFront(res, 'index.html'));
-app.get('/device', (_req, res) => sendFront(res, 'device.html'));
-app.get('/operator', (_req, res) => sendFront(res, 'operator.html'));
-app.get('/dashboard', (_req, res) => sendFront(res, 'dashboard.html'));
-app.get('/scribe-cockpit', (_req, res) => sendFront(res, 'scribe-cockpit.html'));
-
-// Optional fallback for SPA-style routes (not required but safe)
-app.get('*', (_req, res) => sendFront(res, 'index.html'));
+// Frontend now serves all UI. Do NOT expose ../frontend here.
+const backendPublic = path.join(__dirname, 'public');
+if (fs.existsSync(backendPublic)) {
+  app.use(express.static(backendPublic)); // keep only if you really have backend-only assets
+  console.log(`[STATIC] Serving static from ${backendPublic}`);
+} else {
+  dlog('[STATIC] backend/public not found');
+}
 
 // -------------------- TURN Injection --------------------
 function injectTurnConfig(html) {
@@ -271,10 +254,6 @@ function broadcastPairs() {
   dlog('[PAIR] broadcastPairs:', pairs);
 }
 
-
-
-
-
 async function tryAutoPair(deviceId) {
   dlog('[AUTO_PAIR] attempt for', deviceId);
   const partnerId = PAIRINGS_MAP.get(deviceId);
@@ -318,19 +297,6 @@ function roomOf(xrId) {
 const messageHistory = [];
 dlog('[STATE] messageHistory initialized');
 
-// async function buildDeviceListGlobal() {
-//   dlog('[DEVICE_LIST] building (global via fetchSockets)');
-//   const sockets = await io.fetchSockets();
-//   const byId = new Map();
-//   for (const s of sockets) {
-//     const id = s?.data?.xrId;
-//     if (!id) continue;
-//     byId.set(id, { xrId: id, deviceName: s.data.deviceName || 'Unknown' });
-//   }
-//   const list = [...byId.values()];
-//   dlog('[DEVICE_LIST] built:', list);
-//   return list;
-// }
 
 async function buildDeviceListGlobal() {
   dlog('[DEVICE_LIST] building (global via fetchSockets)');
@@ -416,6 +382,44 @@ app.get('/health', async (_req, res) => {
 });
 
 
+// Service Principal (Local or other fallback)
+sequelize = new Sequelize(process.env.DB_NAME, process.env.DB_CLIENT_ID, process.env.DB_CLIENT_SECRET, {
+  host: process.env.DB_SERVER,
+  dialect: 'mssql',
+  port: parseInt(process.env.DB_PORT),
+  dialectOptions: {
+    authentication: {
+      type: 'azure-active-directory-service-principal-secret',
+      options: {
+        clientId: process.env.DB_CLIENT_ID,
+        clientSecret: process.env.DB_CLIENT_SECRET,
+        tenantId: process.env.DB_TENANT_ID
+      }
+    },
+    encrypt: true
+  }
+});
+
+async function connectToDatabase() {
+  try {
+    await sequelize.authenticate();
+    console.log('Connected to Azure SQL Database successfully');
+
+    await sequelize.sync({ alter: false })
+      .then(() => console.log('Database synced'))
+      .catch((err) => {
+        console.error('Error syncing database:', err);
+        process.exit(1);
+      });
+
+
+  } catch (err) {
+    console.error('Error connecting to the database:', err);
+    throw err;
+  }
+}
+connectToDatabase();
+
 // ---- Desktop HTTP telemetry (beginner path) ----
 app.post('/desktop-telemetry', (req, res) => {
   try {
@@ -490,7 +494,6 @@ app.post('/desktop-telemetry', (req, res) => {
     derr('[SOCKET.IO] Redis adapter failed; continuing in-memory:', e.message);
   }
 })();
-
 
 
 
@@ -596,6 +599,122 @@ async function generateSoapNote(transcript) {
       "Medication": ["Error generating note"],
     };
   }
+}
+
+// Parse Medication from SOAP note, check dbo.DrugMaster.drug, and log availability
+async function checkSoapMedicationAvailability(soapNote, opts = {}) {
+  const schema = opts.schema || 'dbo';
+  const table = opts.table || 'DrugMaster';
+  const nameCol = opts.nameCol || 'drug';
+
+  // Normalize a term in JS exactly the same way we normalize in SQL
+  function normalizeTerm(s) {
+    return String(s || '')
+      .toLowerCase()
+      .replace(/[ \-\/\.,'()]/g, ''); // remove spaces and punctuation
+  }
+
+  function extractDrugQuery(raw) {
+    if (!raw) return null;
+    let s = String(raw)
+      .replace(/^[-•]\s*/u, '')
+      .replace(/\(.*?\)/g, '')
+      .replace(/\b(tablet|tablets|tab|tabs|capsule|capsules|cap|caps|syrup|susp(?:ension)?|inj(?:ection)?)\b/gi, '')
+      .replace(/\b(po|od|bd|tid|qid|prn|q\d+h|iv|im|sc|sl)\b/gi, '')
+      .replace(/\b\d+(\.\d+)?\s*(mg|mcg|g|kg|ml|l|iu|units|%)\b/gi, '')
+      .split(/\b\d/)[0]
+      .replace(/[.,;:/]+$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return s || null;
+  }
+
+  // Updated: stronger, consistent matching with status=1 filter
+  async function findDrugMatch(q) {
+    const raw = String(q || '').trim();
+    const rawLike = `%${raw}%`;
+    const norm = normalizeTerm(raw);
+    const normLike = `%${norm}%`;
+
+    // SQL-side normalization expression (mirrors normalizeTerm)
+    const normExpr = `
+      REPLACE(
+        REPLACE(
+          REPLACE(
+            REPLACE(
+              REPLACE(
+                REPLACE(
+                  REPLACE(
+                    REPLACE(LOWER([${nameCol}]), '-', ''), ',', ''), '/', ''), '.', ''), '''', ''), ' ', ''), '(', ''), ')', '')
+    `;
+
+    const sql = `
+      SELECT TOP 1 [${nameCol}] AS name
+      FROM [${schema}].[${table}]
+      WHERE status = 1
+        AND [${nameCol}] IS NOT NULL
+        AND (
+          -- Exact (raw)
+          LOWER([${nameCol}]) = LOWER(:raw)
+          -- Contains (raw)
+          OR LOWER([${nameCol}]) LIKE LOWER(:rawLike)
+          -- Exact (normalized)
+          OR ${normExpr} = :norm
+          -- Contains (normalized)
+          OR ${normExpr} LIKE :normLike
+        )
+      ORDER BY
+        CASE
+          WHEN ${normExpr} = :norm THEN 1
+          WHEN LOWER([${nameCol}]) = LOWER(:raw) THEN 2
+          WHEN ${normExpr} LIKE :normLike THEN 3
+          ELSE 4
+        END,
+        [${nameCol}];
+    `;
+
+    const rows = await sequelize.query(sql, {
+      replacements: { raw, rawLike, norm, normLike },
+      type: Sequelize.QueryTypes.SELECT
+    });
+    return rows?.[0]?.name || null;
+  }
+
+  const meds = Array.isArray(soapNote?.Medication) ? soapNote.Medication : [];
+  const queries = Array.from(new Set(
+    meds
+      .map(m => typeof m === 'string' ? m : (m?.name || m?.drug || m?.Medication || ''))
+      .map(extractDrugQuery)
+      .filter(Boolean)
+  ));
+
+  if (queries.length === 0) {
+    console.log('[DRUG_CHECK] No medication entries to check.');
+    return { results: [] };
+  }
+
+  const results = [];
+  console.log(`[DRUG_CHECK] Checking ${queries.length} medication name(s) against ${schema}.${table}.${nameCol} ...`);
+  for (const q of queries) {
+    try {
+      const matched = await findDrugMatch(q);
+      if (matched) {
+        console.log(`[DRUG_CHECK] "${q}" => AVAILABLE (matched as "${matched}")`);
+        results.push({ query: q, status: 'exists', matched });
+      } else {
+        console.log(`[DRUG_CHECK] "${q}" => NOT FOUND`);
+        results.push({ query: q, status: 'not_found', matched: null });
+      }
+    } catch (e) {
+      console.log(`[DRUG_CHECK] "${q}" => ERROR: ${e.message || e}`);
+      results.push({ query: q, status: 'error', error: String(e) });
+    }
+  }
+
+  const ok = results.filter(r => r.status === 'exists').length;
+  const nf = results.filter(r => r.status === 'not_found').length;
+  console.log(`[DRUG_CHECK] Summary: ${ok} found, ${nf} not found, ${results.length - ok - nf} errors.`);
+  return { results };
 }
 
 // -------------------- Socket.IO Handlers --------------------
@@ -782,28 +901,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // // -------- signal --------
-  // socket.on('signal', ({ type, from, to, data }) => {
-  //   dlog('📡 [EVENT] signal', { type, from, to, dataPreview: safeDataPreview(data) });
-  //   try {
-  //     if (to) {
-  //       dlog('[signal] direct target routing to', to);
-  //       io.to(roomOf(to)).emit('signal', { type, from, data });
-  //       return;
-  //     }
-  //     const roomId = socket.data?.roomId;
-  //     if (!roomId) {
-  //       dwarn('[signal] no "to" and no roomId; ignoring');
-  //       socket.emit('signal_error', { message: 'No room joined and no "to" specified' });
-  //       return;
-  //     }
-  //     dlog('[signal] room forward', roomId);
-  //     socket.to(roomId).emit('signal', { type, from, data });
-  //   } catch (err) {
-  //     derr('[signal] handler error:', err.message);
-  //   }
-  // });
-
   // -------- signal --------
   socket.on('signal', (payload) => {
     // 1) Normalize payload (object or JSON string)
@@ -912,11 +1009,6 @@ io.on('connection', (socket) => {
     }
   });
 
-
-
-
-
-
   // -------- message (transcript -> web console via signal) --------
   socket.on('message', (payload) => {
     dlog('[EVENT] message', safeDataPreview(payload));
@@ -947,6 +1039,7 @@ io.on('connection', (socket) => {
       };
 
       try {
+        // Forward transcript to the intended UI
         if (to) {
           io.to(roomOf(to)).emit('signal', { type: 'transcript_console', from, data: out });
           dlog('[transcript] emitted signal "transcript_console" to', to);
@@ -955,19 +1048,42 @@ io.on('connection', (socket) => {
           dlog('[transcript] emitted signal "transcript_console" to room', socket.data.roomId);
         }
 
-        //  Generate SOAP note if this transcript is final
+        // Generate SOAP note if this transcript is final
         if (out.final && out.text) {
           (async () => {
-            const soapNote = await generateSoapNote(out.text);
+            try {
+              const soapNote = await generateSoapNote(out.text);
 
-            // Send SOAP note back to app.js  console
-            io.to(socket.data?.roomId || roomOf(to)).emit('signal', {
-              type: 'soap_note_console',
-              from,
-              data: soapNote,
-            });
+              const target = socket.data?.roomId || (to ? roomOf(to) : null);
 
-            console.log('[SOAP_NOTE]', JSON.stringify(soapNote, null, 2));
+              // Send SOAP note back to console UI
+              if (target) {
+                io.to(target).emit('signal', {
+                  type: 'soap_note_console',
+                  from,
+                  data: soapNote,
+                });
+              }
+              console.log('[SOAP_NOTE]', JSON.stringify(soapNote, null, 2));
+
+              // Check Medication against dbo.DrugMaster(drug) and log availability
+              const { results } = await checkSoapMedicationAvailability(soapNote, {
+                schema: 'dbo',
+                table: 'DrugMaster',
+                nameCol: 'drug',
+              });
+
+              // Optionally emit availability to UI console too
+              if (target) {
+                io.to(target).emit('signal', {
+                  type: 'drug_availability_console',
+                  from,
+                  data: results,
+                });
+              }
+            } catch (e) {
+              console.error('[SOAP/DRUG] failed:', e?.message || e);
+            }
           })();
         }
       } catch (e) {
@@ -976,6 +1092,7 @@ io.on('connection', (socket) => {
 
       return; // stop normal message path
     }
+
 
 
     // Normal chat message path (unchanged)
@@ -1063,57 +1180,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // -------- telemetry (NEW) --------
-  // -------- telemetry (NEW) --------
-  // socket.on('telemetry', (payload) => {
-  //   try {
-  //     const d = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
-  //     const xrId = d.xrId || socket.data?.xrId;
-  //     if (!xrId) return;
-
-  //     const rec = {
-  //       xrId,
-  //       connType: d.connType || 'none',   // 'wifi' | 'cellular' | 'ethernet' | 'other' | 'none'
-  //       wifiDbm: numOrNull(d.wifiDbm),
-  //       wifiMbps: numOrNull(d.wifiMbps),
-  //       wifiBars: numOrNull(d.wifiBars),
-  //       cellDbm: numOrNull(d.cellDbm),
-  //       cellBars: numOrNull(d.cellBars),
-  //       netDownMbps: numOrNull(d.netDownMbps),
-  //       netUpMbps: numOrNull(d.netUpMbps),
-  //       ts: Date.now(),
-  //     };
-
-  //     // keep latest
-  //     telemetryByDevice.set(xrId, rec);
-
-  //     // 🔵 push into time-series history (for charts)
-  //     pushHist(telemetryHist, xrId, {
-  //       ts: rec.ts,
-  //       connType: rec.connType,
-  //       wifiMbps: rec.wifiMbps,
-  //       netDownMbps: rec.netDownMbps,
-  //       netUpMbps: rec.netUpMbps,
-  //       // pull current battery if we have it
-  //       batteryPct: batteryByDevice.get(xrId)?.pct ?? null,
-  //     });
-
-  //     // 🔵 live delta to subscribers of this device’s detail modal
-  //     io.to(`metrics:${xrId}`).emit('metrics_update', {
-  //       xrId,
-  //       telemetry: [telemetryHist.get(xrId).at(-1)]
-  //     });
-
-  //     // existing broadcast that powers the summary row
-  //     io.emit('telemetry_update', rec);
-
-  //     dlog('[telemetry] update', rec);
-  //   } catch (e) {
-  //     dwarn('[telemetry] bad payload:', e?.message || e);
-  //   }
-  // });
-
-  // -------- telemetry (NEW) --------
   // -------- telemetry (NEW) --------
   socket.on('telemetry', (payload) => {
     try {
@@ -1250,33 +1316,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // // Final cleanup and presence broadcast
-  // socket.on('disconnect', async (reason) => {
-  //   dlog('❎ [EVENT] disconnect', {
-  //     reason,
-  //     xrId: socket.data?.xrId,
-  //     device: socket.data?.deviceName
-  //   });
 
-  //   try {
-  //     const xrId = socket.data?.xrId;
-  //     if (xrId) {
-  //       // Remove from your in-memory maps
-  //       clients.delete(xrId);
-  //       onlineDevices.delete(xrId);
-
-  //       if (desktopClients.get(xrId) === socket) {
-  //         desktopClients.delete(xrId);
-  //         dlog('[disconnect] removed desktop client:', xrId);
-  //       }
-  //     }
-
-  //     // Broadcast device list so UIs update without manual refresh
-  //     await broadcastDeviceList();
-  //   } catch (err) {
-  //     derr('[disconnect] cleanup error:', err.message);
-  //   }
-  // });
 
   // Final cleanup and presence broadcast
   socket.on('disconnect', async (reason) => {

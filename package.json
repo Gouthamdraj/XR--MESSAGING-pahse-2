@@ -1,26 +1,25 @@
 {
   "name": "xr-messaging-root",
   "version": "1.0.0",
-  "description": "XR Messaging System root configuration",
+  "description": "XR Messaging System (single-server setup)",
+  "private": true,
   "scripts": {
-    "start": "npm-run-all --parallel start:server start:frontend",
-    "start:server": "cd backend && npm start",
-    "start:frontend": "cd frontend && npm start"
+    "start": "node backend/server.js",
+    "dev": "nodemon backend/server.js",
+    "clean": "rimraf backend/node_modules node_modules"
   },
   "devDependencies": {
-    "concurrently": "^9.2.0",
-    "npm-run-all": "^4.1.5"
+    "nodemon": "^3.1.7",
+    "rimraf": "^5.0.10"
   },
-  "dependencies": {
-    "@ffmpeg-installer/ffmpeg": "^1.1.0",
-    "axios": "^1.12.2",
-    "cors": "^2.8.5",
-    "dotenv": "^17.2.1",
-    "express": "^5.1.0",
-    "multer": "^2.0.2",
-    "socket.io": "^4.8.1",
-    "socket.io-client": "^4.8.1"
+  "engines": {
+    "node": ">=18"
   },
   "author": "Your Name",
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "mssql": "^12.0.0",
+    "sequelize": "^6.37.7",
+    "tedious": "^18.6.1"
+  }
 }
