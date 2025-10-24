@@ -1,4 +1,4 @@
-// ------------------------------------ dashboard.js (DROP-IN) ------------------------------------
+// ------------------------bolt------------ dashboard.js (DROP-IN) ------------------------------------
 
 // Fixed XR IDs shown on the dashboard
 const XR_LEFT = 'XR-1234';  // XR VISION
@@ -145,12 +145,17 @@ function inAnyPair(xrId) {
 function computeState(xrId) {
   const online = onlineDevices.has(xrId);
   const partner = xrId === XR_LEFT ? XR_RIGHT : XR_LEFT;
+  const partnerOnline = onlineDevices.has(partner);
   const pairKey = [xrId, partner].sort().join('|');
   const paired = activePairs.has(pairKey);
 
-  if (!online) return 'busy';        // 🔴 red
-  if (paired) return 'available';    // 🟢 green
-  return 'connecting';               // 🟠 amber
+  if (!online) return 'busy';        // 🔴 red - device is offline
+
+  // 🟢 green - show green if BOTH devices are online (regardless of formal pairing status)
+  // This fixes the race condition where devices connect but pairing event arrives slightly delayed
+  if (paired || (online && partnerOnline)) return 'available';
+
+  return 'connecting';               // 🟠 amber - device online but partner not yet online
 }
 
 // ---- Cache last connection metrics so the box never goes blank ----

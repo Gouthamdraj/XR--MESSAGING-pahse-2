@@ -156,11 +156,41 @@ function mergeIncremental(prev, next) {
 }
 
 
-// 🔷 ROOM: track the private room we’re paired into (if any)
+// 🔷 ROOM: track the private room we're paired into (if any)
 let currentRoom = null;
 
 // 🔒 Sticky autoconnect flag (persist across refresh)
 const AUTO_KEY = 'XR_AUTOCONNECT';
+
+// 💊 Medication availability state
+const medicationAvailabilityMap = new Map();
+
+async function checkMedicationAvailability(medications) {
+  if (!Array.isArray(medications) || medications.length === 0) {
+    return [];
+  }
+
+  try {
+    const response = await fetch(`${SERVER_URL}/api/medications/availability`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ names: medications }),
+    });
+
+    if (!response.ok) {
+      console.warn('[MED_CHECK] API returned error:', response.status);
+      return [];
+    }
+
+    const data = await response.json();
+    return data.results || [];
+  } catch (err) {
+    console.error('[MED_CHECK] Error checking medications:', err);
+    return [];
+  }
+}
 
 /* =========================
    ✅ ID-gating helpers (added)
@@ -757,6 +787,25 @@ function handleSignalMessage(data) {
             type: 'soap_note_console',
             data: soap,
             timestamp: ts,
+        });
+
+        return; // prevent fallthrough
+    }
+
+    // ---------- Drug Availability handling ----------
+    if (type === 'drug_availability' || type === 'drug_availability_console') {
+        const results = data.data || [];
+        console.log('[DRUG_AVAILABILITY] Received drug availability:', results);
+
+        medicationAvailabilityMap.clear();
+        results.forEach(item => {
+            const name = item.query || item.name || '';
+            const available = item.status === 'exists' || item.available === true;
+            if (name) {
+                medicationAvailabilityMap.set(name.toLowerCase().trim(), available);
+            }
+            const status = available ? '✓ AVAILABLE' : '✖ NOT FOUND';
+            console.log(`[DRUG_AVAILABILITY] ${name}: ${status}`, item.matched ? `(matched as: ${item.matched})` : '');
         });
 
         return; // prevent fallthrough
@@ -1631,4 +1680,3 @@ window.addEventListener('load', () => {
 
 
 console.log('[INIT] Application initialization complete');
-

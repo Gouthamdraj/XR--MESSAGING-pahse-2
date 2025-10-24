@@ -76,9 +76,11 @@
     <!-- Service worker registration -->
     <!-- Service worker registration (Device-only) -->
     <script>
-        if ('serviceWorker' in navigator && location.pathname.startsWith('/device')) {
+        if ('serviceWorker' in navigator) {
             window.addEventListener('load', () => {
-                navigator.serviceWorker.register('/device/sw.js', { scope: '/device/' }).catch(console.error);
+                navigator.serviceWorker
+                    .register('/sw-device.js', { scope: '/device/' })
+                    .catch(console.error);
             });
         }
 
