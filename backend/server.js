@@ -578,43 +578,110 @@ app.post('/api/medications/availability', async (req, res) => {
   }
 });
 
-// Service Principal (Local or other fallback)
-    sequelize = new Sequelize(process.env.DB_NAME, process.env.DB_CLIENT_ID, process.env.DB_CLIENT_SECRET, {
-        host: process.env.DB_SERVER,
-        dialect: 'mssql',
-        port: parseInt(process.env.DB_PORT),
+const AZURE_ENV = process.env.AZURE_ENV || 'LOCAL';
+
+function buildSequelize() {
+  const common = {
+    host: process.env.DB_SERVER,
+    dialect: 'mssql',
+    port: parseInt(process.env.DB_PORT || '1433', 10),
+    dialectOptions: {
+      // keep your original shape to avoid surprises in your env
+      encrypt: true,
+    },
+    logging: false, // flip to console.log for verbose SQL logs
+  };
+
+  const useManagedIdentity = ['DEVELOPMENT', 'PRODUCTION', 'STAGING'].includes(AZURE_ENV);
+
+  if (useManagedIdentity) {
+    // Managed Identity (User Assigned) — mirrors your first code block
+    return new Sequelize(
+      process.env.DB_NAME,
+      process.env.AZURE_CLIENT_ID_MI, // acts as "username" placeholder for AAD MSI
+      '',
+      {
+        ...common,
         dialectOptions: {
-            authentication: {
-                type: 'azure-active-directory-service-principal-secret',
-                options: {
-                    clientId: process.env.DB_CLIENT_ID,
-                    clientSecret: process.env.DB_CLIENT_SECRET,
-                    tenantId: process.env.DB_TENANT_ID
-                }
+          ...common.dialectOptions,
+          authentication: {
+            type: 'azure-active-directory-msi-app-service',
+            options: {
+              clientId: process.env.AZURE_CLIENT_ID_MI,
             },
-            encrypt: true
-        }
-    });
- 
-async function connectToDatabase() {
-    try {
-        await sequelize.authenticate();
-        console.log('Connected to Azure SQL Database successfully');
- 
-        await sequelize.sync({ alter: false })
-            .then(() => console.log('Database synced'))
-            .catch((err) => {
-                console.error('Error syncing database:', err);
-                process.exit(1);
-            });
- 
- 
-    } catch (err) {
-        console.error('Error connecting to the database:', err);
-        throw err;
+          },
+        },
+      }
+    );
+  }
+
+  // Service Principal (Local or other fallback) — mirrors your second block
+  return new Sequelize(
+    process.env.DB_NAME,
+    process.env.DB_CLIENT_ID,
+    process.env.DB_CLIENT_SECRET,
+    {
+      ...common,
+      dialectOptions: {
+        ...common.dialectOptions,
+        authentication: {
+          type: 'azure-active-directory-service-principal-secret',
+          options: {
+            clientId: process.env.DB_CLIENT_ID,
+            clientSecret: process.env.DB_CLIENT_SECRET,
+            tenantId: process.env.DB_TENANT_ID,
+          },
+        },
+      },
     }
+  );
 }
- connectToDatabase();
+
+const sequelize = buildSequelize();
+
+// ---- Resilient connect that won't close your server ----
+async function connectToDatabase({ retries = 5, delayMs = 3000 } = {}) {
+  let attempt = 0;
+
+  while (attempt <= retries) {
+    try {
+      attempt += 1;
+      await sequelize.authenticate();
+      console.log('Connected to Azure SQL Database successfully');
+
+      await sequelize.sync({ alter: false });
+      console.log('Database synced');
+
+      return true; // connected & synced
+    } catch (err) {
+      console.error(
+        `DB connection/sync failed (attempt ${attempt}/${retries + 1}):`,
+        err.message || err
+      );
+
+      if (attempt > retries) {
+        // Give up but DO NOT crash the server
+        console.error(
+          'Max DB retries reached. Continuing to run the server without an active DB connection.'
+        );
+        return false; // caller can decide if/when to retry later
+      }
+
+      // wait before next retry
+      await new Promise((res) => setTimeout(res, delayMs));
+    }
+  }
+}
+
+// Optional: avoid node process crash on unhandled promise rejections
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+  // Intentionally not exiting the process
+});
+
+// Kick off initial connect, but don't throw/exit on failure
+connectToDatabase();
+
 
 
 // ---- Desktop HTTP telemetry (beginner path) ----

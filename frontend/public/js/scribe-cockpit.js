@@ -16,12 +16,17 @@
 // - Exactly 1 device online: "Connecting" (yellow)
 // - 0 devices: "Disconnected" (red)
 //
+// Medication availability UX (UPDATED):
+// - Uses animated emojis: ✅ available, ❌ unavailable, ⏳ pending.
+// - Persists results in localStorage and restores on refresh without re-calling the API.
+// - Calls API ONLY when Medication textarea content changes (vs last validated text).
+//
 // Workflow/UI preserved:
 // - Global "Total Edits" badge on first SOAP heading.
 // - "Add To EHR" always disabled (red).
 // - Clear / Save / Add EHR zero visible counters and REBASE provenance to current text (all 'B').
 
-console.log('[SCRIBE] Booting Scribe Cockpit (incremental + persistent edit tracking + device-aware status)');
+console.log('[SCRIBE] Booting Scribe Cockpit (incremental + persistent edit tracking + device-aware status + emoji meds)');
 
 // ==========================
 // DOM elements
@@ -53,9 +58,9 @@ const LS_KEYS = {
   HISTORY: 'scribe.history',
   LATEST_SOAP: 'scribe.latestSoap',
   ACTIVE_ITEM_ID: 'scribe.activeItem',
+  MED_AVAIL: 'scribe.medAvailability',              // { byName: {<key>: boolean}, lastText: "<normalized-lines>" }
 };
 
-// Endpoints (can override via window.SCRIBE_PUBLIC_ENDPOINTS)
 const NGROK_URL = 'http://localhost:8080';
 const AZURE_URL = 'https://xr-messaging-geexbheshbghhab7.centralindia-01.azurewebsites.net';
 const OVERRIDES = Array.isArray(window.SCRIBE_PUBLIC_ENDPOINTS) ? window.SCRIBE_PUBLIC_ENDPOINTS : null;
@@ -88,9 +93,9 @@ const editStateMap = new WeakMap();
 /*
   For each <textarea>:
   {
-    ann: Array<{ch: string, tag: 'B'|'U'}>,   // current annotated text
-    ins: number,                               // cumulative +insertions; deleting 'U' refunds (decreases)
-    del: number                                // cumulative +deletions of baseline 'B'
+    ann: Array<{ch: string, tag: 'B'|'U'}>,
+    ins: number,
+    del: number
   }
 */
 
@@ -114,6 +119,16 @@ function loadLatestSoap() { return lsSafeParse(LS_KEYS.LATEST_SOAP, {}); }
 function saveActiveItemId(id) { localStorage.setItem(LS_KEYS.ACTIVE_ITEM_ID, id || ''); }
 function loadActiveItemId() { return localStorage.getItem(LS_KEYS.ACTIVE_ITEM_ID) || ''; }
 function uid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
+
+// Medication availability persistence
+function saveMedStatus(byName, lastText) {
+  const payload = { byName: byName || {}, lastText: lastText || '' };
+  localStorage.setItem(LS_KEYS.MED_AVAIL, JSON.stringify(payload));
+}
+function loadMedStatus() {
+  const { byName = {}, lastText = '' } = lsSafeParse(LS_KEYS.MED_AVAIL, { byName: {}, lastText: '' }) || {};
+  return { byName, lastText };
+}
 
 // ==========================
 // Status pill
@@ -665,17 +680,14 @@ function attachEditTrackingToTextarea(box, aiText) {
         updateTotalsAndEhrState();
         persistSoapFromUI();
 
-        // Update inline medication availability if editing Medication section
+        // Medication: show pending emojis and (debounced) validate ONLY when editing
         if (section === 'Medication') {
-          medAvailability.clear();
-          renderMedicationInline();
+          medAvailability.clear();         // clear in-memory so overlay shows ⏳
+          renderMedicationInline();        // show ⏳ while typing
 
-          if (medicationDebounceTimer) {
-            clearTimeout(medicationDebounceTimer);
-          }
-
+          if (medicationDebounceTimer) clearTimeout(medicationDebounceTimer);
           medicationDebounceTimer = setTimeout(() => {
-            checkMedicationsFromTextarea(box);
+            checkMedicationsFromTextarea(box); // will call API only if content changed vs last validated text
           }, 600);
         }
 
@@ -740,7 +752,6 @@ function renderSoapNote(soap) {
       const w = document.createElement('div');
       w.className = 'med-wrap';
       w.appendChild(box);
-      // Ensure overlay gets created (if not present, ensureMedicationWrap will add it)
       wrap.appendChild(w);
     } else {
       wrap.appendChild(box);
@@ -752,13 +763,10 @@ function renderSoapNote(soap) {
   saveLatestSoap(latestSoapNote);
   updateTotalsAndEhrState();
 
-  // Update medication availability indicators if we have data
-  if (medAvailability.size > 0) {
-    updateMedicationAvailabilityIndicators();
-  }
+  // Restore persisted medication availability (no API call here)
+  renderMedicationInline();
 
   scroller.scrollTop = 0;
-  renderMedicationInline();
   const firstBox = scroller.querySelector('textarea[data-section]');
   if (firstBox) { try { firstBox.focus(); } catch { } }
 }
@@ -774,11 +782,9 @@ function renderSoapNoteGenerating(elapsed) {
 }
 
 // ==========================
-// Drug Availability (inline in same box)
+// Drug Availability (inline in same box) — UPDATED with animated emojis + persistence
 // ==========================
-
-// Simple boolean state: Map<lowercasedName, boolean>
-const medAvailability = new Map();
+const medAvailability = new Map(); // Map<normalizedName, boolean>
 
 // Validation state
 let medicationValidationPending = false;
@@ -802,16 +808,37 @@ function normalizeDrugKey(str) {
   return s.toLowerCase();
 }
 
+function normalizedMedicationBlock(textarea) {
+  const lines = (textarea?.value || '').split('\n')
+    .map(l => l.trim())
+    .filter(Boolean)
+    .map(normalizeDrugKey);
+  return lines.join('\n');
+}
+
+// Call API only if textarea content changed vs last validated text
 async function checkMedicationsFromTextarea(textarea) {
   if (!textarea) return;
 
-  const lines = (textarea.value || '').split('\n')
-    .map(l => l.trim())
-    .filter(Boolean);
+  const currentNormalized = normalizedMedicationBlock(textarea);
+  const { byName: persistedByName, lastText } = loadMedStatus();
 
-  if (lines.length === 0) {
+  // If unchanged since last validation, just restore and render; no API call.
+  if (currentNormalized === lastText) {
     medAvailability.clear();
+    Object.entries(persistedByName).forEach(([k, v]) => medAvailability.set(k, !!v));
+    medicationValidationPending = false;
     renderMedicationInline();
+    updateAddToEhrButtonState();
+    return;
+  }
+
+  const rawLines = (textarea.value || '').split('\n').map(l => l.trim()).filter(Boolean);
+  if (rawLines.length === 0) {
+    medAvailability.clear();
+    saveMedStatus({}, currentNormalized);
+    renderMedicationInline();
+    updateAddToEhrButtonState();
     return;
   }
 
@@ -822,7 +849,7 @@ async function checkMedicationsFromTextarea(textarea) {
     const response = await fetch(`${SERVER_URL}/api/medications/availability`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ names: lines })
+      body: JSON.stringify({ names: rawLines })
     });
 
     if (!response.ok) {
@@ -835,17 +862,21 @@ async function checkMedicationsFromTextarea(textarea) {
     const results = data.results || [];
 
     medAvailability.clear();
+    const newByName = {};
     results.forEach(item => {
       const rawName = (item.name ?? item.query ?? item.drug ?? item.drugName ?? '').toString();
       const key = normalizeDrugKey(rawName);
-      if (key) {
-        const available =
-          typeof item.available === 'boolean'
-            ? item.available
-            : (item.status === 'exists' || item.status === 'available');
-        medAvailability.set(key, !!available);
-      }
+      if (!key) return;
+      const available =
+        typeof item.available === 'boolean'
+          ? item.available
+          : (item.status === 'exists' || item.status === 'available' || item.status === true);
+      medAvailability.set(key, !!available);
+      newByName[key] = !!available;
     });
+
+    // Persist statuses & the exact normalized text these apply to
+    saveMedStatus(newByName, currentNormalized);
 
     medicationValidationPending = false;
     renderMedicationInline();
@@ -882,7 +913,7 @@ function showPendingIndicators() {
 
     if (line) {
       const badge = document.createElement('span');
-      badge.className = 'med-badge pending';
+      badge.className = 'med-emoji med-pending';
       badge.textContent = '⏳';
       row.appendChild(badge);
     }
@@ -895,37 +926,44 @@ function showPendingIndicators() {
 
 function updateAddToEhrButtonState() {
   if (!addEhrBtnEl) return;
-
-  if (medicationValidationPending) {
-    addEhrBtnEl.disabled = true;
-  } else {
-    addEhrBtnEl.disabled = true;
-  }
+  // Always disabled per requirements; keep logic in case of future enablement.
+  addEhrBtnEl.disabled = true;
 }
 
-// Inject minimal CSS once (dark-theme friendly)
+// Inject minimal CSS once (dark-theme friendly) — UPDATED to emoji + subtle animations
 function ensureMedStyles() {
   if (document.getElementById('med-inline-css')) return;
   const s = document.createElement('style');
   s.id = 'med-inline-css';
   s.textContent = `
     .med-line { display: flex; align-items: center; gap: 8px; }
-    .med-badge { font-weight: 800; }
-    .med-badge.available { color: #22c55e !important; text-shadow: 0 0 2px rgba(0,0,0,.6); }
-    .med-badge.unavailable { color: #ff4242 !important; text-shadow: 0 0 2px rgba(0,0,0,.6); }
-    .med-badge.pending { color: #fbbf24; animation: pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+    .med-emoji { font-weight: 800; display:inline-block; transform-origin: center; }
     .med-wrap { position: relative; }
     .med-overlay {
       position: absolute; inset: 0; pointer-events: none;
       white-space: pre-wrap; overflow: hidden;
       font: inherit; line-height: inherit; color: inherit;
       z-index: 2;  
-      opacity: 1 !important;/* prevent any inherited dimming */
+      opacity: 1 !important;
     }
+    /* Animations */
     @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: .5; }.med-badge { font-weight: 700; }
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(0.9); opacity: .7; }
     }
+    @keyframes pop {
+      0% { transform: scale(0.6); }
+      60% { transform: scale(1.08); }
+      100% { transform: scale(1); }
+    }
+    @keyframes wiggle {
+      0%, 100% { transform: rotate(0deg); }
+      25% { transform: rotate(-7deg); }
+      75% { transform: rotate(7deg); }
+    }
+    .med-pending { animation: pulse 1.2s ease-in-out infinite; }
+    .med-available { animation: pop 250ms ease-out; }
+    .med-unavailable { animation: wiggle 400ms ease-in-out 2; }
   `;
   document.head.appendChild(s);
 }
@@ -939,7 +977,6 @@ function ensureMedicationWrap(medSection) {
   if (!wrap) {
     wrap = document.createElement('div');
     wrap.className = 'med-wrap';
-    // Move textarea into wrapper (same DOM position)
     textarea.parentNode.insertBefore(wrap, textarea);
     wrap.appendChild(textarea);
   }
@@ -958,7 +995,7 @@ function ensureMedicationWrap(medSection) {
   return wrap;
 }
 
-// Render inline badges line-by-line on top of the textarea (same box)
+// Render inline emojis line-by-line on top of the textarea (same box)
 function renderMedicationInline() {
   ensureMedStyles();
 
@@ -979,6 +1016,14 @@ function renderMedicationInline() {
   overlay.style.fontFamily = cs.fontFamily;
   overlay.scrollTop = textarea.scrollTop;
 
+  // Before drawing, ensure in-memory map reflects persisted statuses if text matches
+  const currentNormalized = normalizedMedicationBlock(textarea);
+  const { byName, lastText } = loadMedStatus();
+  if (currentNormalized === lastText) {
+    medAvailability.clear();
+    Object.entries(byName).forEach(([k, v]) => medAvailability.set(k, !!v));
+  }
+
   const frag = document.createDocumentFragment();
   const lines = (textarea.value || '').split('\n');
 
@@ -996,11 +1041,18 @@ function renderMedicationInline() {
 
     if (line) {
       const key = normalizeDrugKey(line);
+
       if (medAvailability.has(key)) {
         const ok = !!medAvailability.get(key);
         const badge = document.createElement('span');
-        badge.className = `med-badge ${ok ? 'available' : 'unavailable'}`;
-        badge.textContent = ok ? '✔' : '✖';
+        badge.className = `med-emoji ${ok ? 'med-available' : 'med-unavailable'}`;
+        badge.textContent = ok ? '✅' : '❌';
+        row.appendChild(badge);
+      } else if (medicationValidationPending) {
+        // If we're currently validating, show pending
+        const badge = document.createElement('span');
+        badge.className = 'med-emoji med-pending';
+        badge.textContent = '⏳';
         row.appendChild(badge);
       }
     }
@@ -1016,13 +1068,13 @@ function updateMedicationAvailabilityIndicators() {
   renderMedicationInline();
 }
 
-
 // ==========================
 // Signal handling (Socket.IO / BroadcastChannel)
 // ==========================
 function ingestDrugAvailabilityPayload(payload) {
   const arr = Array.isArray(payload) ? payload : (payload ? [payload] : []);
   medAvailability.clear();
+  const newByName = {};
   for (const item of arr) {
     const raw =
       (item?.name ?? item?.query ?? item?.drug ?? item?.drugName ?? '').toString();
@@ -1033,7 +1085,15 @@ function ingestDrugAvailabilityPayload(payload) {
         ? item.available
         : (item?.status === 'exists' || item?.status === 'available' || item?.status === true);
     medAvailability.set(key, !!available);
+    newByName[key] = !!available;
   }
+
+  // Persist what we ingest; tie it to the current Medication block if present
+  const scroller = soapContainerEnsure();
+  const medTextarea = scroller.querySelector('textarea[data-section="Medication"]');
+  const currentNormalized = normalizedMedicationBlock(medTextarea);
+  saveMedStatus(newByName, currentNormalized);
+
   renderMedicationInline();
 }
 
@@ -1099,13 +1159,8 @@ function handleSignalMessage(packet) {
     soapGenerating = false;
     renderSoapNote(latestSoapNote);
 
-    setTimeout(() => {
-      const scroller = soapContainerEnsure();
-      const medTextarea = scroller.querySelector('textarea[data-section="Medication"]');
-      if (medTextarea) {
-        checkMedicationsFromTextarea(medTextarea);
-      }
-    }, 100);
+    // IMPORTANT: Do NOT auto-call the meds API here.
+    // We only validate on user edit. If persisted statuses match current text, they will render immediately.
   }
 }
 
@@ -1194,6 +1249,19 @@ function restoreFromLocalStorage() {
 
   if (historyList.length === 0) renderSoapBlank();
   else renderSoapNote(latestSoapNote || {});
+
+  // Restore persisted med availability into memory if text matches
+  const scroller = soapContainerEnsure();
+  const medTextarea = scroller.querySelector('textarea[data-section="Medication"]');
+  if (medTextarea) {
+    const currentNormalized = normalizedMedicationBlock(medTextarea);
+    const { byName, lastText } = loadMedStatus();
+    if (currentNormalized === lastText) {
+      medAvailability.clear();
+      Object.entries(byName).forEach(([k, v]) => medAvailability.set(k, !!v));
+      renderMedicationInline();
+    }
+  }
 }
 
 // ==========================
@@ -1213,6 +1281,12 @@ function wireSoapActionButtons() {
         if (headMeta) headMeta.textContent = `Edits: 0`;
       });
       persistSoapFromUI();
+
+      // Clear med availability persistence since text is empty
+      saveMedStatus({}, '');
+      medAvailability.clear();
+      renderMedicationInline();
+
       resetAllEditCountersToZero();
       console.log('[SCRIBE] SOAP cleared and edit counters reset.');
     };
@@ -1251,10 +1325,8 @@ function wireSoapActionButtons() {
     restoreFromLocalStorage();
     wireSoapActionButtons();
 
-    // ⬇️ If the inline renderer exists, do an initial draw now
-    if (typeof renderMedicationInline === 'function') {
-      renderMedicationInline();
-    }
+    // Initial draw for medication overlay (uses persisted statuses if available)
+    renderMedicationInline();
 
     await loadSocketIoClientFor(preferred);
     await connectTo(preferred, async () => {
