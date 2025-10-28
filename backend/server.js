@@ -1,4 +1,4 @@
-// --------------------------------------------------Server.js ----------------duplicate id working version ----29-08-25------------------------------------
+// --------------------------------27-5:12----//////-------------Server.js ----------------duplicate id working version ----29-08-25------------------------------------
 
 // // -------------------- Imports & Env --------------------
 const express = require('express');
@@ -12,6 +12,8 @@ const { createAdapter } = require('@socket.io/redis-adapter');
 const axios = require('axios'); // for SOAP note generation
 const sql = require('mssql');   // MSSQL driver
 const { Sequelize } = require('sequelize');
+
+const { sequelize, connectToDatabase, closeDatabase } = require('./database/database-config');
 
 
 const dotenv = require('dotenv');
@@ -59,6 +61,33 @@ function numOrNull(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+// --- Safe global socket snapshot (fast-fail + local fallback) ---
+async function safeFetchSockets(io, namespace = "/") {
+  const nsp = io.of(namespace);
+
+  // Always include local sockets immediately (never blocks)
+  const local = Array.from(nsp.sockets?.values?.() || []);
+
+  const adapter = nsp.adapter;
+  const supportsGlobal = typeof nsp.fetchSockets === "function" && adapter && adapter.broadcast?.apply;
+  if (!supportsGlobal) return local;
+
+  try {
+    // Short guard so device-list / identify / health never stall on a stale peer
+    const guard = new Promise((_, reject) => setTimeout(() => reject(new Error("guard-timeout")), 750));
+    const globalSockets = await Promise.race([nsp.fetchSockets(), guard]);
+
+    // Merge local + global by socket.id
+    const byId = new Map(local.map(s => [s.id, s]));
+    for (const s of globalSockets) byId.set(s.id, s);
+    return Array.from(byId.values());
+  } catch (e) {
+    console.warn("[WARN] [safeFetchSockets] global fetch failed; using local only:", e.message);
+    return local;
+  }
+}
+
+
 // -------------------- Env Flags --------------------
 const IS_PROD =
   (process.env.NODE_ENV || '').toLowerCase().startsWith('prod') ||
@@ -72,7 +101,6 @@ const app = express();
 const server = http.createServer(app);
 console.log('[HTTP] Server created');
 const io = new Server(server, {
-  path: '/socket.io',                       // ✅ explicit path for the 3000 proxy
   cors: { origin: '*', methods: ['GET', 'POST'] },
   transports: ['websocket', 'polling'],   // ← include polling
   pingInterval: 25000,
@@ -83,6 +111,18 @@ console.log('[SOCKET.IO] Socket.IO server initialized');
 app.use(cors());
 app.use(express.json());
 console.log('[MIDDLEWARE] CORS + JSON enabled');
+
+// ✅ Connect to Azure SQL via Sequelize on boot
+(async () => {
+  try {
+    await connectToDatabase();
+    console.log('🚀 [DB] Azure SQL connection established');
+  } catch (err) {
+    console.error('❌ [DB] Failed to connect to Azure SQL:', err?.message || err);
+    // If DB is critical, fail fast:
+    process.exit(1);
+  }
+})();
 
 // // -------------------- UI routes (migrated from frontend/server.js) --------------------
 // // Point these to your FRONTEND folders on disk:
@@ -160,11 +200,24 @@ app.use((req, res, next) => {
 
 const sendView = (name) => (_req, res) => {
   const filePath = path.join(VIEWS_DIR, name);
-  if (fs.existsSync(filePath)) {
-    res.sendFile(filePath);
-  } else {
+  if (!fs.existsSync(filePath)) {
     console.warn(`[WARN] Missing view: ${filePath}`);
-    res.status(404).send(`View not found: ${name}`);
+    return res.status(404).send(`View not found: ${name}`);
+  }
+
+  try {
+    const html = fs.readFileSync(filePath, 'utf8');
+
+    // inject TURN config if function available
+    const injected = (typeof injectTurnConfig === 'function')
+      ? injectTurnConfig(html)
+      : html;
+
+    // Make sure the result is HTML
+    res.type('html').send(injected);
+  } catch (err) {
+    console.error('[sendView] error reading / sending view:', err);
+    res.status(500).send('Server error');
   }
 };
 
@@ -211,17 +264,26 @@ if (fs.existsSync(backendPublic)) {
 
 // -------------------- TURN Injection --------------------
 function injectTurnConfig(html) {
-  dlog('[TURN] injectTurnConfig start');
+  const raw = (process.env.TURN_URL || '').split(/[,\s]+/).filter(Boolean);
+
+  const urls = raw.map(u => {
+    // Add scheme if missing
+    if (!/^(stun|turns?):/i.test(u)) {
+      return 'turn:' + u;              // default to TURN
+    }
+    return u;
+  });
+
   const cfg = `
     <script>
       window.TURN_CONFIG = {
-        urls: '${process.env.TURN_URL || ''}',
-        username: '${process.env.TURN_USERNAME || ''}',
-        credential: '${process.env.TURN_CREDENTIAL || ''}'
+        urls: ${urls.length <= 1 ? JSON.stringify(urls[0] || '') : JSON.stringify(urls)},
+        username: ${JSON.stringify(process.env.TURN_USERNAME || '')},
+        credential: ${JSON.stringify(process.env.TURN_CREDENTIAL || '')}
       };
     </script>`;
-  dlog('[TURN] injectTurnConfig done');
-  return html.replace('</body>', `${cfg}\n</body>`);
+
+  return /<\/body>/i.test(html) ? html.replace(/<\/body>/i, `${cfg}\n</body>`) : (html + cfg);
 }
 
 // -------------------- Room Concept State --------------------
@@ -355,39 +417,11 @@ const messageHistory = [];
 dlog('[STATE] messageHistory initialized');
 
 
-// -------------------- fetchSockets with timeout and retry --------------------
-async function fetchSocketsWithRetry(maxRetries = 2, timeoutMs = 5000) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      dlog(`[FETCH_SOCKETS] attempt ${attempt}/${maxRetries}`);
-
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('timeout reached while waiting for fetchSockets response')), timeoutMs);
-      });
-
-      const fetchPromise = io.fetchSockets();
-      const sockets = await Promise.race([fetchPromise, timeoutPromise]);
-
-      dlog(`[FETCH_SOCKETS] success on attempt ${attempt}, fetched ${sockets.length} sockets`);
-      return sockets;
-    } catch (err) {
-      dwarn(`[FETCH_SOCKETS] attempt ${attempt}/${maxRetries} failed:`, err.message);
-
-      if (attempt === maxRetries) {
-        throw err;
-      }
-
-      const backoffMs = attempt * 500;
-      dlog(`[FETCH_SOCKETS] retrying in ${backoffMs}ms...`);
-      await new Promise(resolve => setTimeout(resolve, backoffMs));
-    }
-  }
-}
 
 
 async function buildDeviceListGlobal() {
   dlog('[DEVICE_LIST] building (global via fetchSockets)');
-  const sockets = await fetchSocketsWithRetry();
+  const sockets = await safeFetchSockets(io, "/");
   const byId = new Map();
 
   for (const s of sockets) {
@@ -451,7 +485,7 @@ function addToMessageHistory(message) {
 app.get('/health', async (_req, res) => {
   dlog('[HEALTH] request');
   try {
-    const sockets = await fetchSocketsWithRetry();
+    const sockets = await safeFetchSockets(io, "/");
     res.status(200).json({
       status: 'healthy',
       timestamp: new Date().toISOString(),
@@ -577,113 +611,6 @@ app.post('/api/medications/availability', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
-
-const AZURE_ENV = process.env.AZURE_ENV || 'LOCAL';
-
-function buildSequelize() {
-  const common = {
-    host: process.env.DB_SERVER,
-    dialect: 'mssql',
-    port: parseInt(process.env.DB_PORT || '1433', 10),
-    dialectOptions: {
-      // keep your original shape to avoid surprises in your env
-      encrypt: true,
-    },
-    // logging: false, // flip to console.log for verbose SQL logs
-  };
-
-  const useManagedIdentity = ['DEVELOPMENT', 'PRODUCTION', 'STAGING'].includes(AZURE_ENV);
-
-  if (useManagedIdentity) {
-    console.log('useManagedIdentity',useManagedIdentity);
-    // Managed Identity (User Assigned) — mirrors your first code block
-    return new Sequelize(
-      process.env.DB_NAME,
-      process.env.AZURE_CLIENT_ID_MI, // acts as "username" placeholder for AAD MSI
-      '',
-      {
-        ...common,
-        dialectOptions: {
-          ...common.dialectOptions,
-          authentication: {
-            type: 'azure-active-directory-msi-app-service',
-            options: {
-              clientId: process.env.AZURE_CLIENT_ID_MI,
-            },
-          },
-        },
-      }
-    );
-  }
-  
-
-  // Service Principal (Local or other fallback) — mirrors your second block
-  return new Sequelize(
-    process.env.DB_NAME,
-    process.env.DB_CLIENT_ID,
-    process.env.DB_CLIENT_SECRET,
-    {
-      ...common,
-      dialectOptions: {
-        ...common.dialectOptions,
-        authentication: {
-          type: 'azure-active-directory-service-principal-secret',
-          options: {
-            clientId: process.env.DB_CLIENT_ID,
-            clientSecret: process.env.DB_CLIENT_SECRET,
-            tenantId: process.env.DB_TENANT_ID,
-          },
-        },
-      },
-    }
-  );
-}
-
-const sequelize = buildSequelize();
-
-// ---- Resilient connect that won't close your server ----
-async function connectToDatabase({ retries = 5, delayMs = 3000 } = {}) {
-  let attempt = 0;
-
-  while (attempt <= retries) {
-    try {
-      attempt += 1;
-      await sequelize.authenticate();
-      console.log('Connected to Azure SQL Database successfully');
-
-      await sequelize.sync({ alter: false });
-      console.log('Database synced');
-
-      return true; // connected & synced
-    } catch (err) {
-      console.error(
-        `DB connection/sync failed (attempt ${attempt}/${retries + 1}):`,
-        err.message || err
-      );
-
-      if (attempt > retries) {
-        // Give up but DO NOT crash the server
-        console.error(
-          'Max DB retries reached. Continuing to run the server without an active DB connection.'
-        );
-        return false; // caller can decide if/when to retry later
-      }
-
-      // wait before next retry
-      await new Promise((res) => setTimeout(res, delayMs));
-    }
-  }
-}
-
-// Optional: avoid node process crash on unhandled promise rejections
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled promise rejection:', reason);
-  // Intentionally not exiting the process
-});
-
-// Kick off initial connect, but don't throw/exit on failure
-connectToDatabase();
-
 
 
 // ---- Desktop HTTP telemetry (beginner path) ----
@@ -1071,656 +998,7 @@ io.on('connection', (socket) => {
 
     // 🔒 GLOBAL duplicate guard (works across devices; cluster-wide with Redis adapter)
     try {
-      const all = await fetchSocketsWithRetry(); // includes other instances if Redis adapter is enabled
-      const holder = all.find(s => s.id !== socket.id && s.data?.xrId === xrId);
-      if (holder) {
-        const holderInfo = {
-          xrId,
-          deviceName: holder.data?.deviceName || 'Unknown',
-          since: holder.data?.connectedAt || null,
-          socketId: holder.id,
-        };
-        dlog('[IDENTIFY] Duplicate xrId in use — rejecting:', holderInfo);
-
-        // ✅ blackout Cockpit: broadcast an empty device list once
-        broadcastEmptyDeviceListOnce();
-
-        // (optional) re-broadcast the real list shortly after, if you want auto-recover
-        setTimeout(async () => {
-          try {
-            await broadcastDeviceList();
-          } catch (e) {
-            dwarn('[DEVICE_LIST] delayed re-broadcast failed:', e.message);
-          }
-        }, 1200);
-
-        socket.emit('duplicate_id', { xrId, holderInfo });
-        return socket.disconnect(true);
-      }
-    } catch (e) {
-      dwarn('[IDENTIFY] fetchSockets failed; continuing cautiously:', e?.message || e);
-    }
-
-    // ✅ Accept this socket
-    socket.data.deviceName = deviceName || 'Unknown';
-    socket.data.xrId = xrId;
-    socket.data.connectedAt = Date.now();
-
-    try { await socket.join(roomOf(xrId)); } catch (e) { dwarn('[IDENTIFY] join room failed:', e?.message || e); }
-    clients.set(xrId, socket);
-    onlineDevices.set(xrId, socket);
-
-    // Track desktop for convenience (no replacement logic anymore)
-    if ((deviceName?.toLowerCase().includes('desktop')) || xrId === 'XR-1238') {
-      desktopClients.set(xrId, socket);
-      dlog('[IDENTIFY] desktop client tracked', xrId);
-    }
-
-    // Send lists and maybe auto-pair
-    try {
-      const list = await buildDeviceListGlobal();
-      socket.emit('device_list', list);
-      await broadcastDeviceList();
-    } catch (e) {
-      derr('[identify] device_list error:', e.message);
-    }
-
-    try {
-      if (!socket.data?.roomId) {
-        await tryAutoPair(xrId);
-      } else {
-        dlog('[IDENTIFY] Skipping tryAutoPair; already in room', socket.data.roomId);
-      }
-    } catch (e) {
-      derr('[identify] tryAutoPair error:', e.message);
-    }
-  });
-
-  // -------- metrics_subscribe / unsubscribe (NEW) --------
-  socket.on('metrics_subscribe', ({ xrId }) => {
-    if (!xrId) return;
-    socket.join(`metrics:${xrId}`);
-    socket.emit('metrics_snapshot', {
-      xrId,
-      telemetry: telemetryHist.get(xrId) || [],
-      quality: qualityHist.get(xrId) || [],
-    });
-  });
-
-  socket.on('metrics_unsubscribe', ({ xrId }) => {
-    if (!xrId) return;
-    socket.leave(`metrics:${xrId}`);
-  });
-
-
-
-
-  // -------- request_device_list --------
-  socket.on('request_device_list', async () => {
-    dlog('[EVENT] request_device_list');
-    try {
-      socket.emit('device_list', await buildDeviceListGlobal());
-    } catch (e) {
-      dwarn('[request_device_list] failed:', e.message);
-    }
-  });
-
-  // -------- pair_with --------
-  socket.on('pair_with', async ({ peerId }) => {
-    dlog('[EVENT] pair_with', { me: socket.data?.xrId, peerId });
-    try {
-      const me = socket.data?.xrId;
-      if (!me || !peerId) {
-        dwarn('[pair_with] missing me or peerId');
-        socket.emit('pair_error', { message: 'Identify and provide peerId' });
-        return;
-      }
-      const allowed = await isPairAllowed(me, peerId);
-      if (!allowed) {
-        dwarn('[pair_with] not allowed', me, peerId);
-        socket.emit('pair_error', { message: 'Pairing not allowed' });
-        return;
-      }
-      const roomId = getRoomIdForPair(me, peerId);
-      await socket.join(roomId);
-      socket.data.roomId = roomId;
-
-      const members = listRoomMembers(roomId);
-      io.to(roomId).emit('room_joined', { roomId, members });
-      dlog('[pair_with] room_joined emitted', { roomId, members });
-
-      // NEW: push active pair state to dashboards
-      broadcastPairs();
-    } catch (err) {
-      derr('[pair_with] error:', err.message);
-      socket.emit('pair_error', { message: 'Internal server error during pairing' });
-    }
-  });
-
-  // -------- signal --------
-  socket.on('signal', (payload) => {
-    // 1) Normalize payload (object or JSON string)
-    let msg = payload;
-    try { msg = (typeof payload === 'string') ? JSON.parse(payload) : (payload || {}); }
-    catch (e) { return dwarn('[signal] JSON parse failed'); }
-
-    const { type } = msg;
-    dlog('📡 [EVENT] signal', { type, preview: safeDataPreview(msg) });
-
-    try {
-      // 2) Intercept Android/Dock quality feed and **return** (don’t fall through)
-      if (type === 'webrtc_quality_update') {
-        const deviceId = msg.deviceId;
-        const samples = Array.isArray(msg.samples) ? msg.samples : [];
-
-        if (deviceId && samples.length) {
-          // Store to the existing per-device history so your detail modal works
-          for (const s of samples) {
-            pushHist(qualityHist, deviceId, {
-              ts: s.ts,
-              jitterMs: numOrNull(s.jitterMs),
-              rttMs: numOrNull(s.rttMs),
-              lossPct: numOrNull(s.lossPct),
-              bitrateKbps: numOrNull(s.bitrateKbps),
-            });
-          }
-
-          // Stream the latest deltas to any open detail modal subscribers
-          io.to(`metrics:${deviceId}`).emit('metrics_update', {
-            xrId: deviceId,
-            quality: samples.map(s => ({
-              ts: s.ts,
-              jitterMs: s.jitterMs,
-              rttMs: s.rttMs,
-              lossPct: s.lossPct,
-              bitrateKbps: s.bitrateKbps,
-            })),
-          });
-
-          // Broadcast to dashboards (powers the connection tiles)
-          io.emit('webrtc_quality_update', { deviceId, samples });
-        }
-        return; // ✅ do not route as a regular signaling message
-      }
-
-      // 3) Existing offer/answer/ICE path (unchanged)
-      const { from, to, data } = msg;
-      if (to) {
-        dlog('[signal] direct target routing to', to);
-        io.to(roomOf(to)).emit('signal', { type, from, data });
-        return;
-      }
-      const roomId = socket.data?.roomId;
-      if (!roomId) {
-        dwarn('[signal] no "to" and no roomId; ignoring');
-        socket.emit('signal_error', { message: 'No room joined and no "to" specified' });
-        return;
-      }
-      dlog('[signal] room forward', roomId);
-      socket.to(roomId).emit('signal', { type, from, data });
-    } catch (err) {
-      derr('[signal] handler error:', err.message);
-    }
-  });
-
-
-  // -------- control --------
-  socket.on('control', (raw) => {
-    // Accept string or object payloads
-    let p = raw;
-    try {
-      p = (typeof raw === 'string') ? JSON.parse(raw) : (raw || {});
-    } catch {
-      p = (raw || {});
-    }
-
-    // Accept both `command` and `action`; keep original casing for compatibility
-    const cmdRaw = (p.command != null ? p.command : p.action) || '';
-    const cmd = String(cmdRaw);
-    const from = p.from;
-    const to = p.to;
-    const msg = p.message;
-
-    dlog('🎮 [EVENT] control', { command: cmd, from, to, message: trimStr(msg || '') });
-
-    // Keep both keys so all clients see what they expect
-    const payload = { command: cmd, action: cmd, from, message: msg };
-
-    try {
-      if (to) {
-        dlog('[control] direct to', to);
-        io.to(roomOf(to)).emit('control', payload);
-      } else {
-        const roomId = socket.data?.roomId;
-        if (roomId) {
-          dlog('[control] room emit', roomId);
-          io.to(roomId).emit('control', payload);
-        } else {
-          dlog('[control] global emit');
-          io.emit('control', payload);
-        }
-      }
-    } catch (err) {
-      derr('[control] handler error:', err.message);
-    }
-  });
-
-  // -------- message (transcript -> web console via signal) --------
-  socket.on('message', (payload) => {
-    dlog('[EVENT] message', safeDataPreview(payload));
-
-    let data;
-    try {
-      data = typeof payload === 'string' ? JSON.parse(payload) : payload;
-    } catch (e) {
-      return dwarn('[message] JSON parse failed:', e.message);
-    }
-
-    const type = data?.type || 'message';
-    const from = data?.from;
-    const to = data?.to;
-    const text = data?.text;
-    const urgent = !!data?.urgent;
-    const timestamp = data?.timestamp || new Date().toISOString();
-
-    // ✳️ Intercept transcripts: forward to desktop's web console via a signal, then STOP
-    if (type === 'transcript') {
-      const out = {
-        type: 'transcript',
-        from,
-        to,
-        text,
-        final: !!data?.final,
-        timestamp,
-      };
-
-      try {
-        // Forward transcript to the intended UI
-        if (to) {
-          io.to(roomOf(to)).emit('signal', { type: 'transcript_console', from, data: out });
-          dlog('[transcript] emitted signal "transcript_console" to', to);
-        } else if (socket.data?.roomId) {
-          io.to(socket.data.roomId).emit('signal', { type: 'transcript_console', from, data: out });
-          dlog('[transcript] emitted signal "transcript_console" to room', socket.data.roomId);
-        }
-
-        // Generate SOAP note if this transcript is final
-        if (out.final && out.text) {
-          (async () => {
-            try {
-              const soapNote = await generateSoapNote(out.text);
-
-              const target = socket.data?.roomId || (to ? roomOf(to) : null);
-
-              // Send SOAP note back to console UI
-              if (target) {
-                io.to(target).emit('signal', {
-                  type: 'soap_note_console',
-                  from,
-                  data: soapNote,
-                });
-              }
-              console.log('[SOAP_NOTE]', JSON.stringify(soapNote, null, 2));
-
-              // Check Medication against dbo.DrugMaster(drug) and log availability
-              const { results } = await checkSoapMedicationAvailability(soapNote, {
-                schema: 'dbo',
-                table: 'DrugMaster',
-                nameCol: 'drug',
-              });
-
-              // Emit availability to both Dock (target) and Scribe Cockpit
-              if (target) {
-                io.to(target).emit('signal', {
-                  type: 'drug_availability_console',
-                  from,
-                  data: results,
-                });
-              }
-              // Also broadcast to all connected clients (including Scribe Cockpit)
-              io.emit('signal', {
-                type: 'drug_availability',
-                from,
-                data: results,
-              });
-            } catch (e) {
-              console.error('[SOAP/DRUG] failed:', e?.message || e);
-            }
-          })();
-        }
-      } catch (e) {
-        dwarn('[transcript] emit failed:', e.message);
-      }
-
-      return; // stop normal message path
-    }
-
-
-
-    // Normal chat message path (unchanged)
-    try {
-      const msg = {
-        type: 'message',
-        from,
-        to,
-        text,
-        urgent,
-        sender: socket.data?.deviceName || from || 'unknown',
-        xrId: from,
-        timestamp,
-      };
-      addToMessageHistory(msg);
-
-      if (to) {
-        dlog('[message] direct to', to);
-        io.to(roomOf(to)).emit('message', msg);
-      } else {
-        const roomId = socket.data?.roomId;
-        if (roomId) {
-          dlog('[message] room emit', roomId);
-          io.to(roomId).emit('message', msg);
-        } else {
-          dlog('[message] global broadcast (excluding sender)');
-          socket.broadcast.emit('message', msg);
-        }
-      }
-    } catch (err) {
-      derr('[message] handler error:', err.message);
-    }
-  });
-
-
-
-
-
-  // -------- clear-messages --------
-  socket.on('clear-messages', ({ by }) => {
-    dlog('[EVENT] clear-messages', { by });
-    const payload = { type: 'message-cleared', by, messageId: Date.now() };
-    io.emit('message-cleared', payload);
-  });
-
-  // -------- clear_confirmation --------
-  socket.on('clear_confirmation', ({ device }) => {
-    dlog('[EVENT] clear_confirmation', { device });
-    const payload = { type: 'message_cleared', by: device, timestamp: new Date().toISOString() };
-    io.emit('message_cleared', payload);
-  });
-
-  // -------- status_report --------
-  socket.on('status_report', ({ from, status }) => {
-    dlog('[EVENT] status_report', { from, status: trimStr(status || '') });
-    const payload = {
-      type: 'status_report',
-      from,
-      status,
-      timestamp: new Date().toISOString(),
-    };
-    const roomId = socket.data?.roomId;
-    if (roomId) {
-      dlog('[status_report] room emit', roomId);
-      io.to(roomId).emit('status_report', payload);
-    } else {
-      dlog('[status_report] global emit');
-      io.emit('status_report', payload);
-    }
-  });
-
-  // -------- battery (NEW) --------
-  socket.on('battery', ({ xrId, batteryPct, charging }) => {
-    try {
-      const id = xrId || socket.data?.xrId;
-      if (!id) return;
-      const pct = Math.max(0, Math.min(100, Number(batteryPct)));
-      const rec = { pct, charging: !!charging, ts: Date.now() };
-
-      batteryByDevice.set(id, rec);
-      io.emit('battery_update', { xrId: id, pct: rec.pct, charging: rec.charging, ts: rec.ts });
-      dlog('[battery] update', { id, pct: rec.pct, charging: rec.charging });
-    } catch (e) {
-      dwarn('[battery] bad payload:', e?.message || e);
-    }
-  });
-
-  // -------- telemetry (NEW) --------
-  socket.on('telemetry', (payload) => {
-    try {
-      const d = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
-      const xrId = d.xrId || socket.data?.xrId;
-      if (!xrId) return;
-
-      // keep ALL fields (network + system)
-      const rec = {
-        xrId,
-        connType: d.connType || 'none',
-
-        // network (existing)
-        wifiDbm: numOrNull(d.wifiDbm),
-        wifiMbps: numOrNull(d.wifiMbps),
-        wifiBars: numOrNull(d.wifiBars),
-        cellDbm: numOrNull(d.cellDbm),
-        cellBars: numOrNull(d.cellBars),
-        netDownMbps: numOrNull(d.netDownMbps),
-        netUpMbps: numOrNull(d.netUpMbps),
-
-        // 🔵 system (NEW)
-        cpuPct: numOrNull(d.cpuPct),
-        memUsedMb: numOrNull(d.memUsedMb),
-        memTotalMb: numOrNull(d.memTotalMb),
-        deviceTempC: numOrNull(d.deviceTempC),
-
-        ts: Date.now(),
-      };
-
-      // keep latest snapshot for device rows
-      telemetryByDevice.set(xrId, rec);
-
-      // time-series history (for modal charts)
-      pushHist(telemetryHist, xrId, {
-        ts: rec.ts,
-        connType: rec.connType,
-        wifiMbps: rec.wifiMbps,
-        netDownMbps: rec.netDownMbps,
-        netUpMbps: rec.netUpMbps,
-        batteryPct: batteryByDevice.get(xrId)?.pct ?? null,
-
-        // include system series
-        cpuPct: rec.cpuPct,
-        memUsedMb: rec.memUsedMb,
-        memTotalMb: rec.memTotalMb,
-        deviceTempC: rec.deviceTempC,
-      });
-
-      // live delta for open detail modal subscribers
-      io.to(`metrics:${xrId}`).emit('metrics_update', {
-        xrId,
-        telemetry: [telemetryHist.get(xrId).at(-1)]
-      });
-
-      // broadcast the latest snapshot to dashboards
-      io.emit('telemetry_update', rec);
-
-      dlog('[telemetry] update', rec);
-    } catch (e) {
-      dwarn('[telemetry] bad payload:', e?.message || e);
-    }
-  });
-
-
-
-
-  socket.on('webrtc_quality', (q) => {
-    dlog('[QUALITY] recv', q);
-    try {
-      const xrId = (q && q.xrId) || socket.data?.xrId;
-      if (!xrId) return;
-
-      const snap = {
-        xrId,
-        ts: q.ts || Date.now(),
-        jitterMs: numOrNull(q.jitterMs),
-        lossPct: numOrNull(q.lossPct),
-        rttMs: numOrNull(q.rttMs),
-        fps: numOrNull(q.fps),
-        dropped: numOrNull(q.dropped),
-        nackCount: numOrNull(q.nackCount),
-        // optional if your Dock computes it and sends it:
-        bitrateKbps: numOrNull(q.bitrateKbps),
-      };
-
-      // keep latest (powers center tiles)
-      qualityByDevice.set(xrId, snap);
-
-      // 🔵 store to history + stream to detail subscribers
-      pushHist(qualityHist, xrId, {
-        ts: snap.ts,
-        jitterMs: snap.jitterMs,
-        rttMs: snap.rttMs,
-        lossPct: snap.lossPct,
-        bitrateKbps: snap.bitrateKbps,
-      });
-      io.to(`metrics:${xrId}`).emit('metrics_update', {
-        xrId,
-        quality: [qualityHist.get(xrId).at(-1)]
-      });
-
-      // existing broadcast (summary tiles)
-      io.emit('webrtc_quality_update', Array.from(qualityByDevice.values()));
-    } catch (e) {
-      dwarn('[QUALITY] store/broadcast failed:', e?.message || e);
-    }
-  });
-
-
-
-
-  // -------- message_history (on demand) --------
-  socket.on('message_history', () => {
-    dlog('[EVENT] message_history request');
-    socket.emit('message_history', {
-      type: 'message_history',
-      messages: messageHistory.slice(-10),
-    });
-  });
-
-
-
-  // Notify peers *before* Socket.IO removes the socket from rooms
-  socket.on('disconnecting', () => {
-    const xrId = socket.data?.xrId;
-    if (!xrId) return;
-
-    for (const roomId of socket.rooms) {
-      if (roomId.startsWith('pair:')) {
-        socket.to(roomId).emit('peer_left', { xrId, roomId });
-        dlog('[disconnecting] notified peer_left', { xrId, roomId });
-      }
-    }
-  });
-
-
-
-  // Final cleanup and presence broadcast
-  socket.on('disconnect', async (reason) => {
-    dlog('❎ [EVENT] disconnect', {
-      reason,
-      xrId: socket.data?.xrId,
-      device: socket.data?.deviceName
-    });
-
-    try {
-      const xrId = socket.data?.xrId;
-      if (xrId) {
-        // Remove from your in-memory maps
-        clients.delete(xrId);
-        onlineDevices.delete(xrId);
-
-        if (desktopClients.get(xrId) === socket) {
-          desktopClients.delete(xrId);
-          dlog('[disconnect] removed desktop client:', xrId);
-        }
-      }
-
-      // Broadcast device list so UIs update without manual refresh
-      await broadcastDeviceList();
-
-      // ✅ NEW: after Socket.IO has pruned rooms, reflect pair changes
-      setTimeout(() => {
-        broadcastPairs();
-      }, 0);
-
-    } catch (err) {
-      derr('[disconnect] cleanup error:', err.message);
-    }
-  });
-
-
-
-
-
-  // -------- error --------
-  socket.on('error', (err) => {
-    derr(`[SOCKET_ERROR] ${socket.id}:`, err?.message || err);
-  });
-});// -------------------- Socket.IO Handlers --------------------
-io.on('connection', (socket) => {
-  console.log(`🔌 [CONNECTION] ${socket.id}`);
-  dlog('[CONNECTION] handshake.query:', safeDataPreview(socket.handshake?.query));
-
-  // Send recent message history
-  if (messageHistory.length > 0) {
-    const recent = messageHistory.slice(-10);
-    dlog('[CONNECTION] sending message_history size=', recent.length);
-    socket.emit('message_history', { type: 'message_history', messages: recent });
-  }
-
-  // after sending message_history (or right at the top of the connection handler)
-  (async () => {
-    try {
-      // send current presence snapshot
-      const list = await buildDeviceListGlobal();
-      socket.emit('device_list', list);
-
-      // send current active pair snapshot
-      socket.emit('room_update', { pairs: collectPairs() });
-    } catch (e) {
-      dwarn('[connection] initial snapshots failed:', e?.message || e);
-    }
-  })();
-
-  // -------- join --------
-  socket.on('join', (xrId) => {
-    dlog('[EVENT] join', xrId);
-    socket.data.xrId = xrId;
-    socket.join(roomOf(xrId));
-    clients.set(xrId, socket);
-    onlineDevices.set(xrId, socket);
-    (async () => {
-      try {
-        const list = await buildDeviceListGlobal();
-        socket.emit('device_list', list);
-        await broadcastDeviceList();
-      } catch (e) {
-        derr('[join] broadcast err:', e.message);
-      }
-    })();
-  });
-
-
-  // -------- identify --------
-  socket.on('identify', async ({ deviceName, xrId }) => {
-    dlog('[EVENT] identify', { deviceName, xrId });
-
-    // Validate
-    if (!xrId || typeof xrId !== 'string') {
-      dwarn('[IDENTIFY] missing/invalid xrId');
-      socket.emit('error', { message: 'Missing xrId' });
-      return socket.disconnect(true);
-    }
-
-    // 🔒 GLOBAL duplicate guard (works across devices; cluster-wide with Redis adapter)
-    try {
-      const all = await fetchSocketsWithRetry(); // includes other instances if Redis adapter is enabled
+      const all = await safeFetchSockets(io, "/"); // includes other instances if Redis adapter is enabled
       const holder = all.find(s => s.id !== socket.id && s.data?.xrId === xrId);
       if (holder) {
         const holderInfo = {
@@ -2313,537 +1591,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// -------------------- Socket.IO Handlers --------------------
-io.on('connection', (socket) => {
-  console.log(`🔌 [CONNECTION] ${socket.id}`);
-  dlog('[CONNECTION] handshake.query:', safeDataPreview(socket.handshake?.query));
 
-  // Send recent message history
-  if (messageHistory.length > 0) {
-    const recent = messageHistory.slice(-10);
-    dlog('[CONNECTION] sending message_history size=', recent.length);
-    socket.emit('message_history', { type: 'message_history', messages: recent });
-  }
-
-  (async () => {
-    try {
-      const list = await buildDeviceListGlobal();
-      socket.emit('device_list', list);
-      emitRoomSnapshot(socket);
-    } catch (e) {
-      dwarn('[connection] initial snapshots failed:', e?.message || e);
-    }
-  })();
-
-  // -------- join --------
-  socket.on('join', (xrId) => {
-    dlog('[EVENT] join', xrId);
-    socket.data.xrId = xrId;
-    socket.join(roomOf(xrId));
-    clients.set(xrId, socket);
-    onlineDevices.set(xrId, socket);
-    (async () => {
-      try {
-        const list = await buildDeviceListGlobal();
-        socket.emit('device_list', list);
-        await broadcastDeviceList();
-      } catch (e) {
-        derr('[join] broadcast err:', e.message);
-      }
-    })();
-    emitRoomSnapshot(socket);
-  });
-
-  // -------- identify --------
-  socket.on('identify', async ({ deviceName, xrId }) => {
-    dlog('[EVENT] identify', { deviceName, xrId });
-
-    if (!xrId || typeof xrId !== 'string') {
-      dwarn('[IDENTIFY] missing/invalid xrId');
-      socket.emit('error', { message: 'Missing xrId' });
-      return socket.disconnect(true);
-    }
-
-    try {
-      const all = await fetchSocketsWithRetry();
-      const holder = all.find(s => s.id !== socket.id && s.data?.xrId === xrId);
-      if (holder) {
-        const holderInfo = {
-          xrId,
-          deviceName: holder.data?.deviceName || 'Unknown',
-          since: holder.data?.connectedAt || null,
-          socketId: holder.id,
-        };
-        dlog('[IDENTIFY] Duplicate xrId in use — rejecting:', holderInfo);
-        broadcastEmptyDeviceListOnce();
-        setTimeout(async () => {
-          try {
-            await broadcastDeviceList();
-          } catch (e) {
-            dwarn('[DEVICE_LIST] delayed re-broadcast failed:', e.message);
-          }
-        }, 1200);
-        socket.emit('duplicate_id', { xrId, holderInfo });
-        return socket.disconnect(true);
-      }
-    } catch (e) {
-      dwarn('[IDENTIFY] fetchSockets failed; continuing cautiously:', e?.message || e);
-    }
-
-    socket.data.deviceName = deviceName || 'Unknown';
-    socket.data.xrId = xrId;
-    socket.data.connectedAt = Date.now();
-
-    try { await socket.join(roomOf(xrId)); } catch (e) { dwarn('[IDENTIFY] join room failed:', e?.message || e); }
-    clients.set(xrId, socket);
-    onlineDevices.set(xrId, socket);
-
-    if ((deviceName?.toLowerCase().includes('desktop')) || xrId === 'XR-1238') {
-      desktopClients.set(xrId, socket);
-      dlog('[IDENTIFY] desktop client tracked', xrId);
-    }
-
-    try {
-      const list = await buildDeviceListGlobal();
-      socket.emit('device_list', list);
-      await broadcastDeviceList();
-    } catch (e) {
-      derr('[identify] device_list error:', e.message);
-    }
-
-    try {
-      if (!socket.data?.roomId) {
-        await tryAutoPair(xrId);
-      } else {
-        dlog('[IDENTIFY] Skipping tryAutoPair; already in room', socket.data.roomId);
-      }
-    } catch (e) {
-      derr('[identify] tryAutoPair error:', e.message);
-    }
-  });
-
-  // -------- metrics_subscribe / unsubscribe --------
-  socket.on('metrics_subscribe', ({ xrId }) => {
-    if (!xrId) return;
-    socket.join(`metrics:${xrId}`);
-    socket.emit('metrics_snapshot', {
-      xrId,
-      telemetry: telemetryHist.get(xrId) || [],
-      quality: qualityHist.get(xrId) || [],
-    });
-  });
-  socket.on('metrics_unsubscribe', ({ xrId }) => {
-    if (!xrId) return;
-    socket.leave(`metrics:${xrId}`);
-  });
-
-  // -------- request_device_list --------
-  socket.on('request_device_list', async () => {
-    dlog('[EVENT] request_device_list');
-    try {
-      socket.emit('device_list', await buildDeviceListGlobal());
-    } catch (e) {
-      dwarn('[request_device_list] failed:', e.message);
-    }
-  });
-
-  // -------- pair_with --------
-  socket.on('pair_with', async ({ peerId }) => {
-    dlog('[EVENT] pair_with', { me: socket.data?.xrId, peerId });
-    try {
-      const me = socket.data?.xrId;
-      if (!me || !peerId) {
-        dwarn('[pair_with] missing me or peerId');
-        socket.emit('pair_error', { message: 'Identify and provide peerId' });
-        return;
-      }
-      const allowed = await isPairAllowed(me, peerId);
-      if (!allowed) {
-        dwarn('[pair_with] not allowed', me, peerId);
-        socket.emit('pair_error', { message: 'Pairing not allowed' });
-        return;
-      }
-      const roomId = getRoomIdForPair(me, peerId);
-      await socket.join(roomId);
-      socket.data.roomId = roomId;
-
-      const members = listRoomMembers(roomId);
-      io.to(roomId).emit('room_joined', { roomId, members });
-      dlog('[pair_with] room_joined emitted', { roomId, members });
-
-      broadcastPairs();
-    } catch (err) {
-      derr('[pair_with] error:', err.message);
-      socket.emit('pair_error', { message: 'Internal server error during pairing' });
-    }
-  });
-
-  // -------- signal --------
-  socket.on('signal', (payload) => {
-    let msg = payload;
-    try { msg = (typeof payload === 'string') ? JSON.parse(payload) : (payload || {}); }
-    catch (e) { return dwarn('[signal] JSON parse failed'); }
-
-    const { type } = msg;
-    dlog('📡 [EVENT] signal', { type, preview: safeDataPreview(msg) });
-
-    try {
-      if (type === 'webrtc_quality_update') {
-        const deviceId = msg.deviceId;
-        const samples = Array.isArray(msg.samples) ? msg.samples : [];
-
-        if (deviceId && samples.length) {
-          for (const s of samples) {
-            pushHist(qualityHist, deviceId, {
-              ts: s.ts,
-              jitterMs: numOrNull(s.jitterMs),
-              rttMs: numOrNull(s.rttMs),
-              lossPct: numOrNull(s.lossPct),
-              bitrateKbps: numOrNull(s.bitrateKbps),
-            });
-          }
-
-          io.to(`metrics:${deviceId}`).emit('metrics_update', {
-            xrId: deviceId,
-            quality: samples.map(s => ({
-              ts: s.ts,
-              jitterMs: s.jitterMs,
-              rttMs: s.rttMs,
-              lossPct: s.lossPct,
-              bitrateKbps: s.bitrateKbps,
-            })),
-          });
-
-          io.emit('webrtc_quality_update', { deviceId, samples });
-        }
-        return;
-      }
-
-      const { from, to, data } = msg;
-      if (to) {
-        dlog('[signal] direct target routing to', to);
-        io.to(roomOf(to)).emit('signal', { type, from, data });
-        return;
-      }
-      const roomId = socket.data?.roomId;
-      if (!roomId) {
-        dwarn('[signal] no "to" and no roomId; ignoring');
-        socket.emit('signal_error', { message: 'No room joined and no "to" specified' });
-        return;
-      }
-      dlog('[signal] room forward', roomId);
-      socket.to(roomId).emit('signal', { type, from, data });
-    } catch (err) {
-      derr('[signal] handler error:', err.message);
-    }
-  });
-
-  // -------- control --------
-  socket.on('control', ({ command, from, to, message }) => {
-    dlog('🎮 [EVENT] control', { command, from, to, message: trimStr(message || '') });
-    const payload = { command, from, message };
-    try {
-      if (to) {
-        dlog('[control] direct to', to);
-        io.to(roomOf(to)).emit('control', payload);
-      } else {
-        const roomId = socket.data?.roomId;
-        if (roomId) {
-          dlog('[control] room emit', roomId);
-          io.to(roomId).emit('control', payload);
-        } else {
-          dlog('[control] global emit');
-          io.emit('control', payload);
-        }
-      }
-    } catch (err) {
-      derr('[control] handler error:', err.message);
-    }
-  });
-
-  // -------- message (transcript -> web console via signal) --------
-  socket.on('message', (payload) => {
-    dlog('[EVENT] message', safeDataPreview(payload));
-
-    let data;
-    try {
-      data = typeof payload === 'string' ? JSON.parse(payload) : payload;
-    } catch (e) {
-      return dwarn('[message] JSON parse failed:', e.message);
-    }
-
-    const type = data?.type || 'message';
-    const from = data?.from;
-    const to = data?.to;
-    const text = data?.text;
-    const urgent = !!data?.urgent;
-    const timestamp = data?.timestamp || new Date().toISOString();
-
-    if (type === 'transcript') {
-      const out = {
-        type: 'transcript',
-        from,
-        to,
-        text,
-        final: !!data?.final,
-        timestamp,
-      };
-
-      try {
-        if (to) {
-          io.to(roomOf(to)).emit('signal', { type: 'transcript_console', from, data: out });
-          dlog('[transcript] emitted signal "transcript_console" to', to);
-        } else if (socket.data?.roomId) {
-          io.to(socket.data.roomId).emit('signal', { type: 'transcript_console', from, data: out });
-          dlog('[transcript] emitted signal "transcript_console" to room', socket.data.roomId);
-        }
-
-        if (out.final && out.text) {
-          (async () => {
-            const soapNote = await generateSoapNote(out.text);
-            io.to(socket.data?.roomId || roomOf(to)).emit('signal', {
-              type: 'soap_note_console',
-              from,
-              data: soapNote,
-            });
-            console.log('[SOAP_NOTE]', JSON.stringify(soapNote, null, 2));
-          })();
-        }
-      } catch (e) {
-        dwarn('[transcript] emit failed:', e.message);
-      }
-      return;
-    }
-
-    try {
-      const msg = {
-        type: 'message',
-        from,
-        to,
-        text,
-        urgent,
-        sender: socket.data?.deviceName || from || 'unknown',
-        xrId: from,
-        timestamp,
-      };
-      addToMessageHistory(msg);
-
-      if (to) {
-        dlog('[message] direct to', to);
-        io.to(roomOf(to)).emit('message', msg);
-      } else {
-        const roomId = socket.data?.roomId;
-        if (roomId) {
-          dlog('[message] room emit', roomId);
-          io.to(roomId).emit('message', msg);
-        } else {
-          dlog('[message] global broadcast (excluding sender)');
-          socket.broadcast.emit('message', msg);
-        }
-      }
-    } catch (err) {
-      derr('[message] handler error:', err.message);
-    }
-  });
-
-  // -------- clear-messages --------
-  socket.on('clear-messages', ({ by }) => {
-    dlog('[EVENT] clear-messages', { by });
-    const payload = { type: 'message-cleared', by, messageId: Date.now() };
-    io.emit('message-cleared', payload);
-  });
-
-  // -------- clear_confirmation --------
-  socket.on('clear_confirmation', ({ device }) => {
-    dlog('[EVENT] clear_confirmation', { device });
-    const payload = { type: 'message_cleared', by: device, timestamp: new Date().toISOString() };
-    io.emit('message_cleared', payload);
-  });
-
-  // -------- status_report --------
-  socket.on('status_report', ({ from, status }) => {
-    dlog('[EVENT] status_report', { from, status: trimStr(status || '') });
-    const payload = {
-      type: 'status_report',
-      from,
-      status,
-      timestamp: new Date().toISOString(),
-    };
-    const roomId = socket.data?.roomId;
-    if (roomId) {
-      dlog('[status_report] room emit', roomId);
-      io.to(roomId).emit('status_report', payload);
-    } else {
-      dlog('[status_report] global emit');
-      io.emit('status_report', payload);
-    }
-  });
-
-  // -------- battery --------
-  socket.on('battery', ({ xrId, batteryPct, charging }) => {
-    try {
-      const id = xrId || socket.data?.xrId;
-      if (!id) return;
-      const pct = Math.max(0, Math.min(100, Number(batteryPct)));
-      const rec = { pct, charging: !!charging, ts: Date.now() };
-
-      batteryByDevice.set(id, rec);
-      io.emit('battery_update', { xrId: id, pct: rec.pct, charging: rec.charging, ts: rec.ts });
-      dlog('[battery] update', { id, pct: rec.pct, charging: rec.charging });
-    } catch (e) {
-      dwarn('[battery] bad payload:', e?.message || e);
-    }
-  });
-
-  // -------- telemetry --------
-  socket.on('telemetry', (payload) => {
-    try {
-      const d = typeof payload === 'string' ? JSON.parse(payload) : (payload || {});
-      const xrId = d.xrId || socket.data?.xrId;
-      if (!xrId) return;
-
-      const rec = {
-        xrId,
-        connType: d.connType || 'none',
-        wifiDbm: numOrNull(d.wifiDbm),
-        wifiMbps: numOrNull(d.wifiMbps),
-        wifiBars: numOrNull(d.wifiBars),
-        cellDbm: numOrNull(d.cellDbm),
-        cellBars: numOrNull(d.cellBars),
-        netDownMbps: numOrNull(d.netDownMbps),
-        netUpMbps: numOrNull(d.netUpMbps),
-        cpuPct: numOrNull(d.cpuPct),
-        memUsedMb: numOrNull(d.memUsedMb),
-        memTotalMb: numOrNull(d.memTotalMb),
-        deviceTempC: numOrNull(d.deviceTempC),
-        ts: Date.now(),
-      };
-
-      telemetryByDevice.set(xrId, rec);
-
-      pushHist(telemetryHist, xrId, {
-        ts: rec.ts,
-        connType: rec.connType,
-        wifiMbps: rec.wifiMbps,
-        netDownMbps: rec.netDownMbps,
-        netUpMbps: rec.netUpMbps,
-        batteryPct: batteryByDevice.get(xrId)?.pct ?? null,
-        cpuPct: rec.cpuPct,
-        memUsedMb: rec.memUsedMb,
-        memTotalMb: rec.memTotalMb,
-        deviceTempC: rec.deviceTempC,
-      });
-
-      io.to(`metrics:${xrId}`).emit('metrics_update', {
-        xrId,
-        telemetry: [telemetryHist.get(xrId).at(-1)]
-      });
-
-      io.emit('telemetry_update', rec);
-
-      dlog('[telemetry] update', rec);
-    } catch (e) {
-      dwarn('[telemetry] bad payload:', e?.message || e);
-    }
-  });
-
-  // -------- webrtc_quality --------
-  socket.on('webrtc_quality', (q) => {
-    dlog('[QUALITY] recv', q);
-    try {
-      const xrId = (q && q.xrId) || socket.data?.xrId;
-      if (!xrId) return;
-
-      const snap = {
-        xrId,
-        ts: q.ts || Date.now(),
-        jitterMs: numOrNull(q.jitterMs),
-        lossPct: numOrNull(q.lossPct),
-        rttMs: numOrNull(q.rttMs),
-        fps: numOrNull(q.fps),
-        dropped: numOrNull(q.dropped),
-        nackCount: numOrNull(q.nackCount),
-        bitrateKbps: numOrNull(q.bitrateKbps),
-      };
-
-      qualityByDevice.set(xrId, snap);
-
-      pushHist(qualityHist, xrId, {
-        ts: snap.ts,
-        jitterMs: snap.jitterMs,
-        rttMs: snap.rttMs,
-        lossPct: snap.lossPct,
-        bitrateKbps: snap.bitrateKbps,
-      });
-      io.to(`metrics:${xrId}`).emit('metrics_update', {
-        xrId,
-        quality: [qualityHist.get(xrId).at(-1)]
-      });
-
-      io.emit('webrtc_quality_update', Array.from(qualityByDevice.values()));
-    } catch (e) {
-      dwarn('[QUALITY] store/broadcast failed:', e?.message || e);
-    }
-  });
-
-  // -------- message_history (on demand) --------
-  socket.on('message_history', () => {
-    dlog('[EVENT] message_history request');
-    socket.emit('message_history', {
-      type: 'message_history',
-      messages: messageHistory.slice(-10),
-    });
-  });
-
-  // Notify peers before Socket.IO removes the socket from rooms
-  socket.on('disconnecting', () => {
-    const xrId = socket.data?.xrId;
-    if (!xrId) return;
-
-    for (const roomId of socket.rooms) {
-      if (roomId.startsWith('pair:')) {
-        socket.to(roomId).emit('peer_left', { xrId, roomId });
-        dlog('[disconnecting] notified peer_left', { xrId, roomId });
-      }
-    }
-  });
-
-  // Final cleanup and presence broadcast
-  socket.on('disconnect', async (reason) => {
-    dlog('❎ [EVENT] disconnect', {
-      reason,
-      xrId: socket.data?.xrId,
-      device: socket.data?.deviceName
-    });
-
-    try {
-      const xrId = socket.data?.xrId;
-      if (xrId) {
-        clients.delete(xrId);
-        onlineDevices.delete(xrId);
-
-        if (desktopClients.get(xrId) === socket) {
-          desktopClients.delete(xrId);
-          dlog('[disconnect] removed desktop client:', xrId);
-        }
-      }
-
-      await broadcastDeviceList();
-
-      setTimeout(() => {
-        broadcastPairs();
-      }, 0);
-
-    } catch (err) {
-      derr('[disconnect] cleanup error:', err.message);
-    }
-  });
-
-  // -------- error --------
-  socket.on('error', (err) => {
-    derr(`[SOCKET_ERROR] ${socket.id}:`, err?.message || err);
-  });
-});
 
 
 // -------------------- Start & Shutdown --------------------
@@ -2859,19 +1607,32 @@ process.on('SIGTERM', shutdown);
 
 function shutdown() {
   console.log('\n[SHUTDOWN] Starting graceful shutdown…');
-  try {
-    const socketCount = io.sockets.sockets.size;
-    dlog('[SHUTDOWN] active sockets:', socketCount);
-    io.sockets.sockets.forEach((s) => s.disconnect(true));
-    io.close(() => {
+  (async () => {
+    try {
+      const socketCount = io.sockets.sockets.size;
+      dlog('[SHUTDOWN] active sockets:', socketCount);
+ 
+      // 1) stop socket.io
+      io.sockets.sockets.forEach((s) => s.disconnect(true));
+      await new Promise((resolve) => io.close(resolve));
       console.log('[SHUTDOWN] Socket.IO closed');
-      server.close(() => {
-        console.log('[SHUTDOWN] HTTP server closed');
-        process.exit(0);
-      });
-    });
-  } catch (e) {
-    derr('[SHUTDOWN] error:', e.message);
-    process.exit(1);
-  }
+ 
+      // 2) close HTTP server
+      await new Promise((resolve) => server.close(resolve));
+      console.log('[SHUTDOWN] HTTP server closed');
+ 
+      // 3) close DB
+      try {
+        await closeDatabase();
+      } catch (e) {
+        dwarn('[SHUTDOWN] DB close error:', e?.message || e);
+      }
+ 
+      process.exit(0);
+    } catch (e) {
+      derr('[SHUTDOWN] error:', e?.message || e);
+      process.exit(1);
+    }
+  })();
 }
+ 

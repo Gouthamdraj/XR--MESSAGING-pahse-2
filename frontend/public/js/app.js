@@ -1,4 +1,4 @@
-// --------------------------------------------------App.js ----------------duplicate id working version ----29-08-25------------------------------------
+// --------------------------------27-5:12-----/////////-------------App.js ----------------duplicate id working version ----29-08-25------------------------------------
 
 // --------------------------------------------16:6--------------23-09-25 --------------dashbaord and cockpit working verison============================
 console.log('[INIT] Initializing DOM elements');
@@ -403,11 +403,6 @@ function setStatus(status) {
     }
 }
 
-function setStatusByDeviceCount(count) {
-    if (count <= 0) return setStatus('Disconnected'); // red
-    if (count === 1) return setStatus('Connecting');  // amber
-    return setStatus('Connected');                    // green
-}
 
 
 // ---- Heartbeat helpers ----
@@ -1285,7 +1280,7 @@ function updateDeviceList(devices) {
         console.log(`[PAIR] Peer (${peerId}) is not online yet — waiting`);
     }
 
-    setStatusByDeviceCount(Array.isArray(devices) ? devices.length : 0);
+    
 
 }
 
