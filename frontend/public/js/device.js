@@ -292,6 +292,14 @@ export class WebRtcStreamer {
       // remember this stream/track for hard stop
       this._allStreams.add(this._localStream);
       this._cameraTrack = this._localStream.getVideoTracks()[0] || null;
+      // iOS/Safari: help the encoder pick a sensible mode
+      try {
+        const v = this._cameraTrack;
+        if (v && 'contentHint' in v && !v.contentHint) {
+          v.contentHint = 'motion'; // good default for live camera
+        }
+      } catch { }
+
 
     } catch (e) {
       console.error('getUserMedia failed', e);
@@ -331,7 +339,7 @@ export class WebRtcStreamer {
     };
     // (Receiver-side events not used on the sender; kept for completeness)
     pc.ontrack = (ev) => console.debug(`[${targetId}] ontrack`, ev.streams?.[0]);
-    
+
 
     // Ensure the initial offer contains an m=audio section so first Unmute works without renegotiation.
     try {
