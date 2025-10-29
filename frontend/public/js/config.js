@@ -25,14 +25,47 @@
   window.__HUB_URL__ = window.SIGNAL_URL;
   window.__SIGNAL_URL__ = window.SIGNAL_URL;
 
-
-  // ICE servers (keep in sync with APK). TURN can be injected if you have it.
+  // --- TURN / ICE inputs (from query or injected globals) ---
+  // If you already pass full "turns:host:port?transport=tcp" URLs, we use them as-is.
+  // Otherwise, we'll synthesize a set that includes TLS on 443.
   const injectedIce = (typeof window !== 'undefined' && window.__ICE_SERVERS__) || null;
-  const turnUrl = (typeof window !== 'undefined' && window.__TURN_URL__) || null;
-  const turnUser = (typeof window !== 'undefined' && window.__TURN_USERNAME__) || null;
-  const turnCred = (typeof window !== 'undefined' && window.__TURN_CREDENTIAL__) || null;
+
+  // Allow override via query (?turn, ?turnUser, ?turnCred) or injected globals
+  const turnUrl = pick(
+    qp.get('turn'),
+    (typeof window !== 'undefined' && window.__TURN_URL__) || null
+  );
+  const turnUser = pick(
+    qp.get('turnUser'), qp.get('turnUsername'),
+    (typeof window !== 'undefined' && window.__TURN_USERNAME__) || null
+  );
+  const turnCred = pick(
+    qp.get('turnCred'), qp.get('turnPassword'), qp.get('turnCredential'),
+    (typeof window !== 'undefined' && window.__TURN_CREDENTIAL__) || null
+  );
+
+
+  // Build TURN urls that cover iOS/corporate networks (must include TLS 443)
+  const buildTurnUrls = (base) => {
+    if (!base) return [];
+    if (Array.isArray(base)) return base;                     // already an array
+    if (/^turns?:/i.test(base)) return [base];                // already a turn/turns URL
+    // If user gave just a host (e.g., "turn.example.com"), synthesize common variants:
+    const host = String(base).replace(/^https?:\/\//, '').replace(/^\/\//, '');
+    return [
+      `turns:${host}:443?transport=tcp`,   // <- critical for iOS/captive networks
+      `turns:${host}:5349?transport=tcp`,
+      `turn:${host}:3478?transport=tcp`,
+      `turn:${host}:3478?transport=udp`
+    ];
+  };
+
   const defaultIce = [{ urls: 'stun:stun.l.google.com:19302' }];
-  const maybeTurn = (turnUrl && turnUser && turnCred) ? [{ urls: turnUrl, username: turnUser, credential: turnCred }] : [];
+  const turnUrls = buildTurnUrls(turnUrl);
+  const maybeTurn = (turnUrls.length && turnUser && turnCred)
+    ? [{ urls: turnUrls, username: turnUser, credential: turnCred }]
+    : [];
+
   window.ICE_SERVERS = injectedIce || defaultIce.concat(maybeTurn);
 
   // XR IDs (overrideable via query or injection)
