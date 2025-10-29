@@ -103,6 +103,7 @@ console.log('[HTTP] Server created');
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
   transports: ['websocket', 'polling'],   // ← include polling
+  allowEIO3: true,
   pingInterval: 25000,
   pingTimeout: 30000,
 });
@@ -262,13 +263,22 @@ if (fs.existsSync(backendPublic)) {
 function injectTurnConfig(html) {
   const raw = (process.env.TURN_URL || '').split(/[,\s]+/).filter(Boolean);
 
-  const urls = raw.map(u => {
-    // Add scheme if missing
-    if (!/^(stun|turns?):/i.test(u)) {
-      return 'turn:' + u;              // default to TURN
-    }
-    return u;
-  });
+  const expand = (u) => {
+    if (!u) return [];
+    // If full turn/turns URL provided, use as-is
+    if (/^(stun|turns?):/i.test(u)) return [u];
+    // If only a host was given (e.g. "turn.example.com"), synthesize common variants.
+    const host = String(u).replace(/:\d+$/, '');
+    return [
+      `turns:${host}:443?transport=tcp`,   // <- critical for iOS/corporate/captive networks
+      `turns:${host}:5349?transport=tcp`,
+      `turn:${host}:3478?transport=tcp`,
+      `turn:${host}:3478?transport=udp`
+    ];
+  };
+
+  // Flatten all provided items (comma/space separated env)
+  const urls = raw.flatMap(expand);
 
   const cfg = `
     <script>
@@ -281,6 +291,8 @@ function injectTurnConfig(html) {
 
   return /<\/body>/i.test(html) ? html.replace(/<\/body>/i, `${cfg}\n</body>`) : (html + cfg);
 }
+
+
 
 // -------------------- Room Concept State --------------------
 const clients = new Map();        // xrId -> socket
@@ -1607,23 +1619,23 @@ function shutdown() {
     try {
       const socketCount = io.sockets.sockets.size;
       dlog('[SHUTDOWN] active sockets:', socketCount);
- 
+
       // 1) stop socket.io
       io.sockets.sockets.forEach((s) => s.disconnect(true));
       await new Promise((resolve) => io.close(resolve));
       console.log('[SHUTDOWN] Socket.IO closed');
- 
+
       // 2) close HTTP server
       await new Promise((resolve) => server.close(resolve));
       console.log('[SHUTDOWN] HTTP server closed');
- 
+
       // 3) close DB
       try {
         await closeDatabase();
       } catch (e) {
         dwarn('[SHUTDOWN] DB close error:', e?.message || e);
       }
- 
+
       process.exit(0);
     } catch (e) {
       derr('[SHUTDOWN] error:', e?.message || e);
@@ -1631,4 +1643,4 @@ function shutdown() {
     }
   })();
 }
- 
+
