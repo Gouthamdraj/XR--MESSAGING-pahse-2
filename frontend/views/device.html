@@ -40,20 +40,20 @@
                 <button id="btnVoice" class="chip-btn">Start Voice</button>
             </div>
             <div class="controls-row">
-                <button id="btnStartRec" class="btn-outline">Start Recording</button>
-                <button id="btnStopRec" class="btn-outline">Stop Recording</button>
+                <button id="btnToggleRecording" class="chip-btn">Start Recording</button>
             </div>
         </section>
 
         <!-- Preview -->
-        <section class="card preview">
+        <section id="videoPanel" class="card preview">
+
             <video id="preview" autoplay playsinline webkit-playsinline muted></video>
 
             <div id="noStream" class="preview-empty" hidden>Stream not ready</div>
         </section>
 
         <!-- Messages -->
-        <section class="messages card">
+        <section id="messagesPanel" class="card messages">
             <h2>Messages</h2>
             <div id="msgList" class="msg-list"></div>
         </section>

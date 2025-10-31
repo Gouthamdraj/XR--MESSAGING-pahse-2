@@ -18,7 +18,8 @@
     "redis": "^5.8.0",
     "sequelize": "^6.37.7",
     "socket.io": "^4.8.1",
-    "tedious": "^18.6.1"
+    "tedious": "^18.6.1",
+    "ws": "^8.18.3"
   },
   "engines": {
     "node": ">=18"

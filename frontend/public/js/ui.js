@@ -37,6 +37,7 @@ const elMsgList = document.getElementById('msgList');
 const elMsgInput = document.getElementById('msgInput');
 const elChkUrgent = document.getElementById('chkUrgent');
 const elBtnSend = document.getElementById('btnSend');
+const elBtnToggleRecording = document.getElementById('btnToggleRecording');
 
 // ----------------- State -----------------
 let signaling = null;
@@ -326,18 +327,19 @@ function createSignaling() {
                 setStatus(isServerConnected);
                 msg('System', 'All desktops disconnected. Stopped streaming.');
 
-                // If stream already running and our preferred desktop is present, (re)send an offer
-                if (streamActive && isServerConnected && connectedDesktops.includes(DEFAULT_DESKTOP_ID)) {
-                    ensureStreamer();
-                    const to = (signaling?.currentDesktopId || DEFAULT_DESKTOP_ID);
 
-                    // ✅ Persist the last selected desktop ID
-                    persistedState.selectedDesktopId = to;
-                    saveState();
-                    streamer.sendOfferTo(to).catch(() => { });
-                }
 
             }
+
+            // If we were already streaming and a desktop is (back) online, re-offer
+            if (streamActive && isServerConnected && connectedDesktops.includes(DEFAULT_DESKTOP_ID)) {
+                ensureStreamer();
+                const to = (signaling?.currentDesktopId || DEFAULT_DESKTOP_ID);
+                persistedState.selectedDesktopId = to;
+                saveState();
+                streamer.sendOfferTo(to).catch(() => { });
+            }
+
         },
         onServerMessage: (event, payload) => {
             if (event === 'peer_left') {
@@ -664,8 +666,62 @@ function finalizeRecordingNote() {
     noteBuffer = '';
 }
 
-elBtnStartRec.addEventListener('click', onStartRecordingNote);
-elBtnStopRec.addEventListener('click', onStopRecordingNote);
+// Single Toggle for Recording (replaces Start/Stop buttons)
+let isRecording = false;
+
+elBtnToggleRecording?.addEventListener('click', async () => {
+    // We allow LOCAL note recording even if not connected.
+    const canSignal = isServerConnected && connectedDesktops.length > 0;
+
+    try {
+        if (!isRecording) {
+            // ---- Start Recording ----
+            if (canSignal) {
+                for (const targetId of connectedDesktops) {
+                    emitSafe('control', {
+                        from: ANDROID_XR_ID, to: targetId,
+                        command: 'start_recording', action: 'start_recording'
+                    });
+                }
+            }
+
+            // Ensure mic is available for SR (if stream is on and currently unmuted, mute first)
+            if (streamActive && !micMuted) applyMute(true);
+
+            // ✅ Start the local note buffer + SR (this was commented out before)
+            onStartRecordingNote();
+
+            elBtnToggleRecording.textContent = 'Stop Recording';
+            elBtnToggleRecording.classList.add('is-recording');
+            msg('System', canSignal ? 'Recording started' : 'Recording started (local only)');
+            isRecording = true;
+
+        } else {
+            // ---- Stop Recording ----
+            if (canSignal) {
+                for (const targetId of connectedDesktops) {
+                    emitSafe('control', {
+                        from: ANDROID_XR_ID, to: targetId,
+                        command: 'stop_recording', action: 'stop_recording'
+                    });
+                }
+            }
+
+            // ✅ Finalize + stop SR buffer (this was commented out before)
+            onStopRecordingNote();
+
+            elBtnToggleRecording.textContent = 'Start Recording';
+            elBtnToggleRecording.classList.remove('is-recording');
+            msg('System', canSignal ? 'Recording stopped' : 'Recording stopped (local)');
+            isRecording = false;
+        }
+    } catch (err) {
+        console.error('Recording toggle error:', err);
+        msg('System', 'Recording toggle failed');
+    }
+});
+
+
 
 // Transcript sender (same payload as Android)
 async function sendTranscript(text, isFinal) {
@@ -694,7 +750,7 @@ function sendControlCommand(command) {
         msg('System', 'No desktops connected to send command'); return;
     }
     for (const targetId of connectedDesktops) {
-        signaling.socket?.emit('control', { from: ANDROID_XR_ID, to: targetId, command, action: command });
+        emitSafe('control', { from: ANDROID_XR_ID, to: targetId, command, action: command });
 
     }
     // local handling mirrors Android’s immediate UI update:
