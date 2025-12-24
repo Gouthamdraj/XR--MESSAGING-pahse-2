@@ -22,7 +22,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22.x'   # or your Node version
+          node-version: '20.x'   # or your Node version
 
       # Step 3: Install backend dependencies
       - name: Install backend dependencies
@@ -45,4 +45,5 @@ jobs:
           package: ./backend
 
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_627E71856F234C14ADC4B32AA7F291A0 }}
+
 
