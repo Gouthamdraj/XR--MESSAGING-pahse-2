@@ -16,6 +16,86 @@ const muteBadge = document.getElementById('muteBadge');
 const videoOverlay = document.getElementById('videoOverlay');
 const openEmulatorBtn = document.getElementById('openEmulator');
 const clearMessagesBtn = document.getElementById('clearMessagesBtn');
+const XR_VISION_DOCK_SCREEN_ID = 3; // From System_Screens table
+// =======================
+// XR Vision Dock permissions
+// =======================
+let xrDockPermissions = null;  // { read, write, edit, delete } for this screen, or null if unknown
+
+async function loadDockPermissions() {
+    try {
+        const res = await fetch('/api/platform/my-screens', {
+            method: 'GET',
+            credentials: 'include',
+            headers: { 'Accept': 'application/json' }
+        });
+
+        if (!res.ok) {
+            console.warn('[PERM] my-screens error:', res.status);
+            xrDockPermissions = null;
+            return;
+        }
+
+        const data = await res.json();
+        const screens = data?.screens || [];
+
+        // *** FIX: ALWAYS MATCH BY SCREEN ID ***
+        const match = screens.find(s => s.id === XR_VISION_DOCK_SCREEN_ID);
+
+        if (!match) {
+            console.warn('[PERM] XR Vision Dock screen ID not found, defaulting to unrestricted');
+            xrDockPermissions = null;
+            return;
+        }
+
+        xrDockPermissions = {
+            read: !!match.read,
+            write: !!match.write,
+            edit: !!match.edit,
+            delete: !!match.delete
+        };
+
+        console.log("[PERM] XR Vision Dock Permission Loaded:", xrDockPermissions);
+
+    } catch (err) {
+        console.warn("[PERM] Failed to load XR Vision Dock permissions:", err);
+        xrDockPermissions = null;
+    }
+}
+
+
+
+function hasDockWritePermission() {
+    // If we couldn't load permissions, do NOT block anything (preserve existing behaviour)
+    if (!xrDockPermissions) return true;
+    return !!xrDockPermissions.write;
+}
+
+// Show the same message as Create User; use showToast if available.
+function notifyReadOnlyXRDock() {
+    const msg = 'You only have READ permission for XR Vision Dock. Editing is not allowed.';
+    if (typeof showToast === 'function') {
+        showToast(msg, 'error');
+    } else {
+        addSystemMessage(msg);
+    }
+}
+
+// Disable Send / Clear / urgent toggle for read-only users
+function applyDockReadOnlyUI() {
+    if (!xrDockPermissions || xrDockPermissions.write) return; // nothing to lock
+
+    console.log('[PERM] Applying read-only UI for XR Vision Dock');
+
+    if (messageInput) {
+        messageInput.readOnly = true;
+        messageInput.placeholder = 'READ-ONLY: You do not have permission to send messages.';
+    }
+    if (urgentCheckbox) urgentCheckbox.disabled = true;
+    if (sendButton) sendButton.disabled = true;
+    if (clearMessagesBtn) clearMessagesBtn.disabled = true;
+}
+
 
 // Mirror helper for the scribe view
 function setMirror(on) {
@@ -158,6 +238,8 @@ function mergeIncremental(prev, next) {
 
 // 🔷 ROOM: track the private room we're paired into (if any)
 let currentRoom = null;
+let pairedPeerId = null; // set when server emits room_joined
+
 
 // 🔒 Sticky autoconnect flag (persist across refresh)
 const AUTO_KEY = 'XR_AUTOCONNECT';
@@ -268,17 +350,24 @@ console.log('[CONFIG] Server URL:', SERVER_URL);
 console.log('[CONFIG] XR ID (initial):', XR_ID);
 console.log('[CONFIG] Device Name:', DEVICE_NAME);
 
-// Peer-ID mapping: map Desktop XR_ID -> its Android peer ID.
-// Customize this logic if you have a different mapping scheme.
+// Peer-ID mapping: LEGACY fallback only.
+// Option B: the server tells us the peer via room_joined members (pairedPeerId).
 function mapPeerId(desktopId) {
-    // Example mapping rule:
-    // - If you want a specific pair, return that here.
-    // - Currently we map all desktop IDs to XR-1234 (the Android).
-    return 'XR-1234';
+    // ✅ Prefer server-determined peer (Option B)
+    if (pairedPeerId) return pairedPeerId;
+
+    // ✅ Legacy fallback only (avoid hardcoding XR-1234)
+    // If you truly need a manual mapping for older setups, implement it here.
+    // Returning null is safer than returning the wrong peer.
+    return null;
 }
+
 function currentPeerId() {
-    return mapPeerId(XR_ID);
+    // Option B: peer is determined by server (room_joined members)
+    return pairedPeerId || null;
 }
+
+
 
 /* =========================
    📣 Cross‑tab presence (duplicate guard)
@@ -340,44 +429,32 @@ function stopPresencePings() {
     }
 }
 
-/* ------------- XR ID change listener (updated) ------------- */
+/* ------------- XR ID change listener (Option B) ------------- */
 xrIdInput.addEventListener('change', () => {
-    // const newId = normalizeId(xrIdInput.value);
-    // XR_ID = newId || ALLOWED_ID;
-
-    // ===============================
+    // Read and normalize the latest input (no fallback to XR-1238)
     const newId = normalizeId(xrIdInput.value);
-    XR_ID = newId; // no fallback
+    XR_ID = newId;
 
-    duplicateLock = false; // user changed ID → allow attempts again
+    // user changed ID → allow attempts again
+    duplicateLock = false;
 
+    // Option B: do NOT restrict XR_ID here, and do NOT auto-connect on change.
+    DEVICE_NAME = XR_ID ? `Desktop${String(XR_ID).replace(/^XR-/i, '')}` : 'Desktop';
+    addSystemMessage(`✅ ID set to ${XR_ID || '(empty)'}.`);
 
-    if (!isAllowedId(XR_ID)) {
-        // Reset label and hide device list if disallowed
-        DEVICE_NAME = 'Desktop';
-        deviceListElement.innerHTML = '';
-        addSystemMessage(`❌ Only ID ${ALLOWED_ID} can connect. You entered "${newId || '(empty)'}".`);
-        // If connected with a different ID somehow, drop it.
-        if (socket?.connected) {
-            try { localStorage.setItem(AUTO_KEY, '0'); } catch { }
-            socket.disconnect();
-        }
-        setStatus('Disconnected');
-        announcePresence('idle');
+    // If connected already, require manual disconnect/reconnect to apply the new ID safely
+    if (socket?.connected) {
+        addSystemMessage('ℹ️ XR ID changed while connected. Please Disconnect and Connect again to use the new ID.');
+        setStatus('Connected');
+        announcePresence('connected');
         return;
     }
 
-    // Allowed: set display name and optionally auto-connect once
-    DEVICE_NAME = `Desktop${ALLOWED_ID_NUM}`;
-    addSystemMessage(`✅ ID set to ${XR_ID}. Connecting…`);
-    if (!socket) initSocket();
-    if (!socket.connected) {
-        setStatus('Connecting');
-        if (socket?.io) socket.io.opts.reconnection = true;
-        try { localStorage.setItem(AUTO_KEY, '1'); } catch { }
-        socket.connect();
-    }
+    // If not connected, just reflect UI state (toggle button will connect)
+    setStatus('Disconnected');
+    announcePresence('idle');
 });
+
 
 // ---------------- Status pill ----------------
 function setStatus(status) {
@@ -467,11 +544,9 @@ function initSocket() {
 
         // Defer the rest of the connect flow until presence check returns
         setTimeout(() => {
-            if (!isAllowedId(XR_ID) || duplicateActive) {
-                console.warn('[SOCKET] Disallowed or duplicate detected; disconnecting.');
-                addSystemMessage(!isAllowedId(XR_ID)
-                    ? `❌ Only ${ALLOWED_ID} may connect. Disconnecting…`
-                    : '⚠️ This XR ID is already active in another tab/window. Disconnecting…');
+            // Only block duplicates; do NOT hardcode XR-1238
+            if (!XR_ID) {
+                addSystemMessage('❌ Please enter an XR ID before connecting.');
                 try { localStorage.setItem(AUTO_KEY, '0'); } catch { }
                 if (socket?.io) socket.io.opts.reconnection = false;
                 socket.disconnect();
@@ -479,6 +554,17 @@ function initSocket() {
                 announcePresence('idle');
                 return;
             }
+
+            if (duplicateActive) {
+                addSystemMessage('⚠️ This XR ID is already active in another tab/window. Disconnecting…');
+                try { localStorage.setItem(AUTO_KEY, '0'); } catch { }
+                if (socket?.io) socket.io.opts.reconnection = false;
+                socket.disconnect();
+                setStatus('Disconnected');
+                announcePresence('idle');
+                return;
+            }
+
 
             console.log('[SOCKET] ✅ Connected');
             loadMessageHistory();
@@ -504,8 +590,8 @@ function initSocket() {
             socket.emit('identify', payload);
             socket.emit('request_device_list');
 
-            console.log('[PAIR] Attempt pairWith on connect');
-            pairWith(currentPeerId());
+            console.log('[PAIR] Option B: waiting for server auto-pair (room_joined)');
+
 
             if (reconnectTimeout) { clearTimeout(reconnectTimeout); reconnectTimeout = null; }
             startHeartbeat();
@@ -546,8 +632,8 @@ function initSocket() {
 
         // On reconnect, try to re-pair if room was lost
         if (!currentRoom) {
-            console.log('[PAIR] No currentRoom on reconnect — re-pairing');
-            pairWith(currentPeerId());
+            console.log('[PAIR] Option B: waiting for server auto-pair (room_joined)');
+
         }
 
         startHeartbeat();
@@ -626,7 +712,20 @@ function initSocket() {
     socket.on('room_joined', ({ roomId, members }) => {
         console.log('[PAIR] room_joined:', roomId, members);
         currentRoom = roomId;
+        // Determine the other member in the pair room (the peer)
+        try {
+            const me = normalizeId(XR_ID);
+            const other = Array.isArray(members)
+                ? members.map(normalizeId).find(m => m && m !== me)
+                : null;
+            pairedPeerId = other || null;
+            console.log('[PAIR] pairedPeerId =', pairedPeerId);
+        } catch { }
+
         addSystemMessage(`🎯 VR Room created: ${roomId}. Members: ${members.join(', ')}`);
+
+        // ✅ Force device list to re-render using pair-only filter
+        if (lastDeviceList) updateDeviceList(lastDeviceList);
     });
 
     socket.on('peer_left', ({ xrId, roomId }) => {
@@ -635,6 +734,8 @@ function initSocket() {
             addSystemMessage(`${xrId} left the room.`);
             currentRoom = null; // ensure we don’t keep signaling into an empty room
             stopStream();
+            // ✅ refresh list so it stops filtering to a stale pair
+            if (lastDeviceList) updateDeviceList(lastDeviceList);
         }
     });
 }
@@ -672,15 +773,15 @@ function toggleConnection() {
         return;
     }
 
-    // Not connected -> only allow connecting if ID is exactly XR-1238
-    if (!isAllowedId(XR_ID)) {
-        // addSystemMessage(`❌ Connecting blocked. Enter "${ALLOWED_ID_NUM}" (or "${ALLOWED_ID}") first.`);
-        addSystemMessage('Please enter the XR ID to connect (e.g., XR-1238).');
+    // Not connected -> require a non-empty XR ID (Option B allows any XR ID)
+    if (!XR_ID) {
+        addSystemMessage('Please enter the XR ID to connect (e.g., XR-8005).');
         try { localStorage.setItem(AUTO_KEY, '0'); } catch { }
         setStatus('Disconnected');
         announcePresence('idle');
         return;
     }
+
 
     // 🔎 Probe other tabs for duplicates before connecting
     duplicateActive = false;
@@ -945,7 +1046,7 @@ function createPeerConnection() {
                     // 2) NEW: feed the time-series modal charts for the Android peer
                     try {
                         (window.socket || socket)?.emit('quality_stats', {
-                            xrId: currentPeerId(),            // e.g. 'XR-1234' (the device you click)
+                            xrId: (pairedPeerId || currentPeerId() || XR_ID),
                             ts: Date.now(),
                             jitterMs: s.jitterMs ?? null,
                             rttMs: s.rttMs ?? null,
@@ -973,16 +1074,23 @@ function createPeerConnection() {
     pc.onicecandidate = (event) => {
         if (event.candidate) {
             console.log('[WEBRTC] Generated ICE candidate:', event.candidate);
+
             socket?.emit('signal', {
                 type: 'ice-candidate',
-                to: currentPeerId(),  // ✅ always route directly to Android
                 from: XR_ID,
+
+                // ✅ enforce pair isolation
+                ...(pairedPeerId ? { to: pairedPeerId } : {}),
+                ...(currentRoom ? { roomId: currentRoom } : {}),
+
                 data: event.candidate,
             });
+
         } else {
             console.log('[WEBRTC] ICE gathering complete');
         }
     };
+
 
 
     pc.oniceconnectionstatechange = () => {
@@ -1031,7 +1139,7 @@ function createPeerConnection() {
                         // 2) NEW: time-series modal (battery/net/bitrate/jitter/rtt/loss)
                         try {
                             (window.socket || socket)?.emit('quality_stats', {
-                                xrId: currentPeerId(),           // e.g. 'XR-1234' (the device you click)
+                                xrId: (pairedPeerId || currentPeerId() || XR_ID),
                                 ts: Date.now(),
                                 jitterMs: s.jitterMs ?? null,
                                 rttMs: s.rttMs ?? null,
@@ -1102,6 +1210,20 @@ async function handleOffer(offer) {
         console.log('[WEBRTC] Setting remote description');
         await peerConnection.setRemoteDescription(desc);
         lastRemoteOfferSdp = desc.sdp;
+        // ✅ NEW: flush any ICE that arrived before PC/remote description was ready
+        if (pendingIceCandidates && pendingIceCandidates.length) {
+            console.log('[WEBRTC] Flushing buffered ICE:', pendingIceCandidates.length);
+            const queued = pendingIceCandidates.slice();
+            pendingIceCandidates.length = 0;
+            for (const c of queued) {
+                try {
+                    await peerConnection.addIceCandidate(new RTCIceCandidate(c));
+                } catch (e) {
+                    console.warn('[WEBRTC] Failed to apply buffered ICE:', e);
+                }
+            }
+        }
+
 
         // Prefer H.264 when answering (iOS Safari camera sends H.264 best)
         try {
@@ -1134,12 +1256,18 @@ async function handleOffer(offer) {
 
         const payload = {
             type: 'answer',
-            to: currentPeerId(),
             from: XR_ID,
+
+            // ✅ enforce strict 1-to-1 isolation (server can route by room, and/or verify target)
+            ...(pairedPeerId ? { to: pairedPeerId } : {}),
+            ...(currentRoom ? { roomId: currentRoom } : {}),
+
             data: peerConnection.localDescription,
         };
+
         console.log('[WEBRTC] Emitting signal (answer):', payload);
         socket?.emit('signal', payload);
+
 
         console.log('[WEBRTC] Answer sent to peer');
 
@@ -1243,40 +1371,43 @@ function showClickToPlayOverlay() {
     }
 }
 
+
 // ---------------- Devices list UI ----------------
 function updateDeviceList(devices) {
     if (!Array.isArray(devices)) {
         console.error('Device list is not an array:', devices);
         return;
-
     }
+
     lastDeviceList = devices;
-
-    // ✅ Keep the list EMPTY unless the current ID is allowed
-    if (!isAllowedId(XR_ID)) {
-        deviceListElement.innerHTML = '';
-        return;
-    }
 
     console.log('[DEVICES] Updating device list with', devices.length, 'devices');
     deviceListElement.innerHTML = '';
 
     const myId = XR_ID;
-    const peerId = currentPeerId();
+    const peerId = pairedPeerId;
+
+    // ✅ Option B UI: once room exists, show only self + paired peer
+    const wantOnlyPair = !!currentRoom; // ✅ IMPORTANT CHANGE
+    const allowed = new Set([normalizeId(myId), normalizeId(peerId)].filter(Boolean));
 
     let peerOnline = false;
     let sameIdCount = 0;
 
     devices.forEach((device) => {
-        const isSelfId = device.xrId === myId;
+        const devIdNorm = normalizeId(device?.xrId);
+
+        // ✅ Filter: if paired (room exists), ignore any device not in the pair
+        if (wantOnlyPair && !allowed.has(devIdNorm)) return;
+
+        const isSelfId = devIdNorm === normalizeId(myId);
         if (isSelfId) sameIdCount += 1;
 
         // If we're disconnected, hide our own Desktop entry
         if (isSelfId && !(socket && socket.connected)) return;
 
-        // Force our own label to Desktop1238 when allowed
         const name = isSelfId
-            ? (DEVICE_NAME || `Desktop${ALLOWED_ID_NUM}`)
+            ? (DEVICE_NAME || 'This device')
             : (device.deviceName || device.name || 'Unknown');
 
         console.log(`[DEVICE] Adding device: ${name} (${device.xrId})`);
@@ -1284,7 +1415,7 @@ function updateDeviceList(devices) {
         li.textContent = `${name} (${device.xrId})`;
         deviceListElement.appendChild(li);
 
-        if (device.xrId === peerId) {
+        if (peerId && devIdNorm === normalizeId(peerId)) {
             peerOnline = true;
         }
     });
@@ -1295,20 +1426,19 @@ function updateDeviceList(devices) {
         duplicateNotified = true;
     }
 
-    // 🔷 ROOM: Auto pair when both this tab's XR_ID and its mapped peer are online
-    if (peerOnline && !currentRoom && socket?.connected) {
-        console.log(`[PAIR] Peer (${peerId}) is online — attempting pair`);
-        pairWith(peerId);
-    } else if (!peerOnline) {
+    // Keep your existing log
+    if (peerId && !peerOnline) {
         console.log(`[PAIR] Peer (${peerId}) is not online yet — waiting`);
     }
-
-
-
 }
 
 
 function sendMessage() {
+    // Permission guard: block send for READ-only users
+    if (!hasDockWritePermission()) {
+        notifyReadOnlyXRDock();
+        return;
+    }
     const text = (messageInput.value || '').trim();
     console.log('[CHAT] Sending message:', text);
     if (!text) return;
@@ -1318,23 +1448,25 @@ function sendMessage() {
         return;
     }
 
-    const to = currentPeerId(); // Android peer, e.g. 'XR-1234'
-    if (!to) {
-        console.warn('[CHAT] No peerId available to send to');
+    const to = pairedPeerId; // Option B: peer comes from room_joined members
+    if (!currentRoom) {
+        console.warn('[CHAT] Not paired yet (no currentRoom). Wait for room_joined.');
+        addSystemMessage?.('⚠️ Not paired yet. Wait for pairing before sending messages.');
         return;
     }
 
+
     // Fully specified payload to satisfy both server and Android client
     const message = {
-        to,                      // ✅ always include explicit target
-        from: XR_ID,             // sender id
-        sender: DEVICE_NAME,     // human-friendly name
-        xrId: XR_ID,             // some clients expect xrId explicitly
+        ...(to ? { to } : {}),       // optional; server routes by pair-room anyway
+        from: XR_ID,                 // sender id
+        sender: DEVICE_NAME,         // human-friendly name
+        xrId: XR_ID,                 // some clients expect xrId explicitly
         text,
         urgent: !!urgentCheckbox.checked,
-        // include roomId if present (some servers prefer room routing)
-        ...(currentRoom ? { roomId: currentRoom } : {})
+        roomId: currentRoom          // always include roomId once paired
     };
+
 
     console.log('[CHAT] Emitting message payload:', message);
     socket.emit('message', message);
@@ -1441,8 +1573,12 @@ function addSystemMessage(text) {
 }
 
 
-
 function clearMessages() {
+    // Permission guard: block clear for READ-only users
+    if (!hasDockWritePermission()) {
+        notifyReadOnlyXRDock();
+        return;
+    }
     socket?.emit('clear-messages', { by: DEVICE_NAME });
     clearedMessages.clear();
 
@@ -1459,14 +1595,22 @@ function clearMessages() {
    🔔 WebRTC offer helpers (NEW)
    ========================= */
 function requestOfferFromPeer() {
-    const to = currentPeerId();
-    if (!socket?.connected || !to) {
-        console.warn('[CONTROL] Cannot request_offer: socket connected?', !!socket?.connected, 'peer=', to);
+    if (!socket?.connected) {
+        console.warn('[CONTROL] Cannot request_offer: socket not connected');
         return;
     }
-    console.log('[CONTROL] Requesting SDP offer from peer:', to);
-    socket.emit('control', { to, command: 'request_offer' });
+
+    // Option B: must be paired first (server routes control only within pair room)
+    if (!currentRoom) {
+        console.warn('[CONTROL] Cannot request_offer: not paired yet (no currentRoom)');
+        addSystemMessage?.('⚠️ Not paired yet. Wait for room_joined before starting stream.');
+        return;
+    }
+
+    console.log('[CONTROL] Requesting SDP offer from peer (pair-room)');
+    socket.emit('control', { command: 'request_offer' });
 }
+
 
 function ensurePeerReadyThenRequestOffer() {
     if (!peerConnection) {
@@ -1503,20 +1647,25 @@ function handleControlCommand(data) {
             // New RTCPeerConnection for this session
             peerConnection = createPeerConnection();
 
-            // Ask Android for a fresh SDP offer — ALWAYS include `to`
-            const to = currentPeerId(); // e.g., 'XR-1234'
-            console.log('[CONTROL] Requesting SDP offer from peer:', to);
-            socket?.emit('control', { to, command: 'request_offer' });
+            // Option B: request offer within the pair room (server routes control by room)
+            if (!currentRoom) {
+                addSystemMessage('⚠️ Not paired yet. Wait for room_joined before starting stream.');
+                console.warn('[CONTROL] start_stream: not paired yet (no currentRoom)');
+                break;
+            }
+            console.log('[CONTROL] Requesting SDP offer from peer (pair-room)');
+            socket?.emit('control', { command: 'request_offer' });
 
             // Optional: retry if no offer arrives
             if (window.__offerRetryTimer) clearTimeout(window.__offerRetryTimer);
             window.__offerRetryTimer = setTimeout(() => {
                 if (!peerConnection || peerConnection.signalingState === 'closed') return;
-                console.log('[CONTROL] No offer yet, re-requesting…');
-                socket?.emit('control', { to, command: 'request_offer' });
+                console.log('[CONTROL] No offer yet, re-requesting (pair-room)…');
+                socket?.emit('control', { command: 'request_offer' });
             }, 4000);
             break;
         }
+
 
 
         case 'request_offer': // optional round‑trip support if peer asks us to prompt again
@@ -1580,20 +1729,13 @@ function handleControlCommand(data) {
 
 
 // ---------------- 🔷 Pairing helper ----------------
+// Option B: server auto-pairs from DB. Keep this function only for backward compatibility,
+// but do NOT emit pair_with.
 function pairWith(peerId) {
-    console.log('[PAIR] pairWith called for:', peerId);
-    if (!socket || !socket.connected) {
-        console.warn('[PAIR] socket not connected, delaying pairWith call');
-        setTimeout(() => pairWith(peerId), 500);
-        return;
-    }
-    if (!peerId) {
-        console.warn('[PAIR] Missing peerId');
-        return;
-    }
-    console.log('[PAIR] Emitting pair_with for peer:', peerId);
-    socket.emit('pair_with', { peerId });
+    console.log('[PAIR] pairWith ignored (Option B auto-pair). peerId=', peerId);
+    // no-op
 }
+
 
 
 
@@ -1631,8 +1773,12 @@ if (videoOverlay) {
 
 
 // =========================================
-window.addEventListener('load', () => {
+window.addEventListener('load', async () => {
     console.log('[APP] Window loaded - initializing (manual connect + refresh-safe)');
+
+    // 1) Load XR Vision Dock permissions & apply read-only UI if needed
+    await loadDockPermissions();
+    applyDockReadOnlyUI();
 
     // Cross-tab presence
     openPresenceChannel();
@@ -1651,13 +1797,13 @@ window.addEventListener('load', () => {
     // Initialize socket (handlers only; do not dial yet)
     initSocket();
 
-    /* (5) Prevent auto-reconnect unless the ID is allowed (updated) */
+    /* (5) Auto-reconnect on reload for any XR_ID (Option B) */
     let shouldAuto = false;
     try {
         const flag = localStorage.getItem(AUTO_KEY);
-        const inputId = normalizeId(xrIdInput.value) || ALLOWED_ID;
-        // Only auto-connect on reload AND allowed ID (XR-1238)
-        shouldAuto = (flag === '1') && isReload && isAllowedId(inputId);
+        const inputId = normalizeId(xrIdInput.value);
+        // Auto-connect on reload if user opted in and XR_ID exists
+        shouldAuto = (flag === '1') && isReload && !!inputId;
         console.log('[AUTO] XR_AUTOCONNECT:', flag, 'inputId:', inputId, ' => shouldAuto:', shouldAuto);
     } catch (e) {
         console.warn('[AUTO] Failed to read XR_AUTOCONNECT:', e);

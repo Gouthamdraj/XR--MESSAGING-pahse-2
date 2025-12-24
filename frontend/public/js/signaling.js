@@ -1,3 +1,4 @@
+// =============================================================signaling.js=====================================================
 // public/js/signaling.js
 // Browser/PWA port of Android SocketIOClient + SignalingClient.
 // Requires the Socket.IO client to be available as global `io`
@@ -34,13 +35,15 @@ export class SignalingClient {
     this._outbox = [];            // [{event, data}]
     this._OUTBOX_MAX = 200;       // cap to avoid unbounded growth
 
-
     // Presence / desktop preference (parity with Android)
     this.currentDesktopId = null;
+    this.roomId = null;  // ✅ server-issued pair room
+
     this._wasDesktopOnline = false;
     this.DESKTOP_ID = (typeof window !== 'undefined' && window.XR_OPERATOR_ID)
       ? String(window.XR_OPERATOR_ID).toUpperCase()
-      : 'XR-1238';
+      : null;
+
 
     // Socket.IO entry point
     this.io = ioOverride || (typeof window !== 'undefined' ? window.io : null);
@@ -55,6 +58,7 @@ export class SignalingClient {
     this._onDisconnect = this._onDisconnect.bind(this);
     this._onConnectError = this._onConnectError.bind(this); // ← FIX: make sure method exists below
     this._onSignal = this._onSignal.bind(this);
+    this._onRoomJoined = this._onRoomJoined.bind(this);
     this._onDeviceList = this._onDeviceList.bind(this);
     this._onPeerLeft = this._onPeerLeft.bind(this);
     this._onMessage = this._onMessage.bind(this);
@@ -63,12 +67,13 @@ export class SignalingClient {
   }
 
   /** Establish the Socket.IO connection. Mirrors Android options. */
+
   connect() {
-    if (this.socket) return; // already connecting/connected
+    if (this.socket) return;
 
     const opts = {
       path: '/socket.io',
-      transports: ['websocket'],        // avoid long-polling (Azure/app service friendly)
+      transports: ['websocket'],
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
@@ -77,7 +82,7 @@ export class SignalingClient {
       forceNew: true
     };
 
-    this._manualClose = false;       // we are connecting intentionally
+    this._manualClose = false;
     this.socket = this.io(opts);
 
     // Core lifecycle
@@ -90,13 +95,17 @@ export class SignalingClient {
     this.socket.on('device_list', this._onDeviceList);
     this.socket.on('peer_left', this._onPeerLeft);
 
+    // ✅ Pair-room event (ONLY ONCE)
+    this.socket.on('room_joined', this._onRoomJoined);
+
     // Optional passthroughs
     this.socket.on('message', this._onMessage);
     this.socket.on('message_history', this._onMessageHistory);
 
-    // NEW: forward control events to UI (APK parity)
+    // Control passthrough
     this.socket.on('control', this._onControl);
   }
+
 
   /** Disable/enable automatic reconnection like Android setReconnectionEnabled(). */
   setReconnectionEnabled(enable) {
@@ -129,6 +138,10 @@ export class SignalingClient {
     this.socket.off('signal', this._onSignal);
     this.socket.off('device_list', this._onDeviceList);
     this.socket.off('peer_left', this._onPeerLeft);
+
+    // ✅ NEW: pair-room event
+    this.socket.off('room_joined', this._onRoomJoined);
+
     this.socket.off('message', this._onMessage);
     this.socket.off('message_history', this._onMessageHistory);
     this.socket.off('control', this._onControl);
@@ -258,6 +271,18 @@ export class SignalingClient {
     this.listener?.onSignal?.(type, from, to, data);
   }
 
+  _onRoomJoined(evt) {
+    // Expected from server: { roomId, members? }
+    const rid = evt?.roomId || null;
+    this.roomId = rid;
+
+    console.log('[SIGNAL] room_joined → roomId:', rid);
+
+    // Optional: forward to UI if needed
+    this.listener?.onRoomJoined?.(evt);
+  }
+
+
   _onDeviceList(arr) {
     if (!Array.isArray(arr)) return;
     const list = [];
@@ -267,18 +292,21 @@ export class SignalingClient {
       const xrId = o?.xrId;
       const name = o?.deviceName || o?.name || 'Unknown';
       if (xrId && xrId !== this.xrId) list.push([name, xrId]);
-      if (xrId && String(xrId).toUpperCase() === this.DESKTOP_ID) desktopOnline = true;
+      if (this.DESKTOP_ID && xrId && String(xrId).toUpperCase() === this.DESKTOP_ID) desktopOnline = true;
+
     }
 
-    // Prefer XR-1238 if present, else first device
-    const preferred = list.find(([, id]) => String(id).toUpperCase() === this.DESKTOP_ID);
-    this.currentDesktopId = (preferred?.[1]) || (list[0]?.[1]) || null;
+    // Option B: no global "desktop" preference. Pick first available peer.
+    // (Server enforces strict 1:1 pairing anyway.)
+    this.currentDesktopId = (list[0]?.[1]) || null;
+
 
     // Fire single "desktop_disconnected" on transition (parity with Android)
-    if (this._wasDesktopOnline && !desktopOnline) {
+    if (this.DESKTOP_ID && this._wasDesktopOnline && !desktopOnline) {
       const notice = { xrId: this.DESKTOP_ID, message: `Desktop [${this.DESKTOP_ID}] disconnected.` };
       this.listener?.onServerMessage?.('desktop_disconnected', notice);
     }
+
     this._wasDesktopOnline = desktopOnline;
 
     this.listener?.onDeviceListUpdated?.(list);
@@ -286,7 +314,7 @@ export class SignalingClient {
 
   _onPeerLeft(obj) {
     const xrId = obj?.xrId;
-    if (xrId && String(xrId).toUpperCase() === this.DESKTOP_ID) {
+    if (this.DESKTOP_ID && xrId && String(xrId).toUpperCase() === this.DESKTOP_ID) {
       this._wasDesktopOnline = false;
       this.listener?.onServerMessage?.('peer_left', obj);
     }
@@ -307,7 +335,13 @@ export class SignalingClient {
   }
 
   _emitSignal(type, from, to, data) {
-    const payload = { type, from, to, data };
+    const payload = {
+      type,
+      from,
+      to,
+      ...(this.roomId ? { roomId: this.roomId } : {}),
+      data
+    };
     this._send('signal', payload);
   }
 

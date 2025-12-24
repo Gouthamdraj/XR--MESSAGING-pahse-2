@@ -1,6 +1,13 @@
-// --------------------------------27-5:12----//////-------------Server.js ----------------duplicate id working version ----29-08-25------------------------------------
+// ---------------------------------------------Server.js ----------------------------------------------------
 
-// // -------------------- Imports & Env --------------------
+// ========================================
+// CRITICAL: Load environment variables FIRST
+// ========================================
+// This MUST be the first require() to ensure
+// all env vars are available before any other module
+const envLoader = require('./config/env-loader');
+
+// -------------------- Imports & Env --------------------
 const express = require('express');
 const http = require('http');
 const path = require('path');
@@ -12,25 +19,15 @@ const { createAdapter } = require('@socket.io/redis-adapter');
 const axios = require('axios'); // for SOAP note generation
 const sql = require('mssql');   // MSSQL driver
 const { Sequelize } = require('sequelize');
+const bcrypt = require('bcryptjs');
+const session = require('express-session');
+const nodemailer = require('nodemailer');
 
 const { sequelize, connectToDatabase, closeDatabase } = require('./database/database-config');
+const { getAzureSqlConnection } = require('./database/azure-db-helper');
 
-
-const dotenv = require('dotenv');
-const envCandidates = [
-  path.resolve(__dirname, '.env'),
-  path.resolve(__dirname, '..', '.env'),
-];
-let loadedFrom = null;
-for (const p of envCandidates) {
-  if (fs.existsSync(p)) {
-    dotenv.config({ path: p });
-    loadedFrom = p;
-    break;
-  }
-}
-console.log('[ENV] .env loaded from:', loadedFrom || 'process.env only');
 console.log('[BOOT] Instance:', process.env.WEBSITE_INSTANCE_ID || process.pid);
+
 // -------------------- Debug helpers --------------------
 const DEBUG_LOGS = (process.env.DEBUG_LOGS || 'true').toLowerCase() === 'true';
 function dlog(...args) {
@@ -113,6 +110,22 @@ app.use(cors());
 app.use(express.json());
 console.log('[MIDDLEWARE] CORS + JSON enabled');
 
+// Session middleware for platform admin
+const sessionSecret = process.env.SESSION_SECRET || 'change-me-in-production';
+app.use(
+  session({
+    secret: sessionSecret,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: 'lax',
+      maxAge: 24 * 60 * 60 * 1000,
+    },
+  })
+);
+console.log('[MIDDLEWARE] Session enabled');
+
 // ✅ Connect to Azure SQL via Sequelize on boot (non-fatal if it fails)
 (async () => {
   try {
@@ -126,59 +139,6 @@ console.log('[MIDDLEWARE] CORS + JSON enabled');
 
 
 // // -------------------- UI routes (migrated from frontend/server.js) --------------------
-// // Point these to your FRONTEND folders on disk:
-// const VIEWS_DIR = path.join(__dirname, '../frontend/views');
-// const PUBLIC_DIR = path.join(__dirname, '../frontend/public');
-
-// // Serve static assets (CSS/JS/images) under /public
-// app.use('/public', express.static(PUBLIC_DIR));
-
-// // Keep HTML fresh (optional, safe for XR flows)
-// app.use((req, res, next) => {
-//   if (req.method === 'GET' && (req.headers.accept || '').includes('text/html')) {
-//     res.set('Cache-Control', 'no-store');
-//   }
-//   next();
-// });
-
-// const sendView = (name) => (_req, res) => res.sendFile(path.join(VIEWS_DIR, name));
-// const sendPublic = (name) => (_req, res) => res.sendFile(path.join(PUBLIC_DIR, name));
-
-// // PWA top-level files (keep at root paths)
-// app.get('/manifest.webmanifest', sendPublic('manifest.webmanifest'));
-// // ✅ Fix: alias /sw.js → use existing file public/js/sw-device.js
-// app.get('/sw.js', (req, res) => {
-//   res.type('application/javascript');
-//   res.sendFile(path.join(PUBLIC_DIR, 'js', 'sw-device.js'));
-// });
-
-// // PWA (Device-only) files
-// app.get('/device.webmanifest', (req, res) => {
-//   res.type('webmanifest');
-//   res.sendFile(path.join(PUBLIC_DIR, 'device.webmanifest'));
-// });
-
-// app.get('/device/sw.js', (req, res) => {
-//   // scope service worker to /device/
-//   res.set('Service-Worker-Allowed', '/device/');
-//   res.type('application/javascript');
-//   res.sendFile(path.join(PUBLIC_DIR, 'js', 'sw-device.js'));
-// });
-
-
-
-// // Pretty routes → views
-// app.get(['/device', '/device/'], sendView('device.html'));
-// app.get(['/dashboard', '/dashboard/'], sendView('dashboard.html'));
-// app.get(['/scribe-cockpit', '/scribe-cockpit/'], sendView('scribe-cockpit.html'));
-// // (optional legacy)
-// app.get(['/operator', '/operator/'], sendView('operator.html'));
-
-
-
-// // Root route → views/index.html
-// app.get('/', sendView('index.html'));
-
 // 🧩 Paths
 const FRONTEND_VIEWS = path.join(__dirname, '..', 'frontend', 'views');
 const FRONTEND_PUBLIC = path.join(__dirname, '..', 'frontend', 'public');
@@ -244,6 +204,7 @@ app.get(['/device', '/device/'], sendView('device.html'));
 app.get(['/dashboard', '/dashboard/'], sendView('dashboard.html'));
 app.get(['/scribe-cockpit', '/scribe-cockpit/'], sendView('scribe-cockpit.html'));
 app.get(['/operator', '/operator/'], sendView('operator.html'));
+app.get(['/platform', '/platform/'], sendView('platform.html'));
 app.get('/', sendView('index.html'));
 
 
@@ -324,29 +285,54 @@ function pushHist(map, xrId, sample) {
 }
 
 
-const allowedPairs = new Set([normalizePair('XR-1234', 'XR-1238')]);
-const PAIRINGS_MAP = new Map([
-  ['XR-1234', 'XR-1238'],
-  ['XR-1238', 'XR-1234'],
-]);
-dlog('[ROOM] allowedPairs:', Array.from(allowedPairs));
-dlog('[ROOM] PAIRINGS_MAP:', Array.from(PAIRINGS_MAP.entries()));
+// ===============================
+// Option B: DB-driven 1:1 pairing
+// ===============================
 
+// In-memory exclusivity map (case-insensitive keys)
+// key = normalized xrId (lowercase)
+// value = normalized partner xrId (lowercase)
+const pairedWith = new Map();
+
+function normXr(x) {
+  return String(x || '').trim().toUpperCase();
+}
+
+// Normalize pair for comparisons / uniqueness (case-insensitive)
 function normalizePair(a, b) {
-  return [a, b].sort().join('|');
+  return [normXr(a), normXr(b)].sort().join('|');
 }
-async function isPairAllowed(a, b) {
-  const key = normalizePair(a, b);
-  const allowed = allowedPairs.has(key);
-  dlog('[PAIR] isPairAllowed?', a, b, '=>', allowed, 'key=', key);
-  return allowed;
-}
+
+// Canonical room id for a pair (case-insensitive room naming)
 function getRoomIdForPair(a, b) {
-  const [one, two] = [a, b].sort();
+  const [one, two] = [normXr(a), normXr(b)].sort();
   const roomId = `pair:${one}:${two}`;
   dlog('[ROOM] getRoomIdForPair', a, b, '=>', roomId);
   return roomId;
 }
+
+// Helper: find an online socket by xrId (case-insensitive) using your existing clients Map
+function getClientSocketByXrIdCI(xrId) {
+  const wanted = normXr(xrId);
+  for (const [key, sock] of clients.entries()) {
+    if (normXr(key) === wanted) return sock;
+  }
+  return null;
+}
+
+// Helper: clear pairing on disconnect (we will call this in disconnect later)
+function clearPairByXrId(xrId) {
+  const me = normXr(xrId);
+  const partner = pairedWith.get(me);
+  if (partner) pairedWith.delete(partner);
+  pairedWith.delete(me);
+  return partner || null;
+}
+
+function isAlreadyPaired(xrId) {
+  return pairedWith.has(normXr(xrId));
+}
+
 function listRoomMembers(roomId) {
   const set = io.sockets.adapter.rooms.get(roomId);
   if (!set) {
@@ -365,11 +351,11 @@ function collectPairs() {
   const pairs = [];
   for (const [roomId] of io.sockets.adapter.rooms) {
     if (!roomId.startsWith('pair:')) continue;
-    const members = listRoomMembers(roomId); // returns xrIds
+    const members = listRoomMembers(roomId); // returns xrIds (original casing)
     if (members.length >= 2) {
-      const key = normalizePair(members[0], members[1]);
+      const key = normalizePair(members[0], members[1]); // case-insensitive
       const [a, b] = key.split('|');
-      pairs.push({ a, b });
+      pairs.push({ a, b }); // will be normalized (lowercase)
     }
   }
   return pairs;
@@ -381,44 +367,132 @@ function broadcastPairs() {
   dlog('[PAIR] broadcastPairs:', pairs);
 }
 
-async function tryAutoPair(deviceId) {
-  dlog('[AUTO_PAIR] attempt for', deviceId);
-  const partnerId = PAIRINGS_MAP.get(deviceId);
-  dlog('[AUTO_PAIR] partnerId:', partnerId);
-  if (!partnerId) return false;
+// ---- DB resolvers using Sequelize (you already use sequelize.query elsewhere) ----
+// NOTE: This assumes `sequelize` and `Sequelize` are in scope in server.js (they are in your existing routes).
 
-  const meSocket = clients.get(deviceId);
-  const partnerSocket = clients.get(partnerId);
-  dlog('[AUTO_PAIR] me?', !!meSocket, 'partner?', !!partnerSocket);
+async function resolveUserIdByXrId(xrId) {
+  const xr = normXr(xrId);
+  if (!xr) return null;
+
+  const rows = await sequelize.query(
+    `
+      SELECT TOP 1 id
+      FROM System_Users
+      WHERE row_status = 1
+        AND LOWER(LTRIM(RTRIM(xr_id))) = :xr
+    `,
+    { replacements: { xr }, type: Sequelize.QueryTypes.SELECT }
+  );
+
+  return rows?.[0]?.id ?? null;
+}
+
+async function resolvePartnerUserId(userId) {
+  if (!userId) return null;
+
+  const rows = await sequelize.query(
+    `
+      SELECT TOP 1
+        CASE
+          WHEN scribe_user_id = :userId THEN provider_user_id
+          WHEN provider_user_id = :userId THEN scribe_user_id
+          ELSE NULL
+        END AS partnerUserId
+      FROM Scribe_Provider_Mapping
+      WHERE row_status = 1
+        AND (:userId IN (scribe_user_id, provider_user_id))
+      ORDER BY id DESC
+    `,
+    { replacements: { userId }, type: Sequelize.QueryTypes.SELECT }
+  );
+
+  return rows?.[0]?.partnerUserId ?? null;
+}
+
+async function resolveXrIdByUserId(userId) {
+  if (!userId) return null;
+
+  const rows = await sequelize.query(
+    `
+      SELECT TOP 1 xr_id
+      FROM System_Users
+      WHERE row_status = 1
+        AND id = :userId
+    `,
+    { replacements: { userId }, type: Sequelize.QueryTypes.SELECT }
+  );
+
+  const xr = rows?.[0]?.xr_id;
+  return xr ? String(xr).trim() : null;
+}
+
+async function tryDbAutoPair(deviceId) {
+  dlog('[DB_AUTO_PAIR] attempt for', deviceId);
+
+  if (isAlreadyPaired(deviceId)) {
+    dlog('[DB_AUTO_PAIR] already paired:', deviceId, '->', pairedWith.get(normXr(deviceId)));
+    return false;
+  }
+
+  const myUserId = await resolveUserIdByXrId(deviceId);
+  dlog('[DB_AUTO_PAIR] myUserId:', myUserId);
+  if (!myUserId) return false;
+
+  const partnerUserId = await resolvePartnerUserId(myUserId);
+  dlog('[DB_AUTO_PAIR] partnerUserId:', partnerUserId);
+  if (!partnerUserId) return false;
+
+  const partnerId = await resolveXrIdByUserId(partnerUserId);
+  dlog('[DB_AUTO_PAIR] partnerId:', partnerId);
+  const partnerXr = normXr(partnerId);
+  if (!partnerXr) return false;
+
+  const meXr = normXr(deviceId);
+  if (meXr === partnerXr) {
+    dlog('[DB_AUTO_PAIR] mapping points to self; refusing', { deviceId, partnerXr });
+    return false;
+  }
+
+  const meSocket = getClientSocketByXrIdCI(deviceId);
+  const partnerSocket = getClientSocketByXrIdCI(partnerXr);
+  dlog('[DB_AUTO_PAIR] me?', !!meSocket, 'partner?', !!partnerSocket);
   if (!meSocket || !partnerSocket) return false;
 
-  const allowed = await isPairAllowed(deviceId, partnerId);
-  if (!allowed) return false;
+  if (isAlreadyPaired(deviceId) || isAlreadyPaired(partnerXr)) {
+    dlog('[DB_AUTO_PAIR] one side already paired, skipping');
+    return false;
+  }
 
-  const roomId = getRoomIdForPair(deviceId, partnerId);
+  const roomId = getRoomIdForPair(deviceId, partnerXr);
   const room = io.sockets.adapter.rooms.get(roomId);
   const memberCount = room ? room.size : 0;
-  dlog('[AUTO_PAIR] roomId:', roomId, 'current members:', memberCount);
+  dlog('[DB_AUTO_PAIR] roomId:', roomId, 'current members:', memberCount);
   if (memberCount >= 2) return false;
 
   await meSocket.join(roomId);
   await partnerSocket.join(roomId);
+
   meSocket.data.roomId = roomId;
   partnerSocket.data.roomId = roomId;
-  dlog('[AUTO_PAIR] joined both to', roomId);
+
+  pairedWith.set(meXr, partnerXr);
+  pairedWith.set(partnerXr, meXr);
+
+  dlog('[DB_AUTO_PAIR] joined both to', roomId);
 
   const members = listRoomMembers(roomId);
   io.to(roomId).emit('room_joined', { roomId, members });
-  dlog('[AUTO_PAIR] room_joined emitted for', roomId, 'members:', members);
+  meSocket.emit('room_joined', { roomId, members });
+  partnerSocket.emit('room_joined', { roomId, members });
 
-  // NEW: tell dashboards the pair is active
   broadcastPairs();
   return true;
 }
 
+
 // -------------------- Utilities --------------------
 function roomOf(xrId) {
-  return `xr:${xrId}`;
+  return `xr:${normXr(xrId)}`;
 }
 
 const messageHistory = [];
@@ -621,6 +695,2299 @@ app.post('/api/medications/availability', async (req, res) => {
 });
 
 
+// -------------------- Login check middleware --------------------
+function requireLogin(req, res, next) {
+  if (!req.session || !req.session.user) {
+    return res.status(401).json({ ok: false, message: 'Not logged in' });
+  }
+  next();
+}
+
+
+// -------------------- Platform Admin Routes --------------------
+
+function requireSuperAdmin(req, res, next) {
+  if (req.session && req.session.user && req.session.user.role === 'superadmin') {
+    return next();
+  }
+  return res.status(401).json({ ok: false, message: 'Unauthorized' });
+}
+
+// 🔐 Screen-level permission guard based on Access_Rights
+function requireScreen(screenId) {
+  return async (req, res, next) => {
+    try {
+      if (!req.session || !req.session.user) {
+        return res.status(401).json({ ok: false, message: 'Not logged in' });
+      }
+
+      const { type, userRoleMappingId } = req.session.user;
+
+      // SuperAdmin TYPE always allowed to pass
+      if (type === 'SuperAdmin') {
+        return next();
+      }
+
+      if (!userRoleMappingId) {
+        return res
+          .status(403)
+          .json({ ok: false, message: 'No screen access configured' });
+      }
+
+      const userId = req.session.user.id;
+
+      // ✅ Effective permission = User_Additional_Permissions override OR Access_Rights default
+      const rows = await sequelize.query(
+        `
+        SELECT TOP 1 ss.id
+        FROM [dbo].[System_Screens] ss
+        LEFT JOIN [dbo].[Access_Rights] ar
+          ON ar.system_screen_id = ss.id
+         AND ar.user_role_mapping_id = :urmId
+         AND ar.row_status = 1
+        LEFT JOIN [dbo].[User_Additional_Permissions] uap
+          ON uap.system_screen_id = ss.id
+         AND uap.user_id = :userId
+         AND uap.row_status = 1
+         AND (uap.start_date IS NULL OR uap.start_date <= SYSDATETIME())
+         AND (uap.end_date   IS NULL OR uap.end_date   >= SYSDATETIME())
+        WHERE ss.id = :screenId
+          AND ss.row_status = 1
+          -- if override exists use uap.read, else fallback to ar.read
+          AND COALESCE(uap.[read], ar.[read], 0) = 1
+        `,
+        {
+          replacements: {
+            userId,
+            urmId: userRoleMappingId,
+            screenId,
+          },
+          type: Sequelize.QueryTypes.SELECT,
+        }
+      );
+
+
+      if (!rows || rows.length === 0) {
+        return res
+          .status(403)
+          .json({ ok: false, message: 'You do not have access to this screen' });
+      }
+
+      return next();
+    } catch (err) {
+      console.error('[PLATFORM] requireScreen error:', err);
+      return res
+        .status(500)
+        .json({ ok: false, message: 'Internal server error' });
+    }
+  };
+}
+
+// 🔐 Screen-level WRITE permission guard (Create User, etc.)
+function requireScreenWrite(screenId) {
+  return async (req, res, next) => {
+    try {
+      if (!req.session || !req.session.user) {
+        return res.status(401).json({ ok: false, message: 'Not logged in' });
+      }
+
+      const { type, userRoleMappingId, id: userId } = req.session.user;
+
+      // SuperAdmin always allowed
+      if (type === 'SuperAdmin') {
+        return next();
+      }
+
+      if (!userRoleMappingId) {
+        return res
+          .status(403)
+          .json({ ok: false, message: 'No screen access configured' });
+      }
+
+      const rows = await sequelize.query(
+        `
+        SELECT TOP 1 ss.id
+        FROM [dbo].[System_Screens] ss
+        LEFT JOIN [dbo].[Access_Rights] ar
+          ON ar.system_screen_id = ss.id
+         AND ar.user_role_mapping_id = :urmId
+         AND ar.row_status = 1
+        LEFT JOIN [dbo].[User_Additional_Permissions] uap
+          ON uap.system_screen_id = ss.id
+         AND uap.user_id = :userId
+         AND uap.row_status = 1
+         AND (uap.start_date IS NULL OR uap.start_date <= SYSDATETIME())
+         AND (uap.end_date   IS NULL OR uap.end_date   >= SYSDATETIME())
+        WHERE ss.id = :screenId
+          AND ss.row_status = 1
+          -- require effective WRITE = 1
+          AND COALESCE(uap.[write], ar.[write], 0) = 1
+        `,
+        {
+          replacements: {
+            userId,
+            urmId: userRoleMappingId,
+            screenId,
+          },
+          type: Sequelize.QueryTypes.SELECT,
+        }
+      );
+
+      if (!rows || rows.length === 0) {
+        return res
+          .status(403)
+          .json({ ok: false, message: 'You do not have write access to this screen' });
+      }
+
+      return next();
+    } catch (err) {
+      console.error('[PLATFORM] requireScreenWrite error:', err);
+      return res
+        .status(500)
+        .json({ ok: false, message: 'Internal server error' });
+    }
+  };
+}
+
+
+app.post('/api/platform/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+
+    // Basic validation
+    if (!email || !password) {
+      return res
+        .status(400)
+        .json({ ok: false, message: 'Email and password required' });
+    }
+
+    // Look up the user in the real schema
+    // Super Admin is defined as:
+    //   Persona:    'Employee'
+    //   Department: 'IT'
+    //   Type:       'SuperAdmin'
+    //   Status:     'Active' (optional check – allows NULL)
+    const rows = await sequelize.query(
+      `
+      SELECT TOP 1
+        su.id,
+        su.full_name,
+        su.email,
+        su.password,
+        su.manager_user_id,
+        su.clinic_id,
+        su.xr_id,
+        su.status_id,
+        su.user_role_mapping_id,
+        p.persona,
+        d.department,
+        t.type,
+        s.status
+      FROM [dbo].[System_Users] su
+      JOIN [dbo].[User_Role_Mapping] urm
+        ON su.user_role_mapping_id = urm.id
+      JOIN [dbo].[Personas] p
+        ON urm.persona_id = p.id
+      JOIN [dbo].[Departments] d
+        ON urm.department_id = d.id
+      JOIN [dbo].[Types] t
+        ON urm.type_id = t.id
+      LEFT JOIN [dbo].[Status] s
+        ON su.status_id = s.id
+      WHERE su.email = :email
+        AND su.row_status = 1
+        AND urm.row_status = 1
+        AND p.row_status = 1
+        AND d.row_status = 1
+        AND t.row_status = 1
+      `,
+      {
+        replacements: { email },
+        type: Sequelize.QueryTypes.SELECT,
+      }
+    );
+
+    if (!rows || rows.length === 0) {
+      return res
+        .status(401)
+        .json({ ok: false, message: 'Invalid credentials' });
+    }
+
+    const user = rows[0];
+
+    // ✅ For now: allow ANY active System_Users row to log in to the Platform.
+    // Later you can tighten this to check persona/department/type again.
+    const isActive = !user.status || user.status === 'Active';
+
+    if (!isActive) {
+      return res
+        .status(403)
+        .json({ ok: false, message: 'Not authorized for platform (inactive user)' });
+    }
+
+    // Plain-text password check for now (matches your seeded row)
+    if (user.password !== password) {
+      return res
+        .status(401)
+        .json({ ok: false, message: 'Invalid credentials' });
+    }
+
+    // Decide if this DB user is the true Master Admin / SuperAdmin
+    const isSuperAdminUser =
+      user.type === 'SuperAdmin' ||              // from Types table
+      user.full_name === 'Master Admin' ||       // your seeded name in System_Users
+      user.email === 'admin@company.com';        // adjust if your master admin email differs
+
+    // Create session – keep the same shape so existing frontend logic still works
+    req.session.user = {
+      role: isSuperAdminUser ? 'superadmin' : 'user',   // 🔑 only Master Admin gets 'superadmin'
+      id: user.id,
+      name: user.full_name,
+      email: user.email,
+      persona: user.persona,
+      department: user.department,
+      type: user.type,
+      userType: user.type,                               // alias used by frontend checks
+      xrId: user.xr_id || null,
+      clinicId: user.clinic_id || null,
+      managerUserId: user.manager_user_id || null,
+      userRoleMappingId: user.user_role_mapping_id || null,
+    };
+
+    if (isSuperAdminUser) {
+      console.log('[PLATFORM] ✅ SuperAdmin logged in via System_Users:', user.email);
+    } else {
+      console.log('[PLATFORM] ✅ Platform user logged in via System_Users:', user.email);
+    }
+
+    // ✅ NEW: If logged-in user is Provider, log provider list (id/email/xr_id) as JSON.
+    // This is side-effect-free: does not change response/session and cannot block login.
+    // ✅ Provider-only: log ONLY the logged-in provider (id/email/xr_id)
+    if (String(user.persona || '').toLowerCase() === 'provider') {
+      console.log(
+        '[PLATFORM][PROVIDER_ME_JSON]',
+        JSON.stringify(
+          {
+            ok: true,
+            provider: {
+              id: user.id,
+              email: user.email,
+              xr_id: user.xr_id || null,
+            },
+          },
+          null,
+          2
+        )
+      );
+    }
+
+    // Response shape kept compatible with old code (we only ADD extra fields)
+    return res.json({
+      ok: true,
+      role: req.session.user.role,
+      email: user.email,
+      name: user.full_name,
+
+      // 👇 NEW helper fields (do NOT break old frontend that only reads ok/role/email/name)
+      id: user.id,
+      persona: user.persona,
+      department: user.department,
+      type: user.type,
+      managerUserId: user.manager_user_id,
+      clinicId: user.clinic_id,
+      xrId: user.xr_id,
+      userRoleMappingId: user.user_role_mapping_id,
+    });
+
+  } catch (err) {
+    console.error('[PLATFORM] Login error (System_Users):', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+
+
+
+
+app.get('/api/platform/me', (req, res) => {
+  if (req.session && req.session.user) {
+    const u = req.session.user;
+    return res.json({
+      ok: true,
+      role: u.role,
+      email: u.email,
+      name: u.name,
+      type: u.type,
+      userType: u.userType || u.type,
+      id: u.id,
+
+      // ✅ add these (safe)
+      userRoleMappingId: u.userRoleMappingId,
+      xrId: u.xrId,
+      clinicId: u.clinicId,
+      managerUserId: u.managerUserId,
+      department: u.department,
+      persona: u.persona,
+    });
+  }
+  return res.json({ ok: false });
+});
+
+
+app.post('/api/platform/logout', (req, res) => {
+  if (req.session) {
+    req.session.destroy((err) => {
+      if (err) {
+        console.error('[PLATFORM] Logout error:', err);
+        return res.status(500).json({ ok: false, message: 'Logout failed' });
+      }
+      return res.json({ ok: true });
+    });
+  } else {
+    return res.json({ ok: true });
+  }
+});
+
+app.get('/platform/secure/ping', requireSuperAdmin, (req, res) => {
+  const conn = getAzureSqlConnection();
+  const dbStatus = conn ? 'configured' : 'mock_mode';
+  return res.json({
+    ok: true,
+    message: 'Authorized',
+    user: req.session.user,
+    database: dbStatus,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get('/api/platform/config-status', (req, res) => {
+  return res.json({
+    env: envLoader.envStatus,
+    ready: envLoader.isReady,
+    loadedFrom: envLoader.loadedFrom || 'process.env only',
+  });
+});
+
+app.get('/api/platform/stats', requireLogin, async (req, res) => {
+  try {
+    // --- 1. Total users (from System_Users) -------------------------
+    const totalUsersResult = await sequelize.query(
+      `
+      SELECT COUNT(*) AS count
+      FROM [dbo].[System_Users]
+      WHERE row_status = 1
+      `,
+      { type: Sequelize.QueryTypes.SELECT }
+    );
+    const totalUsers = totalUsersResult[0]?.count || 0;
+
+    // --- 2. Providers (persona = 'Provider') -----------------------
+    const totalProvidersResult = await sequelize.query(
+      `
+      SELECT COUNT(*) AS count
+      FROM [dbo].[System_Users] su
+      JOIN [dbo].[User_Role_Mapping] urm ON su.user_role_mapping_id = urm.id
+      JOIN [dbo].[Personas] p ON urm.persona_id = p.id
+      WHERE su.row_status = 1
+        AND urm.row_status = 1
+        AND p.row_status = 1
+        AND p.persona = 'Provider'
+      `,
+      { type: Sequelize.QueryTypes.SELECT }
+    );
+    const totalProviders = totalProvidersResult[0]?.count || 0;
+
+    // --- 3. Employees (persona = 'Employee') -----------------------
+    const totalEmployeesResult = await sequelize.query(
+      `
+      SELECT COUNT(*) AS count
+      FROM [dbo].[System_Users] su
+      JOIN [dbo].[User_Role_Mapping] urm ON su.user_role_mapping_id = urm.id
+      JOIN [dbo].[Personas] p ON urm.persona_id = p.id
+      WHERE su.row_status = 1
+        AND urm.row_status = 1
+        AND p.row_status = 1
+        AND p.persona = 'Employee'
+      `,
+      { type: Sequelize.QueryTypes.SELECT }
+    );
+    const totalEmployees = totalEmployeesResult[0]?.count || 0;
+
+    // --- 4. Scribes (Employee + type = 'Scribe') -------------------
+    const totalScribesResult = await sequelize.query(
+      `
+      SELECT COUNT(*) AS count
+      FROM [dbo].[System_Users] su
+      JOIN [dbo].[User_Role_Mapping] urm ON su.user_role_mapping_id = urm.id
+      JOIN [dbo].[Personas] p ON urm.persona_id = p.id
+      JOIN [dbo].[Types] t ON urm.type_id = t.id
+      WHERE su.row_status = 1
+        AND urm.row_status = 1
+        AND p.row_status = 1
+        AND t.row_status = 1
+        AND p.persona = 'Employee'
+        AND t.type = 'Scribe'
+      `,
+      { type: Sequelize.QueryTypes.SELECT }
+    );
+    const totalScribes = totalScribesResult[0]?.count || 0;
+
+    // --- 5. Build response object ---------------------------------
+    const stats = {
+      totalUsers,
+      totalProviders,
+      totalScribes,
+      totalEmployees,
+      recentLogins: [], // we’ll wire this up later
+    };
+
+    return res.json({ ok: true, stats });
+  } catch (err) {
+    console.error('[PLATFORM] /api/platform/stats error:', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+
+// -------------------- Screens visible to current platform user --------------------
+app.get('/api/platform/my-screens', requireLogin, async (req, res) => {
+  try {
+    const sessionUser = req.session.user;
+    if (!sessionUser) {
+      return res.status(401).json({ ok: false, message: 'Not logged in' });
+    }
+
+    const userRoleMappingId = sessionUser.userRoleMappingId;
+    const userType = sessionUser.type; // e.g. 'SuperAdmin', 'Scribe', 'Employee'
+
+    // SuperAdmin: see all screens with full permissions
+    if (userType === 'SuperAdmin') {
+      const screens = await sequelize.query(
+        `
+        SELECT
+          id,
+          screen_name,
+          route_path,
+          1 AS [read],
+          1 AS [write],
+          1 AS [edit],
+          1 AS [delete]
+        FROM [dbo].[System_Screens]
+        WHERE row_status = 1
+        ORDER BY id
+        `,
+        { type: Sequelize.QueryTypes.SELECT }
+      );
+
+      return res.json({ ok: true, screens });
+    }
+
+
+    // Everyone else: defaults from Access_Rights + optional overrides from User_Additional_Permissions
+    if (!userRoleMappingId) {
+      // no mapping id – safest is to return no screens
+      return res.json({ ok: true, screens: [] });
+    }
+
+    const userId = sessionUser.id;
+
+    const screens = await sequelize.query(
+      `
+      SELECT
+        ss.id,
+        ss.screen_name,
+        ss.route_path,
+        -- effective permissions: per-user override first, then role default
+        COALESCE(uap.[read],  ar.[read],  0) AS [read],
+        COALESCE(uap.[write], ar.[write], 0) AS [write],
+        COALESCE(uap.[edit],  ar.[edit],  0) AS [edit],
+        COALESCE(uap.[delete],ar.[delete],0) AS [delete]
+      FROM [dbo].[System_Screens] ss
+      LEFT JOIN [dbo].[Access_Rights] ar
+        ON ar.system_screen_id = ss.id
+       AND ar.user_role_mapping_id = :userRoleMappingId
+       AND ar.row_status = 1
+      LEFT JOIN [dbo].[User_Additional_Permissions] uap
+        ON uap.system_screen_id = ss.id
+       AND uap.user_id = :userId
+       AND uap.row_status = 1
+       AND (uap.start_date IS NULL OR uap.start_date <= SYSDATETIME())
+       AND (uap.end_date   IS NULL OR uap.end_date   >= SYSDATETIME())
+      WHERE ss.row_status = 1
+        -- only show screens where effective READ = 1
+        AND COALESCE(uap.[read], ar.[read], 0) = 1
+      ORDER BY ss.id
+      `,
+      {
+        replacements: { userRoleMappingId, userId },
+        type: Sequelize.QueryTypes.SELECT,
+      }
+    );
+
+
+    return res.json({ ok: true, screens });
+  } catch (err) {
+    console.error('[PLATFORM] /api/platform/my-screens error:', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+// Helper: normalize rights from old & new payload shapes into
+// [{ screenId, read, write, edit, delete }]
+function normalizeScreenRights(rawRights) {
+  const result = [];
+  if (!Array.isArray(rawRights)) return result;
+
+  for (const entry of rawRights) {
+    if (!entry) continue;
+
+    // NEW shape: { screenId, read, write, edit, delete }
+    if (typeof entry === 'object') {
+      const screenId = Number(entry.screenId ?? entry.id);
+      if (!Number.isFinite(screenId)) continue;
+
+      result.push({
+        screenId,
+        read: entry.read ? 1 : 0,
+        write: entry.write ? 1 : 0,
+        edit: entry.edit ? 1 : 0,
+        delete: entry.delete ? 1 : 0,
+      });
+      continue;
+    }
+
+    // OLD shape: "1", "2", 3 → defaults to READ=1 only
+    const screenId = Number(entry);
+    if (!Number.isFinite(screenId)) continue;
+
+    result.push({
+      screenId,
+      read: 1,
+      write: 0,
+      edit: 0,
+      delete: 0,
+    });
+  }
+
+  return result;
+}
+
+
+
+
+app.post('/api/platform/create-user', requireLogin, requireScreenWrite(6), async (req, res) => {
+
+  try {
+    // ---- 0. Normalise incoming body (support old + new field names) ----
+    const body = req.body || {};
+
+    const category =
+      body.category ||
+      body.userCategory ||       // old / alternative name
+      body.persona ||
+      null;
+
+    const name = body.name || body.full_name || null;
+    const email = body.email || null;
+
+    const department =
+      body.department ||
+      body.dept ||
+      null;
+
+    const type =
+      body.type ||
+      body.userType ||          // old field name
+      body.typeName ||
+      null;
+
+    const status = body.status || null;
+
+    const password =
+      body.password ||
+      body.tempPassword ||      // if frontend ever uses a different key
+      null;
+
+    const rights =
+      Array.isArray(body.rights) ? body.rights :
+        Array.isArray(body.screenAccess) ? body.screenAccess :
+          Array.isArray(body.screenRights) ? body.screenRights :
+            [];
+
+    // Normalize rights into consistent structure
+    const normalizedRights = normalizeScreenRights(rights);
+
+
+
+    const reportingManagerId =
+      body.reportingManagerId ||
+      body.reportingManager ||
+      body.managerUserId ||
+      null;
+
+    const clinicId = body.clinicId || body.clinic || null;
+    const xrId = body.xrId || body.xr_id || null;
+    const primaryProviderId =
+      body.primaryProviderUserId ||
+      body.primaryProviderId ||
+      body.primaryProvider ||
+      null;
+
+    // Small debug to help if this ever fails again
+    console.log('[PLATFORM] /create-user incoming body (sanitised):', {
+      category,
+      name,
+      email,
+      department,
+      type,
+      status,
+      hasPassword: !!password,
+      rights,
+      reportingManagerId,
+      clinicId,
+      xrId,
+      primaryProviderId
+    });
+
+    // --- 1. Basic validation --------------------------------------------
+    if (!category || !name || !email || !status || !password) {
+      return res.status(400).json({
+        ok: false,
+        message: 'All fields are required'
+      });
+    }
+
+    // Normalize category to match Personas values
+    const normalizedCategory = String(category).toLowerCase();
+
+    // Personas table: 'Employee' and 'Provider'
+    // For Scribe, we treat persona = 'Employee' with type = 'Scribe'
+    let personaName;
+    if (normalizedCategory === 'provider') {
+      personaName = 'Provider';
+    } else {
+      // Employee, Scribe, etc. → Employee persona
+      personaName = 'Employee';
+    }
+
+    // If department not supplied, default sensibly
+    const departmentName =
+      department || (normalizedCategory === 'provider' ? 'OPS' : 'IT');
+
+    // Decide which "type" (Types table) to use
+    let typeName = type || 'Employee';
+
+    // Our Types table does NOT have "Provider" as a type.
+    // Providers should use the "Employee" type entry.
+    if (normalizedCategory === 'provider') {
+      typeName = 'Employee';
+    }
+
+    const statusName = status; // 'Active' / 'Inactive'
+
+
+    // --- 2. Look up IDs from master tables ------------------------------
+
+    const personaRow = await sequelize.query(
+      `
+      SELECT id
+      FROM [dbo].[Personas]
+      WHERE persona = :personaName
+        AND row_status = 1
+      `,
+      {
+        replacements: { personaName },
+        type: Sequelize.QueryTypes.SELECT
+      }
+    );
+    if (!personaRow.length) {
+      return res
+        .status(400)
+        .json({ ok: false, message: 'Invalid persona/category' });
+    }
+    const personaId = personaRow[0].id;
+
+    const deptRow = await sequelize.query(
+      `
+      SELECT id
+      FROM [dbo].[Departments]
+      WHERE department = :departmentName
+        AND row_status = 1
+      `,
+      {
+        replacements: { departmentName },
+        type: Sequelize.QueryTypes.SELECT
+      }
+    );
+    if (!deptRow.length) {
+      return res
+        .status(400)
+        .json({ ok: false, message: 'Invalid department' });
+    }
+    const departmentId = deptRow[0].id;
+
+    const typeRow = await sequelize.query(
+      `
+      SELECT id
+      FROM [dbo].[Types]
+      WHERE type = :typeName
+        AND row_status = 1
+      `,
+      {
+        replacements: { typeName },
+        type: Sequelize.QueryTypes.SELECT
+      }
+    );
+    if (!typeRow.length) {
+      return res
+        .status(400)
+        .json({ ok: false, message: 'Invalid type' });
+    }
+    const typeId = typeRow[0].id;
+
+    const statusRow = await sequelize.query(
+      `
+      SELECT id
+      FROM [dbo].[Status]
+      WHERE status = :statusName
+        AND row_status = 1
+      `,
+      {
+        replacements: { statusName },
+        type: Sequelize.QueryTypes.SELECT
+      }
+    );
+    if (!statusRow.length) {
+      return res
+        .status(400)
+        .json({ ok: false, message: 'Invalid status' });
+    }
+    const statusId = statusRow[0].id;
+
+    // --- 3. Check if email already exists in System_Users ----------------
+    const existingUser = await sequelize.query(
+      `
+      SELECT id
+      FROM [dbo].[System_Users]
+      WHERE email = :email
+        AND row_status = 1
+      `,
+      {
+        replacements: { email },
+        type: Sequelize.QueryTypes.SELECT
+      }
+    );
+    if (existingUser.length) {
+      return res.status(400).json({
+        ok: false,
+        message: 'A user with this email already exists'
+      });
+    }
+
+    const createdById = (req.session.user && req.session.user.id) || null;
+
+    // --- 4. Insert into User_Role_Mapping + System_Users (transaction) ---
+
+    const transaction = await sequelize.transaction();
+
+    try {
+      // 4a) Insert into User_Role_Mapping and get id via OUTPUT
+      const roleRowsRaw = await sequelize.query(
+        `
+        INSERT INTO [dbo].[User_Role_Mapping] (
+          persona_id,
+          department_id,
+          type_id,
+          created_date,
+          created_by,
+          modified_date,
+          modified_by,
+          row_status
+        )
+        OUTPUT INSERTED.id AS id
+        VALUES (
+          :personaId,
+          :departmentId,
+          :typeId,
+          SYSDATETIME(),
+          :createdBy,
+          SYSDATETIME(),
+          :createdBy,
+          1
+        )
+        `,
+        {
+          replacements: {
+            personaId,
+            departmentId,
+            typeId,
+            createdBy: createdById
+          },
+          type: Sequelize.QueryTypes.SELECT,
+          transaction
+        }
+      );
+
+      console.log(
+        '[DEBUG] roleRowsRaw from User_Role_Mapping insert:',
+        roleRowsRaw
+      );
+
+      let userRoleMappingId = null;
+      if (Array.isArray(roleRowsRaw)) {
+        if (
+          roleRowsRaw.length &&
+          roleRowsRaw[0] &&
+          typeof roleRowsRaw[0].id !== 'undefined'
+        ) {
+          userRoleMappingId = roleRowsRaw[0].id;
+        } else if (
+          Array.isArray(roleRowsRaw[0]) &&
+          roleRowsRaw[0].length &&
+          roleRowsRaw[0][0] &&
+          typeof roleRowsRaw[0][0].id !== 'undefined'
+        ) {
+          userRoleMappingId = roleRowsRaw[0][0].id;
+        }
+      }
+
+      if (!userRoleMappingId) {
+        throw new Error(
+          'User_Role_Mapping insert did not return an id (check roleRowsRaw debug log)'
+        );
+      }
+
+      // 4b) Insert into System_Users
+      const managerUserId = reportingManagerId || null;
+
+      await sequelize.query(
+        `
+        INSERT INTO [dbo].[System_Users] (
+          full_name,
+          email,
+          password,
+          manager_user_id,
+          clinic_id,
+          xr_id,
+          status_id,
+          user_role_mapping_id,
+          created_date,
+          created_by,
+          modified_date,
+          modified_by,
+          row_status
+        )
+        VALUES (
+          :full_name,
+          :email,
+          :password,
+          :manager_user_id,
+          :clinic_id,
+          :xr_id,
+          :status_id,
+          :user_role_mapping_id,
+          SYSDATETIME(),
+          :created_by,
+          SYSDATETIME(),
+          :created_by,
+          1
+        )
+        `,
+        {
+          replacements: {
+            full_name: name,
+            email,
+            password, // still plain, matching your seed; can switch to bcrypt later
+            manager_user_id: managerUserId,
+            clinic_id: clinicId || null,
+            xr_id: xrId || null,
+            status_id: statusId,
+            user_role_mapping_id: userRoleMappingId,
+            created_by: createdById
+          },
+          type: Sequelize.QueryTypes.INSERT,
+          transaction
+        }
+      );
+      // 4c) Insert screen rights into Access_Rights (if any screens were selected)
+      if (normalizedRights && normalizedRights.length > 0) {
+        for (const r of normalizedRights) {
+          const screenId = Number(r.screenId);
+          if (!Number.isFinite(screenId)) continue; // skip bad values
+
+          await sequelize.query(
+            `
+            INSERT INTO [dbo].[Access_Rights] (
+              user_role_mapping_id,
+              system_screen_id,
+              [read],
+              [write],
+              [edit],
+              [delete],
+              created_date,
+              created_by,
+              modified_date,
+              modified_by,
+              row_status
+            )
+            VALUES (
+              :user_role_mapping_id,
+              :system_screen_id,
+              :read,
+              :write,
+              :edit,
+              :delete,
+              SYSDATETIME(),
+              :created_by,
+              SYSDATETIME(),
+              :created_by,
+              1
+            )
+            `,
+            {
+              replacements: {
+                user_role_mapping_id: userRoleMappingId,
+                system_screen_id: screenId,
+                read: r.read ? 1 : 0,
+                write: r.write ? 1 : 0,
+                edit: r.edit ? 1 : 0,
+                delete: r.delete ? 1 : 0,
+                created_by: createdById,
+              },
+              type: Sequelize.QueryTypes.INSERT,
+              transaction,
+            }
+          );
+        }
+      }
+
+
+
+      await transaction.commit();
+    } catch (txErr) {
+      await transaction.rollback();
+      throw txErr;
+    }
+
+    console.log('[PLATFORM] System_Users user created:', {
+      name,
+      email,
+      category: personaName,
+      department: departmentName,
+      type: typeName
+    });
+
+    // --- 5. Send welcome email with login credentials --------------------
+    try {
+      await sendNewLoginEmail({
+        to: email,
+        name,
+        email,
+        password
+      });
+    } catch (mailErr) {
+      console.error(
+        '[PLATFORM] Failed to send welcome email:',
+        mailErr.message || mailErr
+      );
+      // Do NOT fail the request just because email failed
+    }
+
+    return res.json({
+      ok: true,
+      message: 'User created in System_Users and login email sent'
+    });
+  } catch (err) {
+    console.error('[PLATFORM] Create user error:', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+// -------------------- USERS FOR ASSIGN USERS TABLE --------------------
+// Returns providers + scribes with any existing assignment rows.
+// - SuperAdmin  → sees all providers + all scribes
+// - Manager     → sees all providers + only scribes that report to them
+// - Manager     → sees all providers + only scribes that report to them
+// - Manager     → sees all providers + only scribes that report to them
+// - Manager     → sees all providers + only scribes that report to them
+// - Manager     → sees all providers + only scribes that report to them
+// - Manager     → sees all providers + only scribes that report to them
+app.get('/api/platform/users', requireLogin, requireScreen(8), async (req, res) => {
+  try {
+    const sessionUser = req.session.user;
+    if (!sessionUser) {
+      return res.status(401).json({ ok: false, message: 'Not logged in' });
+    }
+
+    const currentUserId = sessionUser.id;
+    const isSuperAdmin =
+      sessionUser.role === 'superadmin' || sessionUser.type === 'SuperAdmin';
+    const isSuperAdminBit = isSuperAdmin ? 1 : 0;
+
+    const sql = `
+      SELECT
+        su.id,
+        su.full_name,
+        su.email,
+        su.xr_id,
+        su.clinic_id,
+        CASE
+          WHEN vur.persona_id = 5 THEN 'Provider'
+          WHEN vur.type_id   = 4 THEN 'Scribe'
+          ELSE 'Other'
+        END AS userType
+      FROM [dbo].[System_Users] su
+      JOIN [dbo].[View_User_Role_Mapping] vur
+        ON su.user_role_mapping_id = vur.id
+      WHERE
+        su.row_status = 1
+        AND su.status_id = 1
+        AND (
+             -- Providers
+             vur.persona_id = 5
+             OR
+             -- Scribes (SuperAdmin sees all; Manager only own reportees)
+             (
+               vur.type_id = 4
+               AND (
+                 :isSuperAdmin = 1
+                 OR su.manager_user_id = :managerId
+               )
+             )
+        )
+      ORDER BY su.full_name ASC;
+    `;
+
+    const rows = await sequelize.query(sql, {
+      replacements: {
+        isSuperAdmin: isSuperAdminBit,
+        managerId: currentUserId,
+      },
+      type: Sequelize.QueryTypes.SELECT,
+    });
+
+    const users = (rows || []).map((u) => ({
+      id: u.id,
+      name: u.full_name,
+      email: u.email,
+      xr_id: u.xr_id,
+      clinic_id: u.clinic_id,
+      userType: u.userType,       // 'Provider' or 'Scribe'
+      // mapping fields start empty; Save will fill them
+      provider_id: null,
+      scribe_id: null,
+      level: null,
+    }));
+
+    return res.json({ ok: true, users });
+  } catch (err) {
+    console.error('[PLATFORM] /api/platform/users error:', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+
+
+
+app.post('/api/platform/assign-user', requireSuperAdmin, async (req, res) => {
+  try {
+    const { userId, providerId, scribeId, level } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ ok: false, message: 'User ID is required' });
+    }
+
+    const checkQuery = 'SELECT * FROM [dbo].[assignusers] WHERE user_id = :userId';
+    const existing = await sequelize.query(checkQuery, {
+      replacements: { userId },
+      type: Sequelize.QueryTypes.SELECT,
+    });
+
+    if (existing && existing.length > 0) {
+      const updateQuery = `
+        UPDATE [dbo].[assignusers]
+        SET provider_id = :providerId, scribe_id = :scribeId, level = :level, updated_at = GETDATE()
+        WHERE user_id = :userId
+      `;
+      await sequelize.query(updateQuery, {
+        replacements: { userId, providerId: providerId || null, scribeId: scribeId || null, level: level || null },
+        type: Sequelize.QueryTypes.UPDATE,
+      });
+    } else {
+      const insertQuery = `
+        INSERT INTO [dbo].[assignusers] (user_id, provider_id, scribe_id, level, created_at)
+        VALUES (:userId, :providerId, :scribeId, :level, GETDATE())
+      `;
+      await sequelize.query(insertQuery, {
+        replacements: { userId, providerId: providerId || null, scribeId: scribeId || null, level: level || null },
+        type: Sequelize.QueryTypes.INSERT,
+      });
+    }
+
+    console.log('[PLATFORM] User assignment updated:', { userId, providerId, scribeId, level });
+    return res.json({ ok: true, message: 'Assignment saved successfully' });
+  } catch (err) {
+    console.error('[PLATFORM] Assign user error:', err);
+    return res.status(500).json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+
+// -------------------- ASSIGN USERS DROPDOWN OPTIONS --------------------
+// Returns:
+//  - scribes: 
+//      Master Admin  -> ALL scribes in System_Users
+//      Manager       -> ONLY scribes where manager_user_id = current manager
+//  - providers: ALL providers (for now, both Master Admin & Manager)
+// New Assign Users top-panel dropdown options
+app.get('/api/platform/assign-users/options', requireLogin, requireScreen(8), async (req, res) => {
+
+  try {
+    const sessionUser = req.session.user;
+    if (!sessionUser) {
+      return res.status(401).json({ ok: false, message: 'Not logged in' });
+    }
+
+    const currentUserId = sessionUser.id;
+    // Master Admin flag:
+    //  - role === 'superadmin' (we set this in /api/platform/login)
+    //  - OR Types.type === 'SuperAdmin'
+    const isMasterAdmin =
+      sessionUser.role === 'superadmin' ||
+      sessionUser.type === 'SuperAdmin';
+
+    const isMasterAdminBit = isMasterAdmin ? 1 : 0;
+
+    // 👇 Scribes:
+    // - type_id = 4 in View_User_Role_Mapping = Scribe
+    // - if NOT Master Admin, restrict by manager_user_id
+    const scribesQuery = `
+  SELECT
+    su.id,
+    su.full_name,
+    su.email,
+    su.xr_id,
+    su.manager_user_id,
+    mgr.full_name AS manager_name
+  FROM [dbo].[System_Users] su
+  LEFT JOIN [dbo].[System_Users] mgr
+    ON mgr.id = su.manager_user_id
+   AND mgr.row_status = 1
+  WHERE
+    su.row_status = 1
+    AND su.user_role_mapping_id IN (
+      SELECT id
+      FROM [dbo].[View_User_Role_Mapping]
+      WHERE type_id = 4      -- Scribe
+    )
+    AND (
+      :isMasterAdmin = 1
+      OR su.manager_user_id = :currentUserId
+    )
+  ORDER BY su.full_name;
+`;
+
+
+    // 👇 Providers:
+    // - persona_id = 5 in View_User_Role_Mapping = Provider
+    // - no manager filter (both Master Admin & Manager see all providers)
+    const providersQuery = `
+      SELECT
+        su.id,
+        su.full_name,
+        su.email,
+        su.xr_id,
+        su.clinic_id
+      FROM [dbo].[System_Users] su
+      WHERE
+        su.row_status = 1
+        AND su.status_id = 1
+        AND su.user_role_mapping_id IN (
+          SELECT id
+          FROM [dbo].[View_User_Role_Mapping]
+          WHERE persona_id = 5   -- Provider
+        )
+      ORDER BY su.full_name;
+    `;
+
+
+    const [scribes, providers] = await Promise.all([
+      sequelize.query(scribesQuery, {
+        replacements: { currentUserId, isMasterAdmin: isMasterAdminBit },
+        type: Sequelize.QueryTypes.SELECT,
+      }),
+      sequelize.query(providersQuery, {
+        type: Sequelize.QueryTypes.SELECT,
+      }),
+    ]);
+
+    return res.json({
+      ok: true,
+      scope: isMasterAdmin ? 'all' : 'manager', // just for debugging in UI
+      scribes,       // [{ id, full_name }]
+      providers,     // [{ id, full_name }]
+    });
+  } catch (err) {
+    console.error('[PLATFORM] /api/platform/assign-users/options error:', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+// -------------------- Scribe ⇄ Provider mappings (bottom Assign Users grid) --------------------
+// Returns one row per active mapping in Scribe_Provider_Mapping.
+// - Master Admin: sees all mappings
+// - Manager: sees only mappings where *their* scribes are mapped
+// - Master Admin: sees all mappings
+// - Manager: sees only mappings where *their* scribes are mapped
+app.get('/api/platform/scribe-provider-mapping', requireLogin, requireScreen(8), async (req, res) => {
+
+  try {
+    const sessionUser = req.session.user;
+    if (!sessionUser) {
+      return res.status(401).json({ ok: false, message: 'Not logged in' });
+    }
+
+    const currentUserId = sessionUser.id;
+    const isMasterAdmin =
+      sessionUser.role === 'superadmin' ||
+      sessionUser.type === 'SuperAdmin';
+    const isMasterAdminBit = isMasterAdmin ? 1 : 0;
+
+    const rows = await sequelize.query(
+      `
+      SELECT
+        m.id,
+
+        -- Scribe side
+        s.id          AS scribe_id,
+        s.full_name   AS scribe_name,
+        s.email       AS scribe_email,
+        s.xr_id       AS scribe_xr_id,
+
+        -- Provider side
+        p.id          AS provider_id,
+        p.full_name   AS provider_name,
+        p.email       AS provider_email,
+        p.xr_id       AS provider_xr_id,
+        p.clinic_id   AS provider_clinic_id,
+        c.clinic      AS provider_clinic_name,
+
+
+        -- Manager of the scribe
+        mgr.full_name AS scribe_manager_name
+      FROM [dbo].[Scribe_Provider_Mapping] m
+      JOIN [dbo].[System_Users] s
+        ON m.scribe_user_id = s.id
+       AND s.row_status = 1
+      JOIN [dbo].[System_Users] p
+        ON m.provider_user_id = p.id
+       AND p.row_status = 1
+       LEFT JOIN [dbo].[Clinics] c
+      ON p.clinic_id = c.id
+      AND c.row_status = 1
+      LEFT JOIN [dbo].[System_Users] mgr
+        ON s.manager_user_id = mgr.id
+       AND mgr.row_status = 1
+      WHERE
+        m.row_status = 1
+        AND (
+          :isMasterAdmin = 1
+          OR s.manager_user_id = :managerId
+        )
+      ORDER BY
+        s.full_name ASC,
+        p.full_name ASC;
+      `,
+      {
+        replacements: {
+          isMasterAdmin: isMasterAdminBit,
+          managerId: currentUserId,
+        },
+        type: Sequelize.QueryTypes.SELECT,
+      }
+    );
+
+    // Shape it nicely for the frontend (no behavior impact on other routes)
+    const mappings = rows.map((r) => ({
+      id: r.id,
+      scribe: {
+        id: r.scribe_id,
+        name: r.scribe_name,
+        email: r.scribe_email,
+        xrId: r.scribe_xr_id,
+        managerName: r.scribe_manager_name || null,
+      },
+      provider: {
+        id: r.provider_id,
+        name: r.provider_name,
+        email: r.provider_email,
+        xrId: r.provider_xr_id,
+        // ✅ add these
+        clinic_id: r.provider_clinic_id,
+        clinic_name: r.provider_clinic_name,
+
+      },
+    }));
+
+    return res.json({ ok: true, mappings });
+  } catch (err) {
+    console.error('[PLATFORM] /api/platform/scribe-provider-mapping (GET) error:', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+// Create / update a Scribe ⇄ Provider mapping from the top "Save Assignment" button
+// Create / update a Scribe ⇄ Provider mapping from the top "Save Assignment" button
+app.post('/api/platform/scribe-provider-mapping', requireLogin, requireScreenWrite(8), async (req, res) => {
+
+  try {
+    const sessionUser = req.session.user;
+    if (!sessionUser) {
+      return res.status(401).json({ ok: false, message: 'Not logged in' });
+    }
+
+    const { scribeUserId, providerUserId } = req.body || {};
+    const scribeId = parseInt(scribeUserId, 10);
+    const providerId = parseInt(providerUserId, 10);
+
+    if (!scribeId || !providerId) {
+      return res.status(400).json({
+        ok: false,
+        message: 'scribeUserId and providerUserId are required',
+      });
+    }
+
+    const currentUserId = sessionUser.id;
+    const isMasterAdmin =
+      sessionUser.role === 'superadmin' ||
+      sessionUser.type === 'SuperAdmin';
+
+    // Managers can only assign their own scribes
+    if (!isMasterAdmin) {
+      const [check] = await sequelize.query(
+        `
+        SELECT TOP 1 id
+        FROM [dbo].[System_Users]
+        WHERE id = :scribeId
+          AND manager_user_id = :managerId
+          AND row_status = 1
+        `,
+        {
+          replacements: { scribeId, managerId: currentUserId },
+          type: Sequelize.QueryTypes.SELECT,
+        }
+      );
+
+      if (!check) {
+        return res.status(403).json({
+          ok: false,
+          message: 'You can only assign scribes that report to you',
+        });
+      }
+    }
+
+    const nowUserId = currentUserId || null;
+
+    // Upsert model: one *active* mapping per scribe
+    const existing = await sequelize.query(
+      `
+      SELECT TOP 1 id
+      FROM [dbo].[Scribe_Provider_Mapping]
+      WHERE scribe_user_id = :scribeId
+        AND row_status = 1
+      `,
+      {
+        replacements: { scribeId },
+        type: Sequelize.QueryTypes.SELECT,
+      }
+    );
+
+    if (existing && existing.length > 0) {
+      // Update provider for this scribe
+      const mappingId = existing[0].id;
+      await sequelize.query(
+        `
+        UPDATE [dbo].[Scribe_Provider_Mapping]
+        SET
+          provider_user_id = :providerId,
+          modified_date    = SYSDATETIME(),
+          modified_by      = :userId
+        WHERE id = :id
+        `,
+        {
+          replacements: {
+            id: mappingId,
+            providerId,
+            userId: nowUserId,
+          },
+          type: Sequelize.QueryTypes.UPDATE,
+        }
+      );
+    } else {
+      // Insert new mapping row
+      await sequelize.query(
+        `
+        INSERT INTO [dbo].[Scribe_Provider_Mapping] (
+          scribe_user_id,
+          provider_user_id,
+          created_date,
+          created_by,
+          modified_date,
+          modified_by,
+          row_status
+        )
+        VALUES (
+          :scribeId,
+          :providerId,
+          SYSDATETIME(),
+          :userId,
+          SYSDATETIME(),
+          :userId,
+          1
+        )
+        `,
+        {
+          replacements: {
+            scribeId,
+            providerId,
+            userId: nowUserId,
+          },
+          type: Sequelize.QueryTypes.INSERT,
+        }
+      );
+    }
+
+    console.log('[PLATFORM] Scribe_Provider_Mapping saved:', {
+      scribeId,
+      providerId,
+      by: nowUserId,
+    });
+
+    return res.json({ ok: true, message: 'Mapping saved successfully' });
+  } catch (err) {
+    console.error('[PLATFORM] /api/platform/scribe-provider-mapping (POST) error:', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+
+
+// Lookup options for create-user form based on NEW XRBase schema
+// -------------------- Create-User dropdown / lookup data --------------------
+app.get('/api/platform/lookup-options', requireLogin, requireScreen(6), async (req, res) => {
+
+  try {
+    const personasQuery = `
+      SELECT id, persona
+      FROM [dbo].[Personas]
+      WHERE row_status = 1
+      ORDER BY id
+    `;
+
+    const departmentsQuery = `
+      SELECT id, department
+      FROM [dbo].[Departments]
+      WHERE row_status = 1
+      ORDER BY id
+    `;
+
+    const typesQuery = `
+      SELECT id, type
+      FROM [dbo].[Types]
+      WHERE row_status = 1
+      ORDER BY id
+    `;
+
+    const statusesQuery = `
+      SELECT id, status
+      FROM [dbo].[Status]
+      WHERE row_status = 1
+      ORDER BY id
+    `;
+
+    const clinicsQuery = `
+      SELECT id, clinic
+      FROM [dbo].[Clinics]
+      WHERE row_status = 1
+      ORDER BY id
+    `;
+
+    const screensQuery = `
+      SELECT id, screen_name, route_path
+      FROM [dbo].[System_Screens]
+      WHERE row_status = 1
+      ORDER BY id
+    `;
+
+    // All active MANAGERS (Types.type = 'Manager') for Reporting Manager dropdown
+    const managersQuery = `
+      SELECT
+        su.id,
+        su.full_name
+      FROM [dbo].[System_Users] su
+      JOIN [dbo].[User_Role_Mapping] urm
+        ON su.user_role_mapping_id = urm.id
+      JOIN [dbo].[Types] t
+        ON urm.type_id = t.id
+      WHERE su.row_status = 1
+        AND urm.row_status = 1
+        AND t.row_status = 1
+        AND t.type = 'Manager'
+      ORDER BY su.full_name ASC
+    `;
+
+
+
+
+    // ✅ now we grab 7 results, including managers
+    const [personas, departments, types, statuses, clinics, screens, managers] =
+      await Promise.all([
+        sequelize.query(personasQuery, { type: Sequelize.QueryTypes.SELECT }),
+        sequelize.query(departmentsQuery, { type: Sequelize.QueryTypes.SELECT }),
+        sequelize.query(typesQuery, { type: Sequelize.QueryTypes.SELECT }),
+        sequelize.query(statusesQuery, { type: Sequelize.QueryTypes.SELECT }),
+        sequelize.query(clinicsQuery, { type: Sequelize.QueryTypes.SELECT }),
+        sequelize.query(screensQuery, { type: Sequelize.QueryTypes.SELECT }),
+        sequelize.query(managersQuery, { type: Sequelize.QueryTypes.SELECT }), // 👈 NEW
+      ]);
+
+
+    return res.json({
+      ok: true,
+      options: {
+        personas,
+        departments,
+        types,
+        statuses,
+        clinics,
+        screens,
+        managers,   // 👈 NEW: list of { id, full_name } for Reporting Manager dropdown
+      },
+    });
+
+  } catch (err) {
+    console.error('[PLATFORM] /api/platform/lookup-options error:', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+// -------------------- Providers for a clinic (Primary Provider dropdown) --------------------
+app.get('/api/platform/providers', requireLogin, requireScreen(6), async (req, res) => {
+  try {
+    const clinicId = parseInt(req.query.clinicId, 10);
+
+    if (!clinicId || Number.isNaN(clinicId)) {
+      return res.status(400).json({
+        ok: false,
+        message: 'clinicId is required and must be a number',
+      });
+    }
+
+    // A "provider" = active user in that clinic with effective READ=1 for XR Device (screen 4)
+    // A "provider" = active user in that clinic whose persona is Provider
+    // A "provider" = active user in that clinic whose persona is Provider
+    const providers = await sequelize.query(
+      `
+      SELECT
+        su.id,
+        su.full_name
+      FROM [dbo].[System_Users] su
+      JOIN [dbo].[User_Role_Mapping] urm
+        ON su.user_role_mapping_id = urm.id
+       AND urm.row_status = 1
+      JOIN [dbo].[Personas] p
+        ON urm.persona_id = p.id
+       AND p.row_status = 1
+       AND p.persona = 'Provider'
+      WHERE
+        su.clinic_id = :clinicId
+        AND su.status_id = 1      -- Active
+        AND su.row_status = 1
+      ORDER BY
+        su.full_name ASC
+      `,
+      {
+        replacements: { clinicId },
+        type: Sequelize.QueryTypes.SELECT,
+      }
+    );
+
+
+
+    return res.json({ ok: true, providers });
+  } catch (err) {
+    console.error('[PLATFORM] /api/platform/providers error:', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+
+
+// -------------------- USER RELATIONS (Manager + Reportees) --------------------
+app.get('/api/platform/my-relations', requireLogin, async (req, res) => {
+  try {
+    const userId = req.session.user.id;
+
+    // 1️⃣ Load this user's full profile including manager
+    const [me] = await sequelize.query(`
+      SELECT 
+        su.id,
+        su.full_name,
+        su.email,
+        su.manager_user_id,
+        mgr.full_name AS manager_name
+      FROM System_Users su
+      LEFT JOIN System_Users mgr 
+        ON mgr.id = su.manager_user_id AND mgr.row_status = 1
+      WHERE su.id = :userId AND su.row_status = 1
+    `, {
+      replacements: { userId },
+      type: Sequelize.QueryTypes.SELECT
+    });
+
+    // 2️⃣ Load all reportees under this user
+    const reportees = await sequelize.query(`
+      SELECT 
+        su.id,
+        su.full_name,
+        su.email
+      FROM System_Users su
+      WHERE su.manager_user_id = :userId 
+        AND su.row_status = 1
+      ORDER BY su.full_name
+    `, {
+      replacements: { userId },
+      type: Sequelize.QueryTypes.SELECT
+    });
+
+    return res.json({
+      ok: true,
+      me,
+      manager: me.manager_user_id
+        ? { id: me.manager_user_id, name: me.manager_name }
+        : null,
+      reportees
+    });
+
+  } catch (err) {
+    console.error('my-relations error:', err);
+    return res.status(500).json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+
+// -------------------- SUBTREE HIERARCHY FOR CURRENT USER --------------------
+app.get('/api/platform/my-hierarchy', requireLogin, async (req, res) => {
+  try {
+    const currentUserId = req.session.user && req.session.user.id;
+    if (!currentUserId) {
+      return res.status(401).json({ ok: false, message: 'Not logged in' });
+    }
+
+    // 1️⃣ Load ALL active users with role/persona/department
+    const users = await sequelize.query(
+      `
+      SELECT
+        su.id,
+        su.full_name,
+        su.email,
+        su.manager_user_id,
+        su.xr_id,
+        su.clinic_id,
+        urm.id AS user_role_mapping_id,
+        p.persona,
+        d.department,
+        t.type AS role_type
+      FROM [dbo].[System_Users] su
+      JOIN [dbo].[User_Role_Mapping] urm
+        ON su.user_role_mapping_id = urm.id
+       AND urm.row_status = 1
+      LEFT JOIN [dbo].[Personas] p
+        ON urm.persona_id = p.id
+       AND p.row_status = 1
+      LEFT JOIN [dbo].[Departments] d
+        ON urm.department_id = d.id
+       AND d.row_status = 1
+      LEFT JOIN [dbo].[Types] t
+        ON urm.type_id = t.id
+       AND t.row_status = 1
+      WHERE su.row_status = 1
+      ORDER BY su.full_name ASC
+      `,
+      { type: Sequelize.QueryTypes.SELECT }
+    );
+
+    if (!users || users.length === 0) {
+      return res.json({ ok: true, roots: [], stats: { totalUsers: 0 } });
+    }
+
+    // 2️⃣ Build id -> node map
+    const byId = new Map();
+    users.forEach((u) => {
+      byId.set(u.id, {
+        id: u.id,
+        name: u.full_name,
+        email: u.email,
+        manager_user_id: u.manager_user_id,
+        xrId: u.xr_id,
+        clinicId: u.clinic_id,
+        userRoleMappingId: u.user_role_mapping_id,
+        persona: u.persona,
+        department: u.department,
+        role: u.role_type, // 'SuperAdmin', 'Manager', 'Scribe', 'Employee', etc.
+        children: [],
+      });
+    });
+
+    // 3️⃣ Hook each user to their manager
+    users.forEach((u) => {
+      const node = byId.get(u.id);
+      if (u.manager_user_id && byId.has(u.manager_user_id)) {
+        byId.get(u.manager_user_id).children.push(node);
+      }
+    });
+
+    const rootNode = byId.get(currentUserId);
+    if (!rootNode) {
+      return res.json({
+        ok: false,
+        message: 'Current user not found in hierarchy',
+      });
+    }
+
+    // 4️⃣ Collect subtree stats (current user + everyone under them)
+    const collected = [];
+    (function collect(node) {
+      collected.push(node);
+      if (Array.isArray(node.children)) {
+        node.children.forEach(collect);
+      }
+    })(rootNode);
+
+    const totalUsers = collected.length;
+    const totalManagers = collected.filter((u) => u.role === 'Manager').length;
+    const totalScribes = collected.filter((u) => u.role === 'Scribe').length;
+    const totalProviders = collected.filter((u) => u.persona === 'Provider').length;
+
+    const stats = {
+      totalUsers,
+      totalManagers,
+      totalScribes,
+      totalProviders,
+    };
+
+    return res.json({
+      ok: true,
+      roots: [rootNode], // subtree starting at THIS user
+      stats,
+    });
+  } catch (err) {
+    console.error('[PLATFORM] /api/platform/my-hierarchy error:', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+
+
+// -------------------- FULL USER HIERARCHY (SuperAdmin only) --------------------
+app.get('/api/platform/user-hierarchy', requireSuperAdmin, async (req, res) => {
+  try {
+    // 1️⃣ Load ALL active users with role/persona/department
+    const users = await sequelize.query(
+      `
+      SELECT
+        su.id,
+        su.full_name,
+        su.email,
+        su.manager_user_id,
+        su.xr_id,
+        su.clinic_id,
+        urm.id AS user_role_mapping_id,
+        p.persona,
+        d.department,
+        t.type AS role_type
+      FROM [dbo].[System_Users] su
+      JOIN [dbo].[User_Role_Mapping] urm
+        ON su.user_role_mapping_id = urm.id
+       AND urm.row_status = 1
+      LEFT JOIN [dbo].[Personas] p
+        ON urm.persona_id = p.id
+       AND p.row_status = 1
+      LEFT JOIN [dbo].[Departments] d
+        ON urm.department_id = d.id
+       AND d.row_status = 1
+      LEFT JOIN [dbo].[Types] t
+        ON urm.type_id = t.id
+       AND t.row_status = 1
+      WHERE su.row_status = 1
+      ORDER BY su.full_name ASC
+      `,
+      { type: Sequelize.QueryTypes.SELECT }
+    );
+
+    // 2️⃣ Build a map: id -> node
+    const byId = new Map();
+    users.forEach((u) => {
+      byId.set(u.id, {
+        id: u.id,
+        name: u.full_name,
+        email: u.email,
+        manager_user_id: u.manager_user_id,
+        xrId: u.xr_id,
+        clinicId: u.clinic_id,
+        userRoleMappingId: u.user_role_mapping_id,
+        persona: u.persona,
+        department: u.department,
+        role: u.role_type,   // e.g. 'SuperAdmin', 'Manager', 'Scribe', 'Member'
+        children: [],
+      });
+    });
+
+    // 3️⃣ Attach children to their manager; collect roots
+    const roots = [];
+    users.forEach((u) => {
+      const node = byId.get(u.id);
+      if (u.manager_user_id && byId.has(u.manager_user_id)) {
+        byId.get(u.manager_user_id).children.push(node);
+      } else {
+        // No valid manager → top-level in the tree
+        roots.push(node);
+      }
+    });
+
+    // 4️⃣ Simple stats for dashboard / profile header
+    const totalUsers = users.length;
+    const totalManagers = users.filter((u) => u.role_type === 'Manager').length;
+    const totalScribes = users.filter((u) => u.role_type === 'Scribe').length;
+    const totalProviders = users.filter((u) => u.persona === 'Provider').length;
+
+    const stats = {
+      totalUsers,
+      totalManagers,
+      totalScribes,
+      totalProviders,
+    };
+
+    return res.json({
+      ok: true,
+      roots,     // full tree: SuperAdmin -> Managers -> Employees etc.
+      stats,     // useful summary
+    });
+  } catch (err) {
+    console.error('[PLATFORM] /api/platform/user-hierarchy error:', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+
+
+
+// ================== EMAIL (login user welcome) ==================
+const smtpHost = process.env.SMTP_HOST;
+const smtpPort = Number(process.env.SMTP_PORT || 587);
+const smtpSecure = (process.env.SMTP_SECURE || 'false').toLowerCase() === 'true';
+const smtpUser = process.env.SMTP_USER;
+const smtpPass = process.env.SMTP_PASS;
+const emailFrom = process.env.EMAIL_FROM || smtpUser || 'no-reply@example.com';
+
+// Create a reusable transporter (only if config is present)
+let mailTransporter = null;
+if (smtpHost && smtpUser && smtpPass) {
+  mailTransporter = nodemailer.createTransport({
+    host: smtpHost,
+    port: smtpPort,
+    secure: smtpSecure,
+    auth: {
+      user: smtpUser,
+      pass: smtpPass,
+    },
+  });
+} else {
+  console.warn('[MAIL] SMTP not fully configured – emails will be skipped');
+}
+
+async function sendNewLoginEmail({ to, name, email, password }) {
+  if (!mailTransporter) {
+    console.warn('[MAIL] Transporter not available – skip sending email to', to);
+    return;
+  }
+
+  const subject = 'Your XR Platform login details';
+  const text = [
+    `Hi ${name || 'User'},`,
+    '',
+    'Your XR Platform login has been created.',
+    '',
+    `Login URL: http://localhost:8080/platform`,
+    `Email: ${email}`,
+    `Password: ${password}`,
+    '',
+    'Please sign in and change your password after first login.',
+    '',
+    'Thanks,',
+    'XR Platform',
+  ].join('\n');
+
+  const html = `
+    <p>Hi ${name || 'User'},</p>
+    <p>Your <strong>XR Platform</strong> login has been created.</p>
+    <p>
+      <strong>Login URL:</strong> <a href="http://localhost:8080/platform">http://localhost:8080/platform</a><br/>
+      <strong>Email:</strong> ${email}<br/>
+      <strong>Password:</strong> ${password}
+    </p>
+    <p>Please sign in and change your password after first login.</p>
+    <p>Thanks,<br/>XR Platform</p>
+  `;
+
+  try {
+    await mailTransporter.sendMail({
+      from: emailFrom,
+      to,
+      subject,
+      text,
+      html,
+    });
+    console.log('[MAIL] Login details sent to', to);
+  } catch (err) {
+    console.error('[MAIL] Failed to send login email to', to, err.message || err);
+  }
+}
+
+
+
+// -------------------- Create Login User (System_Users) --------------------
+app.post('/api/auth/create-user', requireSuperAdmin, async (req, res) => {
+  try {
+    const { name, email, password, reportingManager } = req.body || {};
+    // Optional screen rights for this auth-created user (not used by default)
+    const rights = Array.isArray(req.body?.rights) ? req.body.rights : [];
+
+
+    if (!name || !email || !password) {
+      return res
+        .status(400)
+        .json({ ok: false, message: 'Name, email, and password are required' });
+    }
+
+    // 1) Check if a System_Users row already exists for this email
+    const existing = await sequelize.query(
+      `
+      SELECT id
+      FROM [dbo].[System_Users]
+      WHERE email = :email
+        AND row_status = 1
+      `,
+      {
+        replacements: { email },
+        type: Sequelize.QueryTypes.SELECT,
+      }
+    );
+
+    if (existing && existing.length > 0) {
+      return res
+        .status(400)
+        .json({ ok: false, message: 'A user with this email already exists' });
+    }
+
+    // 2) Look up basic role + status IDs.
+    // For now, treat login-created users as Employee / IT / Member / Active.
+    // For now, treat login-created users as Employee / IT / Employee / Active.
+    // 2) Look up basic role + status IDs.
+    // For now, treat login-created users as Employee / IT / Employee / Active.
+    const personaRow = await sequelize.query(
+      `SELECT id FROM [dbo].[Personas] WHERE persona = 'Employee' AND row_status = 1`,
+      { type: Sequelize.QueryTypes.SELECT }
+    );
+    const deptRow = await sequelize.query(
+      `SELECT id FROM [dbo].[Departments] WHERE department = 'IT' AND row_status = 1`,
+      { type: Sequelize.QueryTypes.SELECT }
+    );
+    const typeRow = await sequelize.query(
+      `SELECT id FROM [dbo].[Types] WHERE type = 'Employee' AND row_status = 1`,
+      { type: Sequelize.QueryTypes.SELECT }
+    );
+    const statusRow = await sequelize.query(
+      `SELECT id FROM [dbo].[Status] WHERE status = 'Active' AND row_status = 1`,
+      { type: Sequelize.QueryTypes.SELECT }
+    );
+
+
+    if (!personaRow.length || !deptRow.length || !typeRow.length || !statusRow.length) {
+      return res
+        .status(500)
+        .json({ ok: false, message: 'Master data (Personas/Departments/Types/Status) missing' });
+    }
+
+    const personaId = personaRow[0].id;
+    const departmentId = deptRow[0].id;
+    const typeId = typeRow[0].id;
+    const statusId = statusRow[0].id;
+
+    const createdById = (req.session.user && req.session.user.id) || null;
+
+    // For now, we don’t resolve reportingManager → System_Users.id yet
+    const managerUserId = null;
+
+    // 3) Wrap inserts in a transaction
+    const transaction = await sequelize.transaction();
+
+    try {
+      // 3a) Insert into User_Role_Mapping
+      const [roleRows] = await sequelize.query(
+        `
+        INSERT INTO [dbo].[User_Role_Mapping] (
+          persona_id,
+          department_id,
+          type_id,
+          created_date,
+          created_by,
+          modified_date,
+          modified_by,
+          row_status
+        )
+        VALUES (
+          :personaId,
+          :departmentId,
+          :typeId,
+          SYSDATETIME(),
+          :createdBy,
+          SYSDATETIME(),
+          :createdBy,
+          1
+        );
+        SELECT SCOPE_IDENTITY() AS id;
+        `,
+        {
+          replacements: { personaId, departmentId, typeId, createdBy: createdById },
+          type: Sequelize.QueryTypes.SELECT,
+          transaction,
+        }
+      );
+
+      const userRoleMappingId = roleRows[0].id;
+
+      // 3b) Insert into System_Users
+      await sequelize.query(
+        `
+        INSERT INTO [dbo].[System_Users] (
+          full_name,
+          email,
+          password,
+          manager_user_id,
+          clinic_id,
+          xr_id,
+          status_id,
+          user_role_mapping_id,
+          created_date,
+          created_by,
+          modified_date,
+          modified_by,
+          row_status
+        )
+        VALUES (
+          :full_name,
+          :email,
+          :password,
+          :manager_user_id,
+          NULL,
+          NULL,
+          :status_id,
+          :user_role_mapping_id,
+          SYSDATETIME(),
+          :created_by,
+          SYSDATETIME(),
+          :created_by,
+          1
+        )
+        `,
+        {
+          replacements: {
+            full_name: name,
+            email,
+            password,          // plain for now, same as before
+            manager_user_id: managerUserId,
+            status_id: statusId,
+            user_role_mapping_id: userRoleMappingId,
+            created_by: createdById,
+          },
+          type: Sequelize.QueryTypes.INSERT,
+          transaction,
+        }
+      );
+
+      // 3c) Insert screen rights into Access_Rights (if any screens were selected)
+      if (rights && rights.length > 0) {
+        for (const rawId of rights) {
+          const screenId = Number(rawId);
+          if (!Number.isFinite(screenId)) continue; // skip bad values
+
+          await sequelize.query(
+            `
+            INSERT INTO [dbo].[Access_Rights] (
+              user_role_mapping_id,
+              system_screen_id,
+              [read],
+              [write],
+              [edit],
+              [delete],
+              created_date,
+              created_by,
+              modified_date,
+              modified_by,
+              row_status
+            )
+            VALUES (
+              :user_role_mapping_id,
+              :system_screen_id,
+              1,  -- read allowed
+              0,  -- write
+              0,  -- edit
+              0,  -- delete
+              SYSDATETIME(),
+              :created_by,
+              SYSDATETIME(),
+              :created_by,
+              1
+            )
+            `,
+            {
+              replacements: {
+                user_role_mapping_id: userRoleMappingId,
+                system_screen_id: screenId,
+                created_by: createdById,
+              },
+              type: Sequelize.QueryTypes.INSERT,
+              transaction,
+            }
+          );
+        }
+      }
+
+      await transaction.commit();
+    } catch (err) {
+      await transaction.rollback();
+      throw err;
+    }
+
+
+
+    console.log('[AUTH/System_Users] Login user created via /api/auth/create-user:', {
+      name,
+      email,
+    });
+
+    // 4) Send welcome email (same helper)
+    try {
+      await sendNewLoginEmail({
+        to: email,
+        name,
+        email,
+        password,
+      });
+    } catch (mailErr) {
+      console.error('[AUTH/System_Users] Failed to send welcome email:', mailErr.message || mailErr);
+      // do not fail request because of email
+    }
+
+    return res.json({
+      ok: true,
+      message: 'Login user created in System_Users and email sent',
+    });
+  } catch (err) {
+    console.error('[AUTH/System_Users] Create login user error:', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+
+
+// -------------------- Simple DB Login (auth_users) --------------------
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    // 1) Basic validation
+    if (!email || !password) {
+      return res
+        .status(400)
+        .json({ ok: false, message: 'Email and password are required' });
+    }
+
+    // 2) Look up user in auth_users by email
+    const users = await sequelize.query(
+      `
+      SELECT id, name, email, password_hash, reporting_manager
+      FROM [dbo].[auth_users]
+      WHERE email = :email
+      `,
+      {
+        replacements: { email },
+        type: Sequelize.QueryTypes.SELECT,
+      }
+    );
+
+    if (!users || users.length === 0) {
+      return res
+        .status(401)
+        .json({ ok: false, message: 'Invalid email or password' });
+    }
+
+    const user = users[0];
+
+    // 3) For now: plain password compare (later we'll use bcrypt)
+    if (user.password_hash !== password) {
+      return res
+        .status(401)
+        .json({ ok: false, message: 'Invalid email or password' });
+    }
+
+    // 4) Success – return user info (no session/JWT yet)
+    return res.json({
+      ok: true,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        reporting_manager: user.reporting_manager,
+      },
+    });
+  } catch (err) {
+    console.error('[AUTH] /api/auth/login error:', err);
+    return res
+      .status(500)
+      .json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+
+
 // ---- Desktop HTTP telemetry (beginner path) ----
 app.post('/desktop-telemetry', (req, res) => {
   try {
@@ -724,102 +3091,98 @@ function normalizeMedicationList(raw) {
     .filter(s => s.length > 0);
 }
 
-
-
-
-// -------------------- SOAP Note Generator --------------------
 async function generateSoapNote(transcript) {
   try {
     const prompt = `
-      Based on the provided transcript, generate a structured SOAP note.
-      Sections (always in this order):
-      - Chief Complaints
-      - History of Present Illness
-      - Subjective
-      - Objective
-      - Assessment
-      - Plan
-      - Medication
+Based on the provided transcript, generate a structured SOAP note.
+Sections (always in this order):
+- Chief Complaints
+- History of Present Illness
+- Subjective
+- Objective
+- Assessment
+- Plan
+- Medication
  
-      Rules:
-      - Each section should be an array of strings OR "No data available".
-      - If info missing, explicitly write "No data available".
-      - JSON only, no extra commentary.
+Rules:
+- Each section should be an array of strings OR "No data available".
+- If info missing, explicitly write "No data available".
+- JSON only, no extra commentary.
  
-      Transcript:
-      ${transcript.trim()}
-    `;
+Transcript:
+${transcript.trim()}
+    `.trim();
 
-    // ADDED: Use Abacus.AI RouteLLM instead of OpenAI
-    const ABACUS_API_KEY = process.env.ABACUS_API_KEY; // ADDED
-    if (!ABACUS_API_KEY) throw new Error('Missing ABACUS_API_KEY in environment');
-    const ABACUS_MODEL = ((process.env.ABACUS_MODEL).trim());
-    const ABACUS_TEMPERATURE = Number(process.env.ABACUS_TEMPERATURE);
-    let llmEndpoint = (process.env.ABACUS_LLM_ENDPOINT || '').trim();
-    if (!llmEndpoint) {
-      const epRes = await axios.get('https://api.abacus.ai/api/v0/getApiEndpoint', {
-        headers: { 'apiKey': ABACUS_API_KEY },
-      });
-      llmEndpoint = epRes?.data?.result?.llmEndpoint;
+    // ---------- ENV ----------
+    const ABACUS_API_KEY = process.env.ABACUS_API_KEY;
+    const ABACUS_MODEL = (process.env.ABACUS_MODEL || "gpt-4o").trim();
+    const ABACUS_TEMPERATURE = Number(process.env.ABACUS_TEMPERATURE || 0.2);
+
+    if (!ABACUS_API_KEY) {
+      throw new Error("Missing ABACUS_API_KEY in environment");
     }
-    if (!llmEndpoint) throw new Error('Could not resolve Abacus.AI LLM endpoint');
 
-    const base = llmEndpoint.replace(/\/$/, '');
-
-    // ADDED: OpenAI-compatible Chat Completions request body
-    const reqBody = {
-      model: ABACUS_MODEL,
-      messages: [
-        { role: 'system', content: 'You are a helpful assistant skilled at creating structured SOAP notes.' },
-        { role: 'user', content: prompt },
-      ],
-      temperature: ABACUS_TEMPERATURE,
-    };
-    let chatResponse;
-    try {
-      chatResponse = await axios.post(`${base}/v1/chat/completions`, reqBody, {
-        headers: { 'Content-Type': 'application/json', 'apiKey': ABACUS_API_KEY },
-      });
-    } catch (e) {
-      chatResponse = await axios.post(`${base}/chat/completions`, reqBody, {
-        headers: { 'Content-Type': 'application/json', 'apiKey': ABACUS_API_KEY },
-      });
-    }
-    const rawContent = (
-      chatResponse?.data?.choices?.[0]?.message?.content?.trim() ||
-      chatResponse?.data?.choices?.[0]?.text?.trim() ||
-      chatResponse?.data?.output_text?.trim() ||
-      ''
+    // ---------- ROUTELLM CHAT COMPLETION ----------
+    const response = await axios.post(
+      "https://routellm.abacus.ai/v1/chat/completions",
+      {
+        model: ABACUS_MODEL,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        temperature: ABACUS_TEMPERATURE,
+        stream: false, // IMPORTANT: keep false for JSON
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${ABACUS_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 60000,
+      }
     );
+
+    const rawContent =
+      response?.data?.choices?.[0]?.message?.content || "";
+
+    if (!rawContent) {
+      throw new Error("Empty response from RouteLLM");
+    }
+
+    // ---------- CLEAN & PARSE JSON ----------
     const soapNoteContent = rawContent
-      .replace(/^```(?:json)?\s*/i, '')
-      .replace(/\s*```$/i, '');
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```$/i, "");
 
     let parsed;
     try {
       parsed = JSON.parse(soapNoteContent);
     } catch (e) {
-      const first = soapNoteContent.indexOf('{');
-      const last = soapNoteContent.lastIndexOf('}');
+      const first = soapNoteContent.indexOf("{");
+      const last = soapNoteContent.lastIndexOf("}");
       if (first !== -1 && last !== -1) {
         parsed = JSON.parse(soapNoteContent.slice(first, last + 1));
       } else {
         throw e;
       }
     }
-    // sanitize Medication to be pure medication items only
-    const meds = normalizeMedicationList(parsed["Medication"]);
+
     return {
       "Chief Complaints": parsed["Chief Complaints"] || ["No data available"],
-      "History of Present Illness": parsed["History of Present Illness"] || ["No data available"],
+      "History of Present Illness":
+        parsed["History of Present Illness"] || ["No data available"],
       "Subjective": parsed["Subjective"] || ["No data available"],
       "Objective": parsed["Objective"] || ["No data available"],
       "Assessment": parsed["Assessment"] || ["No data available"],
       "Plan": parsed["Plan"] || ["No data available"],
       "Medication": parsed["Medication"] || ["No data available"],
     };
+
   } catch (err) {
-    console.error('[SOAP_NOTE] generation failed:', err.message);
+    console.error("[SOAP_NOTE] generation failed:", err.message);
     return {
       "Chief Complaints": ["Error generating note"],
       "History of Present Illness": ["Error generating note"],
@@ -1004,32 +3367,35 @@ io.on('connection', (socket) => {
       return socket.disconnect(true);
     }
 
-    // 🔒 GLOBAL duplicate guard (works across devices; cluster-wide with Redis adapter)
+    // ✅ normalize once (Option B)
+    const XR = normXr(xrId);
+
+    // 🔒 GLOBAL duplicate guard
     try {
-      const all = await safeFetchSockets(io, "/"); // includes other instances if Redis adapter is enabled
-      const holder = all.find(s => s.id !== socket.id && s.data?.xrId === xrId);
+      const all = await safeFetchSockets(io, "/");
+      const holder = all.find(s =>
+        s.id !== socket.id &&
+        typeof s.data?.xrId === 'string' &&
+        normXr(s.data.xrId) === XR
+      );
+
       if (holder) {
         const holderInfo = {
-          xrId,
+          xrId: XR,
           deviceName: holder.data?.deviceName || 'Unknown',
           since: holder.data?.connectedAt || null,
           socketId: holder.id,
         };
         dlog('[IDENTIFY] Duplicate xrId in use — rejecting:', holderInfo);
 
-        // ✅ blackout Cockpit: broadcast an empty device list once
         broadcastEmptyDeviceListOnce();
 
-        // (optional) re-broadcast the real list shortly after, if you want auto-recover
         setTimeout(async () => {
-          try {
-            await broadcastDeviceList();
-          } catch (e) {
-            dwarn('[DEVICE_LIST] delayed re-broadcast failed:', e.message);
-          }
+          try { await broadcastDeviceList(); }
+          catch (e) { dwarn('[DEVICE_LIST] delayed re-broadcast failed:', e.message); }
         }, 1200);
 
-        socket.emit('duplicate_id', { xrId, holderInfo });
+        socket.emit('duplicate_id', { xrId: XR, holderInfo });
         return socket.disconnect(true);
       }
     } catch (e) {
@@ -1038,17 +3404,19 @@ io.on('connection', (socket) => {
 
     // ✅ Accept this socket
     socket.data.deviceName = deviceName || 'Unknown';
-    socket.data.xrId = xrId;
+    socket.data.xrId = XR;
     socket.data.connectedAt = Date.now();
 
-    try { await socket.join(roomOf(xrId)); } catch (e) { dwarn('[IDENTIFY] join room failed:', e?.message || e); }
-    clients.set(xrId, socket);
-    onlineDevices.set(xrId, socket);
+    try { await socket.join(roomOf(XR)); }
+    catch (e) { dwarn('[IDENTIFY] join room failed:', e?.message || e); }
 
-    // Track desktop for convenience (no replacement logic anymore)
-    if ((deviceName?.toLowerCase().includes('desktop')) || xrId === 'XR-1238') {
-      desktopClients.set(xrId, socket);
-      dlog('[IDENTIFY] desktop client tracked', xrId);
+    clients.set(XR, socket);
+    onlineDevices.set(XR, socket);
+
+    // Track desktop for convenience
+    if ((deviceName?.toLowerCase().includes('desktop')) || XR === 'XR-1238') {
+      desktopClients.set(XR, socket);
+      dlog('[IDENTIFY] desktop client tracked', XR);
     }
 
     // Send lists and maybe auto-pair
@@ -1062,14 +3430,15 @@ io.on('connection', (socket) => {
 
     try {
       if (!socket.data?.roomId) {
-        await tryAutoPair(xrId);
+        await tryDbAutoPair(XR);
       } else {
-        dlog('[IDENTIFY] Skipping tryAutoPair; already in room', socket.data.roomId);
+        dlog('[IDENTIFY] Skipping tryDbAutoPair; already in room', socket.data.roomId);
       }
     } catch (e) {
-      derr('[identify] tryAutoPair error:', e.message);
+      derr('[identify] tryDbAutoPair error:', e.message);
     }
   });
+
 
   // -------- metrics_subscribe / unsubscribe (NEW) --------
   socket.on('metrics_subscribe', ({ xrId }) => {
@@ -1101,36 +3470,43 @@ io.on('connection', (socket) => {
   });
 
   // -------- pair_with --------
+  // Option B: DB-driven auto pairing is enabled.
+  // Keep this handler for backward compatibility (frontend may still emit it),
+  // but do NOT allow manual pairing to override DB mapping.
   socket.on('pair_with', async ({ peerId }) => {
-    dlog('[EVENT] pair_with', { me: socket.data?.xrId, peerId });
+    dlog('[EVENT] pair_with (disabled - auto pairing)', { me: socket.data?.xrId, peerId });
+
+    // If the socket is not identified yet, keep the old error behavior.
+    const me = socket.data?.xrId;
+    if (!me) {
+      socket.emit('pair_error', { message: 'Identify first (missing xrId)' });
+      return;
+    }
+
+    // If already paired, just tell the client what room it is in.
+    if (socket.data?.roomId) {
+      socket.emit('pair_error', {
+        message: 'Auto pairing enabled (already paired)',
+        roomId: socket.data.roomId,
+      });
+      return;
+    }
+
+    // Try DB auto pairing as a convenience (safe fallback).
+    // This does NOT use peerId; server decides partner from DB.
     try {
-      const me = socket.data?.xrId;
-      if (!me || !peerId) {
-        dwarn('[pair_with] missing me or peerId');
-        socket.emit('pair_error', { message: 'Identify and provide peerId' });
-        return;
+      const ok = await tryDbAutoPair(me);
+      if (!ok) {
+        socket.emit('pair_error', {
+          message: 'Auto pairing enabled. Partner not available yet (or no active DB mapping).',
+        });
       }
-      const allowed = await isPairAllowed(me, peerId);
-      if (!allowed) {
-        dwarn('[pair_with] not allowed', me, peerId);
-        socket.emit('pair_error', { message: 'Pairing not allowed' });
-        return;
-      }
-      const roomId = getRoomIdForPair(me, peerId);
-      await socket.join(roomId);
-      socket.data.roomId = roomId;
-
-      const members = listRoomMembers(roomId);
-      io.to(roomId).emit('room_joined', { roomId, members });
-      dlog('[pair_with] room_joined emitted', { roomId, members });
-
-      // NEW: push active pair state to dashboards
-      broadcastPairs();
     } catch (err) {
-      derr('[pair_with] error:', err.message);
-      socket.emit('pair_error', { message: 'Internal server error during pairing' });
+      derr('[pair_with] auto pairing fallback error:', err?.message || err);
+      socket.emit('pair_error', { message: 'Auto pairing enabled, but pairing attempt failed.' });
     }
   });
+
 
   // -------- signal --------
   socket.on('signal', (payload) => {
@@ -1178,21 +3554,32 @@ io.on('connection', (socket) => {
         return; // ✅ do not route as a regular signaling message
       }
 
-      // 3) Existing offer/answer/ICE path (unchanged)
-      const { from, to, data } = msg;
-      if (to) {
-        dlog('[signal] direct target routing to', to);
-        io.to(roomOf(to)).emit('signal', { type, from, data });
+      // 3) offer/answer/ICE path (Option B: strict pair-room only)
+
+      // ✅ Always trust socket identity, never payload
+      const from = socket.data?.xrId || msg.from;
+      const data = msg.data;
+
+      // ✅ OPTIONAL but recommended: allowlist only WebRTC signaling types from clients
+      const allowed = new Set(['offer', 'answer', 'ice-candidate', 'request_offer']);
+      if (!allowed.has(type)) {
+        dwarn('[signal] blocked non-webrtc client signal type:', type);
         return;
       }
+
       const roomId = socket.data?.roomId;
       if (!roomId) {
-        dwarn('[signal] no "to" and no roomId; ignoring');
-        socket.emit('signal_error', { message: 'No room joined and no "to" specified' });
+        dwarn('[signal] no roomId (not paired yet); ignoring');
+        socket.emit('signal_error', { message: 'Not paired yet (no room)' });
         return;
       }
-      dlog('[signal] room forward', roomId);
+
+      dlog('[signal] pair-room forward', { roomId, type });
+      // Forward ONLY within pair room
       socket.to(roomId).emit('signal', { type, from, data });
+
+
+
     } catch (err) {
       derr('[signal] handler error:', err.message);
     }
@@ -1212,29 +3599,30 @@ io.on('connection', (socket) => {
     // Accept both `command` and `action`; keep original casing for compatibility
     const cmdRaw = (p.command != null ? p.command : p.action) || '';
     const cmd = String(cmdRaw);
-    const from = p.from;
+    const from = socket.data?.xrId || p.from;
     const to = p.to;
     const msg = p.message;
 
     dlog('🎮 [EVENT] control', { command: cmd, from, to, message: trimStr(msg || '') });
 
     // Keep both keys so all clients see what they expect
-    const payload = { command: cmd, action: cmd, from, message: msg };
+    const payload = { command: cmd, action: cmd, from, to, message: msg };
+
 
     try {
-      if (to) {
-        dlog('[control] direct to', to);
-        io.to(roomOf(to)).emit('control', payload);
-      } else {
-        const roomId = socket.data?.roomId;
-        if (roomId) {
-          dlog('[control] room emit', roomId);
-          io.to(roomId).emit('control', payload);
-        } else {
-          dlog('[control] global emit');
-          io.emit('control', payload);
-        }
+      // Option B strict isolation:
+      // Ignore "to" and NEVER broadcast control globally.
+      // Control messages must stay inside the paired room only.
+      const roomId = socket.data?.roomId;
+      if (!roomId) {
+        dwarn('[control] no roomId (not paired yet); ignoring', { command: cmd });
+        socket.emit('control_error', { message: 'Not paired yet (no room)', command: cmd });
+        return;
       }
+
+      dlog('[control] pair-room emit', { roomId, ignoredTo: to || null });
+      io.to(roomId).emit('control', payload);
+
     } catch (err) {
       derr('[control] handler error:', err.message);
     }
@@ -1252,11 +3640,14 @@ io.on('connection', (socket) => {
     }
 
     const type = data?.type || 'message';
-    const from = data?.from;
+    const from = socket.data?.xrId || data?.from;
     const to = data?.to;
     const text = data?.text;
     const urgent = !!data?.urgent;
     const timestamp = data?.timestamp || new Date().toISOString();
+    // Option B strict isolation: all messaging must stay inside the paired room
+    const pairRoomId = socket.data?.roomId || null;
+
 
     // ✳️ Intercept transcripts: forward to desktop's web console via a signal, then STOP
     if (type === 'transcript') {
@@ -1270,14 +3661,15 @@ io.on('connection', (socket) => {
       };
 
       try {
-        // Forward transcript to the intended UI
-        if (to) {
-          io.to(roomOf(to)).emit('signal', { type: 'transcript_console', from, data: out });
-          dlog('[transcript] emitted signal "transcript_console" to', to);
-        } else if (socket.data?.roomId) {
-          io.to(socket.data.roomId).emit('signal', { type: 'transcript_console', from, data: out });
-          dlog('[transcript] emitted signal "transcript_console" to room', socket.data.roomId);
+        // Forward transcript ONLY within pair room
+        if (!pairRoomId) {
+          dwarn('[transcript] no pairRoomId (not paired yet); ignoring');
+          socket.emit('message_error', { message: 'Not paired yet (no room)' });
+          return;
         }
+        io.to(pairRoomId).emit('signal', { type: 'transcript_console', from, data: out });
+        dlog('[transcript] emitted signal "transcript_console" to pair room', pairRoomId);
+
 
         // Generate SOAP note if this transcript is final
         if (out.final && out.text) {
@@ -1285,7 +3677,7 @@ io.on('connection', (socket) => {
             try {
               const soapNote = await generateSoapNote(out.text);
 
-              const target = socket.data?.roomId || (to ? roomOf(to) : null);
+              const target = pairRoomId;
 
               // Send SOAP note back to console UI
               if (target) {
@@ -1312,12 +3704,7 @@ io.on('connection', (socket) => {
                   data: results,
                 });
               }
-              // Also broadcast to all connected clients (including Scribe Cockpit)
-              io.emit('signal', {
-                type: 'drug_availability',
-                from,
-                data: results,
-              });
+
             } catch (e) {
               console.error('[SOAP/DRUG] failed:', e?.message || e);
             }
@@ -1332,7 +3719,8 @@ io.on('connection', (socket) => {
 
 
 
-    // Normal chat message path (unchanged)
+    /// Normal chat message path (Option B: pair-room only)
+
     try {
       const msg = {
         type: 'message',
@@ -1346,19 +3734,15 @@ io.on('connection', (socket) => {
       };
       addToMessageHistory(msg);
 
-      if (to) {
-        dlog('[message] direct to', to);
-        io.to(roomOf(to)).emit('message', msg);
-      } else {
-        const roomId = socket.data?.roomId;
-        if (roomId) {
-          dlog('[message] room emit', roomId);
-          io.to(roomId).emit('message', msg);
-        } else {
-          dlog('[message] global broadcast (excluding sender)');
-          socket.broadcast.emit('message', msg);
-        }
+      if (!pairRoomId) {
+        dwarn('[message] no pairRoomId (not paired yet); ignoring');
+        socket.emit('message_error', { message: 'Not paired yet (no room)' });
+        return;
       }
+
+      dlog('[message] pair-room emit', { roomId: pairRoomId, ignoredTo: to || null });
+      io.to(pairRoomId).emit('message', msg);
+
     } catch (err) {
       derr('[message] handler error:', err.message);
     }
@@ -1371,16 +3755,31 @@ io.on('connection', (socket) => {
   // -------- clear-messages --------
   socket.on('clear-messages', ({ by }) => {
     dlog('[EVENT] clear-messages', { by });
+
+    const roomId = socket.data?.roomId;
+    if (!roomId) {
+      dwarn('[clear-messages] no roomId; ignoring');
+      return;
+    }
+
     const payload = { type: 'message-cleared', by, messageId: Date.now() };
-    io.emit('message-cleared', payload);
+    io.to(roomId).emit('message-cleared', payload);
   });
 
   // -------- clear_confirmation --------
   socket.on('clear_confirmation', ({ device }) => {
     dlog('[EVENT] clear_confirmation', { device });
+
+    const roomId = socket.data?.roomId;
+    if (!roomId) {
+      dwarn('[clear_confirmation] no roomId; ignoring');
+      return;
+    }
+
     const payload = { type: 'message_cleared', by: device, timestamp: new Date().toISOString() };
-    io.emit('message_cleared', payload);
+    io.to(roomId).emit('message_cleared', payload);
   });
+
 
   // -------- status_report --------
   socket.on('status_report', ({ from, status }) => {
@@ -1541,17 +3940,22 @@ io.on('connection', (socket) => {
 
 
   // Notify peers *before* Socket.IO removes the socket from rooms
+  // Notify peers *before* Socket.IO removes the socket from rooms
   socket.on('disconnecting', () => {
-    const xrId = socket.data?.xrId;
+    const xrId = normXr(socket.data?.xrId);
     if (!xrId) return;
 
     for (const roomId of socket.rooms) {
       if (roomId.startsWith('pair:')) {
         socket.to(roomId).emit('peer_left', { xrId, roomId });
+        // optional compatibility ping
+        socket.to(roomId).emit('desktop_disconnected', { xrId, roomId });
+
         dlog('[disconnecting] notified peer_left', { xrId, roomId });
       }
     }
   });
+
 
 
 
@@ -1564,11 +3968,17 @@ io.on('connection', (socket) => {
     });
 
     try {
-      const xrId = socket.data?.xrId;
+      const xrId = normXr(socket.data?.xrId);
       if (xrId) {
         // Remove from your in-memory maps
         clients.delete(xrId);
         onlineDevices.delete(xrId);
+
+        // ✅ Option B: release one-to-one lock (do this ONCE)
+        const partner = clearPairByXrId(xrId);
+        if (partner) {
+          dlog('[PAIR] cleared pairing', { xrId, partner });
+        }
 
         if (desktopClients.get(xrId) === socket) {
           desktopClients.delete(xrId);
@@ -1579,7 +3989,7 @@ io.on('connection', (socket) => {
       // Broadcast device list so UIs update without manual refresh
       await broadcastDeviceList();
 
-      // ✅ NEW: after Socket.IO has pruned rooms, reflect pair changes
+      // ✅ After Socket.IO prunes rooms, reflect pair changes
       setTimeout(() => {
         broadcastPairs();
       }, 0);

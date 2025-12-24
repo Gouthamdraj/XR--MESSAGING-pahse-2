@@ -1,4 +1,4 @@
-
+// =====================================================ui.js===========================================================
 
 // UI wiring converted from EmulatorUI.kt + MainActivity.kt
 // Keeps identical semantics, event names, and control flow.
@@ -12,18 +12,146 @@ import WebRtcStreamer from './device.js';
 import TelemetryReporter from './telemetry.js';
 import { Message, appendMessage } from './messages.js';
 
+// Normalize XR IDs so that "1234" becomes "XR-1234", etc.
+function normalizeXrId(raw) {
+    if (!raw) return '';
+    const trimmed = String(raw).trim().toUpperCase();
+    if (!trimmed) return '';
+    if (trimmed.startsWith('XR-')) return trimmed;
+    // If it's only digits, prefix with XR-
+    if (/^[0-9]+$/.test(trimmed)) return `XR-${trimmed}`;
+    return trimmed;
+}
+
+
 
 // ----------------- Constants (parity) -----------------
-const ANDROID_XR_ID = (window.XR_DEVICE_ID || 'XR-1234');
+// XR ID for the Web Device (can be changed from the UI)
+let ANDROID_XR_ID = normalizeXrId(window.XR_DEVICE_ID || '');
+
+window.XR_DEVICE_ID = ANDROID_XR_ID;
+
 const DEFAULT_DESKTOP_ID = (window.XR_OPERATOR_ID || 'XR-1238');
 const SERVER_URL = (window.SIGNAL_URL || location.origin);
 
 // Speech settings
 const PARTIAL_THROTTLE_MS = 800;
 
+// ----------------- XR Device permissions (System_Screens.id = 4) -----------------
+const XR_DEVICE_SCREEN_ID = 4; // "XR Device" in System_Screens
+
+let xrDevicePermissions = null;
+let xrDevicePermsLoaded = false;
+
+async function loadDevicePermissionsOnce() {
+    if (xrDevicePermsLoaded) return;
+    xrDevicePermsLoaded = true;
+
+    // Only enforce when fetch is available (browser context)
+    if (typeof fetch === 'undefined') {
+        xrDevicePermissions = null; // fail-open
+        return;
+    }
+
+    try {
+        const res = await fetch('/api/platform/my-screens', {
+            method: 'GET',
+            credentials: 'include',
+            headers: { 'Accept': 'application/json' }
+        });
+
+        if (!res.ok) {
+            console.warn('[XRDEVICE] my-screens returned', res.status);
+            xrDevicePermissions = null; // fail-open
+            return;
+        }
+
+        const data = await res.json();
+        const screens = data?.screens || [];
+
+        // ✅ Always prefer exact ID match
+        let match = screens.find(s => s.id === XR_DEVICE_SCREEN_ID);
+
+        // Defensive fallbacks if ID ever changes
+        if (!match) {
+            match = screens.find(s => (s.route_path || '').toLowerCase() === '/device');
+        }
+        if (!match) {
+            match = screens.find(s => (s.screen_name || '').toLowerCase() === 'xr device');
+        }
+
+        if (!match) {
+            console.warn('[XRDEVICE] No screen entry for XR Device; leaving unrestricted.');
+            xrDevicePermissions = null;
+            return;
+        }
+
+        xrDevicePermissions = {
+            read: !!match.read,
+            write: !!match.write,
+            edit: !!match.edit,
+            delete: !!match.delete
+        };
+
+        console.log('[XRDEVICE] Permissions (UI):', xrDevicePermissions);
+    } catch (err) {
+        console.warn('[XRDEVICE] Failed to load my-screens for XR Device:', err);
+        xrDevicePermissions = null; // fail-open
+    }
+}
+
+function hasDeviceWritePermission() {
+    // If we couldn't load permissions, do not block anything (preserve behaviour)
+    if (!xrDevicePermissions) return true;
+    return !!xrDevicePermissions.write;
+}
+
+function notifyReadOnlyDevice() {
+    const text = 'You only have READ permission for XR Device. This action is not allowed.';
+    // use the existing msg() rendering if available
+    try {
+        msg('System', text);
+    } catch {
+        console.warn(text);
+    }
+}
+
+function applyDeviceReadOnlyUI() {
+    if (!xrDevicePermissions || xrDevicePermissions.write) return;
+
+    console.log('[XRDEVICE] Applying read-only UI on /device');
+
+    const markDisabled = (btn) => {
+        if (!btn) return;
+        btn.disabled = true;
+        btn.style.opacity = '0.5';
+        btn.style.cursor = 'not-allowed';
+    };
+
+    // Treat these as "write" actions (cannot be used when write = 0)
+    markDisabled(elBtnConnect);
+    markDisabled(elBtnStream);
+    markDisabled(elBtnMute);
+    markDisabled(elBtnVideo);
+    markDisabled(elBtnVoice);
+    markDisabled(elBtnStartRec);
+    markDisabled(elBtnStopRec);
+    markDisabled(elBtnSend);
+
+    if (elChkUrgent) elChkUrgent.disabled = true;
+
+
+    if (elMsgInput) {
+        elMsgInput.readOnly = true;
+        elMsgInput.placeholder = 'READ-ONLY: you do not have permission to send messages.';
+    }
+}
+
+
 // ----------------- Elements -----------------
 const elStatus = document.getElementById('status');
 const elChip = document.getElementById('chipLastCmd');
+const elDeviceXrIdInput = document.getElementById('deviceXrIdInput');
 const elBtnConnect = document.getElementById('btnConnect');
 const elBtnStream = document.getElementById('btnStream');
 const elBtnMute = document.getElementById('btnMute');
@@ -37,7 +165,21 @@ const elMsgList = document.getElementById('msgList');
 const elMsgInput = document.getElementById('msgInput');
 const elChkUrgent = document.getElementById('chkUrgent');
 const elBtnSend = document.getElementById('btnSend');
-const elBtnToggleRecording = document.getElementById('btnToggleRecording');
+
+
+// Initialise Device XR ID input from localStorage or default
+if (elDeviceXrIdInput) {
+    try {
+        const stored = localStorage.getItem('xr-device-id');
+        const initialId = normalizeXrId(stored || ANDROID_XR_ID);
+        // Show only the numeric part to the user (like Dock’s "1234")
+        elDeviceXrIdInput.value = initialId.replace(/^XR-/, '');
+        ANDROID_XR_ID = initialId;
+        window.XR_DEVICE_ID = ANDROID_XR_ID;
+    } catch {
+        elDeviceXrIdInput.value = (ANDROID_XR_ID || '').replace(/^XR-/, '');
+    }
+}
 
 // ----------------- State -----------------
 let signaling = null;
@@ -54,6 +196,8 @@ let lastRecognizedCommand = '';
 
 let connectedDesktops = []; // XR IDs
 let hadDesktops = false;
+let pairedDesktopId = null; // Option B: set from room_joined members
+
 
 // note-taking
 let recordingActive = false;
@@ -205,14 +349,24 @@ function applyMute(wantMuted) {
 
 
 function preferDesktop(listPairs) {
-    const ids = listPairs.map(p => p[1]);
+    const ids = listPairs.map(p => String(p?.[1] || '').toUpperCase()).filter(Boolean);
     connectedDesktops = [];
-    if (ids.includes(DEFAULT_DESKTOP_ID)) connectedDesktops.push(DEFAULT_DESKTOP_ID);
-    else connectedDesktops.push(...ids);
-    // ✅ Persist connected desktop list to localStorage
+
+    // ✅ Option B: if paired desktop known, prefer ONLY that one (strict one-to-one)
+    if (pairedDesktopId && ids.includes(String(pairedDesktopId).toUpperCase())) {
+        connectedDesktops.push(String(pairedDesktopId).toUpperCase());
+    } else if (ids.includes(String(DEFAULT_DESKTOP_ID).toUpperCase())) {
+        // fallback keeps old behavior for XR-1238 demo pairing
+        connectedDesktops.push(String(DEFAULT_DESKTOP_ID).toUpperCase());
+    } else {
+        connectedDesktops.push(...ids);
+    }
+
     persistedState.connectedDesktops = connectedDesktops.slice();
     saveState();
 }
+
+
 
 // ----------------- Signaling wiring (parity) -----------------
 function createSignaling() {
@@ -232,7 +386,6 @@ function createSignaling() {
             telemetry = new TelemetryReporter({
                 xrId: ANDROID_XR_ID,
                 sendJson: (event, payload) => emitSafe(event, payload),
-
                 periodMs: 12_000
             });
             telemetry.start();
@@ -244,8 +397,7 @@ function createSignaling() {
         onDisconnected: () => {
             isServerConnected = false;
 
-            // ⬇️ add these two lines
-            userWantsConnected = false;      // prevent auto-reconnect after a manual disconnect
+            userWantsConnected = false; // prevent auto-reconnect after a manual disconnect
 
             setStatus(false);
             msg('System', 'Disconnected from server');
@@ -256,22 +408,38 @@ function createSignaling() {
             if (streamActive) {
                 streamActive = false;
                 streamer?.stopStreaming().catch(() => { });
-
                 msg('System', 'Stream stopped.');
             }
 
             // Ensure camera is off even if we weren't "streaming"
             try { ensureStreamer().stopCamera(); } catch { }
+
             // Only disable reconnection if this was a *manual* disconnect
             if (signaling?._manualClose) {
                 try { signaling.setReconnectionEnabled(false); } catch { }
             }
 
-            // ✅ AUTO-RELOAD block — add right here
+            // ✅ AUTO-RELOAD block
             console.log('[AUTO-RELOAD] onDisconnected hook firing', { manualClose: signaling?._manualClose });
             try { persistNow(); } catch { }
-            if (!streamActive) { // optional guard—skip reload during active stream cuts if you prefer
+            if (!streamActive) {
                 scheduleAutoReload(signaling?._manualClose ? 'user' : 'network');
+            }
+        },
+
+        // ✅ Option B: dedicated room_joined handler (from signaling.js)
+        onRoomJoined: (payload) => {
+            const members = Array.isArray(payload?.members) ? payload.members : [];
+            const me = normalizeXrId(ANDROID_XR_ID);
+            const other = members.map(normalizeXrId).find(x => x && x !== me) || null;
+
+            pairedDesktopId = other;
+            signaling.currentDesktopId = other || null;
+
+            if (other) {
+                msg('System', `🎯 Paired with Desktop [${other}] in room ${payload?.roomId || ''}`);
+            } else {
+                msg('System', `🎯 Room joined: ${payload?.roomId || ''}`);
             }
         },
 
@@ -297,16 +465,19 @@ function createSignaling() {
             const cmd = String(c?.command || c?.action || '').toLowerCase();
             if (cmd === 'request_offer') {
                 ensureStreamer();
-                const to = DEFAULT_DESKTOP_ID; // e.g., 'XR-1238'
+                const to = pairedDesktopId || signaling?.currentDesktopId || DEFAULT_DESKTOP_ID;
+                if (!to) {
+                    msg('System', '⚠️ Not paired yet (no desktop). Wait for room_joined.');
+                    return;
+                }
+
                 streamer.sendOfferTo(to).catch(console.error);
-                return;                                    // <— KEEP this return
+                return; // <— KEEP this return
             }
 
-            // ⬇️ INSERT THESE TWO LINES *RIGHT HERE*, before the closing brace of onControl
             if (cmd === 'mute') { applyMute(true); return; }
             if (cmd === 'unmute') { applyMute(false); return; }
         },
-
 
         onDeviceListUpdated: (listPairs) => {
             preferDesktop(listPairs);
@@ -317,8 +488,9 @@ function createSignaling() {
             if (!hadBefore && hadDesktops)
                 msg('System', "A desktop connected! Tap 'Start Stream' to begin streaming.");
 
-            if (isServerConnected && connectedDesktops.includes(DEFAULT_DESKTOP_ID) && !hadBefore) {
-                msg('System', `System [${ANDROID_XR_ID}] is connected to Desktop [${DEFAULT_DESKTOP_ID}]`);
+            const shown = (pairedDesktopId || DEFAULT_DESKTOP_ID);
+            if (isServerConnected && shown && connectedDesktops.map(x => x.toUpperCase()).includes(shown.toUpperCase()) && !hadBefore) {
+                msg('System', `System [${ANDROID_XR_ID}] sees Desktop [${shown}] online.`);
             }
 
             if (!hadDesktops && streamActive) {
@@ -326,27 +498,18 @@ function createSignaling() {
                 streamer?.stopStreaming().catch(() => { });
                 setStatus(isServerConnected);
                 msg('System', 'All desktops disconnected. Stopped streaming.');
-
-
-
             }
-
-            // If we were already streaming and a desktop is (back) online, re-offer
-            if (streamActive && isServerConnected && connectedDesktops.includes(DEFAULT_DESKTOP_ID)) {
-                ensureStreamer();
-                const to = (signaling?.currentDesktopId || DEFAULT_DESKTOP_ID);
-                persistedState.selectedDesktopId = to;
-                saveState();
-                streamer.sendOfferTo(to).catch(() => { });
-            }
-
         },
+
         onServerMessage: (event, payload) => {
+            // NOTE: room_joined is handled by onRoomJoined now (avoid double handling)
+
             if (event === 'peer_left') {
                 const id = (payload?.xrId || '').toUpperCase();
-                if (id === DEFAULT_DESKTOP_ID) {
-                    msg('System', `Desktop [${DEFAULT_DESKTOP_ID}] left the room (${payload?.roomId || ''}).`);
-                    connectedDesktops = connectedDesktops.filter(x => x.toUpperCase() !== DEFAULT_DESKTOP_ID);
+                const expected = (pairedDesktopId || DEFAULT_DESKTOP_ID).toUpperCase();
+                if (id === expected) {
+                    msg('System', `Desktop [${expected}] left the room (${payload?.roomId || ''}).`);
+                    connectedDesktops = connectedDesktops.filter(x => x.toUpperCase() !== expected);
                     if (streamActive) {
                         streamActive = false;
                         streamer?.stopStreaming().catch(() => { });
@@ -391,6 +554,7 @@ function createSignaling() {
 }
 
 
+
 function ensureStreamer() {
     if (streamer) return streamer;
     streamer = new WebRtcStreamer({ signaling, androidXrId: ANDROID_XR_ID });
@@ -399,8 +563,14 @@ function ensureStreamer() {
 }
 
 // ----------------- Controls -----------------
+// ----------------- Controls -----------------
 // Connect / Disconnect
 elBtnConnect.addEventListener('click', async () => {
+    // 🔒 READ-only guard for XR Device
+    if (!hasDeviceWritePermission()) {
+        notifyReadOnlyDevice();
+        return;
+    }
     // Prefer the client’s own state if available; fall back to our flag
     const connected = (typeof signaling?.isConnectedNow === 'function')
         ? signaling.isConnectedNow()
@@ -432,18 +602,48 @@ elBtnConnect.addEventListener('click', async () => {
         return;
     }
 
+    // ---- NOT CONNECTED → require XR Device ID first ----
+    // ---- NOT CONNECTED → require XR Device ID first ----
+    if (elDeviceXrIdInput) {
+        const raw = (elDeviceXrIdInput.value || '').trim();
+        const normalized = normalizeXrId(raw);
+
+        if (!normalized) {
+            msg('System', 'Please enter your XR Device ID (e.g. 1234) before connecting.');
+            elDeviceXrIdInput.focus();
+            return;
+        }
+
+
+        ANDROID_XR_ID = normalized;          // will be XR-1234
+        window.XR_DEVICE_ID = ANDROID_XR_ID;
+        try {
+            localStorage.setItem('xr-device-id', ANDROID_XR_ID);
+        } catch { /* ignore */ }
+
+        msg('System', `Using XR Device ID [${ANDROID_XR_ID}].`);
+    }
+
     // Not connected → connect
     userWantsConnected = true;
-    persistedState.userWantsConnected = true;   // ✅ add
-    saveState();                                 // ✅ add
+    persistedState.userWantsConnected = true;
+    saveState();
     msg('System', 'Connecting…');
-    createSignaling();     // wires listeners and calls signaling.connect()
-    ensureStreamer();      // bind preview element
+    createSignaling();
+    ensureStreamer();
+    // bind preview element
 });
+
 
 
 elBtnStream.addEventListener('click', async () => {
     if (!isServerConnected) { msg('System', 'Not connected'); return; }
+
+    // 🔒 READ-only guard for XR Device
+    if (!hasDeviceWritePermission()) {
+        notifyReadOnlyDevice();
+        return;
+    }
     if (streamActive) {
         streamActive = false;
         await ensureStreamer().stopStreaming();
@@ -453,7 +653,8 @@ elBtnStream.addEventListener('click', async () => {
 
         // Tell the Dock to blank out *now* (no waiting for ICE/TURN timeouts)
         try {
-            const to = (signaling?.currentDesktopId || DEFAULT_DESKTOP_ID);
+            const to = pairedDesktopId || signaling?.currentDesktopId || DEFAULT_DESKTOP_ID;
+
             // ✅ persist last selected desktop even on stop (keeps continuity)
             persistedState.selectedDesktopId = to;
             saveState();
@@ -482,7 +683,8 @@ elBtnStream.addEventListener('click', async () => {
 
         // Immediately push an SDP offer to the Dock (device is the offerer)
         ensureStreamer();
-        const to = (signaling?.currentDesktopId || DEFAULT_DESKTOP_ID);
+        const to = (pairedDesktopId || signaling?.currentDesktopId || DEFAULT_DESKTOP_ID);
+
         // ✅ persist last selected desktop
         persistedState.selectedDesktopId = to;
         saveState();
@@ -500,6 +702,11 @@ elBtnStream.addEventListener('click', async () => {
 });
 
 elBtnMute.addEventListener('click', async () => {
+    // 🔒 READ-only guard
+    if (!hasDeviceWritePermission()) {
+        notifyReadOnlyDevice();
+        return;
+    }
     if (!isServerConnected || !streamActive) {
         msg('System', 'Stream not active');
         return;
@@ -522,6 +729,11 @@ elBtnMute.addEventListener('click', async () => {
 
 
 elBtnVideo.addEventListener('click', () => {
+    // 🔒 READ-only guard
+    if (!hasDeviceWritePermission()) {
+        notifyReadOnlyDevice();
+        return;
+    }
     if (!isServerConnected || !streamActive) { msg('System', 'Stream not active'); return; }
     if (videoVisible) {
         videoVisible = false;
@@ -627,6 +839,10 @@ function processVoiceCommand(cmd) {
 }
 
 elBtnVoice.addEventListener('click', () => {
+    if (!hasDeviceWritePermission()) {
+        notifyReadOnlyDevice();
+        return;
+    }
     if (isListening) stopVoiceRecognition(); else startVoiceRecognition();
 });
 
@@ -666,65 +882,22 @@ function finalizeRecordingNote() {
     noteBuffer = '';
 }
 
-// Single Toggle for Recording (replaces Start/Stop buttons)
-let isRecording = false;
-
-elBtnToggleRecording?.addEventListener('click', async () => {
-    // We allow LOCAL note recording even if not connected.
-    const canSignal = isServerConnected && connectedDesktops.length > 0;
-
-    try {
-        if (!isRecording) {
-            // ---- Start Recording ----
-            if (canSignal) {
-                for (const targetId of connectedDesktops) {
-                    emitSafe('control', {
-                        from: ANDROID_XR_ID, to: targetId,
-                        command: 'start_recording', action: 'start_recording'
-                    });
-                }
-            }
-
-            // Ensure mic is available for SR (if stream is on and currently unmuted, mute first)
-            if (streamActive && !micMuted) applyMute(true);
-
-            // ✅ Start the local note buffer + SR (this was commented out before)
-            onStartRecordingNote();
-
-            elBtnToggleRecording.textContent = 'Stop Recording';
-            elBtnToggleRecording.classList.add('is-recording');
-            msg('System', canSignal ? 'Recording started' : 'Recording started (local only)');
-            isRecording = true;
-
-        } else {
-            // ---- Stop Recording ----
-            if (canSignal) {
-                for (const targetId of connectedDesktops) {
-                    emitSafe('control', {
-                        from: ANDROID_XR_ID, to: targetId,
-                        command: 'stop_recording', action: 'stop_recording'
-                    });
-                }
-            }
-
-            // ✅ Finalize + stop SR buffer (this was commented out before)
-            onStopRecordingNote();
-
-            elBtnToggleRecording.textContent = 'Start Recording';
-            elBtnToggleRecording.classList.remove('is-recording');
-            msg('System', canSignal ? 'Recording stopped' : 'Recording stopped (local)');
-            isRecording = false;
-        }
-    } catch (err) {
-        console.error('Recording toggle error:', err);
-        msg('System', 'Recording toggle failed');
+elBtnStartRec.addEventListener('click', () => {
+    if (!hasDeviceWritePermission()) {
+        notifyReadOnlyDevice();
+        return;
     }
+    onStartRecordingNote();
 });
-
+elBtnStopRec.addEventListener('click', onStopRecordingNote);
 
 
 // Transcript sender (same payload as Android)
 async function sendTranscript(text, isFinal) {
+    if (!hasDeviceWritePermission()) {
+        notifyReadOnlyDevice();
+        return;
+    }
     if (!isServerConnected) { msg('System', 'Not connected; transcript not sent.'); return; }
     if (connectedDesktops.length === 0) { msg('System', 'No desktops connected; transcript not sent.'); return; }
     await signaling?.waitUntilConnected?.().catch(() => { });    // <-- INSERT THIS
@@ -745,14 +918,27 @@ async function sendTranscript(text, isFinal) {
 }
 
 // ----------------- Control & Chat sending -----------------
-function sendControlCommand(command) {
-    if (connectedDesktops.length === 0) {
-        msg('System', 'No desktops connected to send command'); return;
-    }
-    for (const targetId of connectedDesktops) {
-        emitSafe('control', { from: ANDROID_XR_ID, to: targetId, command, action: command });
 
+function sendControlCommand(command) {
+    // 🔒 READ-only guard for any remote control / streaming
+    if (!hasDeviceWritePermission()) {
+        notifyReadOnlyDevice();
+        return;
     }
+
+    // ✅ Option B strict: prefer paired desktop only, else fallback to current list
+    const targets = pairedDesktopId ? [pairedDesktopId] : connectedDesktops.slice();
+
+    if (targets.length === 0) {
+        msg('System', 'No desktops connected to send command');
+        return;
+    }
+
+    for (const targetId of targets) {
+        // ✅ Use emitSafe so signaling queue + roomId logic is preserved
+        emitSafe('control', { from: ANDROID_XR_ID, to: targetId, command, action: command });
+    }
+
     // local handling mirrors Android’s immediate UI update:
     if (command === 'start_stream') elBtnStream.click();
     else if (command === 'stop_stream') elBtnStream.click();
@@ -762,7 +948,13 @@ function sendControlCommand(command) {
     else if (command === 'show_video') { if (!videoVisible) elBtnVideo.click(); }
 }
 
+
 elBtnSend.addEventListener('click', () => {
+    if (!hasDeviceWritePermission()) {
+        notifyReadOnlyDevice();
+        return;
+    }
+
     const text = (elMsgInput.value || '').trim();
     const urgent = !!elChkUrgent.checked;
     if (!text) return;
@@ -851,4 +1043,16 @@ setStatus(false);
 if (persistedState.messages.length === 0) {
     msg('System', "Disconnected. Tap 'Connect' or say 'connect' to join the server.");
 }
+
+// Load XR Device permissions once and apply read-only UI if needed
+if (typeof window !== 'undefined') {
+    loadDevicePermissionsOnce()
+        .then(() => {
+            applyDeviceReadOnlyUI();
+        })
+        .catch((err) => {
+            console.warn('[XRDEVICE] Permission bootstrap failed:', err);
+        });
+}
+
 

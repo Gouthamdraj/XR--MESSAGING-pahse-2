@@ -6,6 +6,95 @@ const XR_RIGHT = 'XR-1238';  // XR DOCK
 
 const STATIC_BATTERY_LEFT = 83;
 
+// ===== XR Hub Dashboard permissions (System_Screens.id = 1) =====
+const XR_HUB_SCREEN_ID = 1;   // "XR Hub Dashboard" in System_Screens
+
+let xrHubPermissions = null;  // { read, write, edit, delete } or null (fail-open)
+
+async function loadHubPermissions() {
+  try {
+    const res = await fetch('/api/platform/my-screens', {
+      method: 'GET',
+      credentials: 'include',
+      headers: { 'Accept': 'application/json' }
+    });
+
+    if (!res.ok) {
+      console.warn('[XRHUB] my-screens returned', res.status);
+      xrHubPermissions = null; // fail-open: keep existing behaviour
+      return;
+    }
+
+    const data = await res.json();
+    const screens = data?.screens || [];
+
+    // ✅ Always match by screen ID to avoid route/name mismatches
+    let match = screens.find(s => s.id === XR_HUB_SCREEN_ID);
+
+    // Fallbacks in case IDs ever change
+    if (!match) {
+      match = screens.find(s => (s.screen_name || '').toLowerCase() === 'xr hub dashboard');
+    }
+    if (!match) {
+      match = screens.find(s => (s.route_path || '').toLowerCase() === '/dashboard');
+    }
+
+    if (!match) {
+      console.warn('[XRHUB] No screen entry for XR Hub Dashboard; leaving unrestricted.');
+      xrHubPermissions = null;
+      return;
+    }
+
+    xrHubPermissions = {
+      read: !!match.read,
+      write: !!match.write,
+      edit: !!match.edit,
+      delete: !!match.delete,
+    };
+
+    console.log('[XRHUB] Permissions:', xrHubPermissions);
+  } catch (err) {
+    console.warn('[XRHUB] Failed to load permissions:', err);
+    xrHubPermissions = null; // fail-open
+  }
+}
+
+function hasHubWritePermission() {
+  // If we couldn't load permissions, do not block anything (preserve behaviour)
+  if (!xrHubPermissions) return true;
+  return !!xrHubPermissions.write;
+}
+
+function notifyReadOnlyHub() {
+  const msg = 'You only have READ permission for XR Hub Dashboard. Editing is not allowed.';
+  if (typeof showToast === 'function') {
+    showToast(msg, 'error');
+  } else {
+    try { alert(msg); } catch { console.warn(msg); }
+  }
+}
+
+function applyHubReadOnlyUI() {
+  if (!xrHubPermissions || xrHubPermissions.write) return; // nothing to lock
+
+  console.log('[XRHUB] Applying read-only UI on dashboard');
+
+  const markDisabled = (btn) => {
+    if (!btn) return;
+    btn.setAttribute('aria-disabled', 'true');
+    btn.style.opacity = '0.4';
+    btn.style.cursor = 'not-allowed';
+    const title = btn.getAttribute('title') || '';
+    if (!title.toLowerCase().includes('read-only')) {
+      btn.setAttribute('title', `${title ? title + ' · ' : ''}Read-only: no permission to edit.`);
+    }
+  };
+
+  // These will be added in step 2
+  document.querySelectorAll('.hub-edit-btn, .hub-msg-btn').forEach(markDisabled);
+}
+
+
 // ===== A) Per-device WebRTC quality cache =====
 const XR_ANDROID = 'XR-1234';   // Android (left)
 const XR_DOCK = 'XR-1238';   // Dock (right)
@@ -433,7 +522,7 @@ function rowHTML({ label, left, scribe, right }) {
       <div class="flex items-center gap-3">
         ${leftChip}
         <div class="flex gap-2">
-          <button class="icon-btn" title="Edit">${Icon.pen}</button>
+          <button class="icon-btn hub-edit-btn" title="Edit">${Icon.pen}</button>
           ${renderSignalBars(XR_LEFT)}
           ${batteryMarkup(XR_LEFT)}
         </div>
@@ -484,9 +573,9 @@ function rowHTML({ label, left, scribe, right }) {
         <div class="text-white/90 text-base md:text-lg mr-20 pr-2">${scribe}</div><!-- ✅ matched size --> 
         ${rightChip}
         <div class="flex gap-2">
-          <button class="icon-btn" title="Edit">${Icon.pen}</button>
+          <button class="icon-btn hub-edit-btn" title="Edit">${Icon.pen}</button>
           ${renderSignalBars(XR_RIGHT)}
-          <button class="icon-btn" title="Message">${Icon.mail}</button>
+          <button class="icon-btn hub-msg-btn" title="Message">${Icon.mail}</button>
         </div>
       </div>
       ${renderNetBadges(XR_RIGHT)}
@@ -798,7 +887,7 @@ function initSocket() {
     qualityChart.update('none');
   }
 
-  // Delegate clicks on any .chip[data-xr]
+  // Delegate clicks on any .device-chip[data-xr] (open device detail)
   document.addEventListener('click', (e) => {
     const btn = e.target.closest('.device-chip[data-xr]');
     if (!btn) return;
@@ -808,7 +897,18 @@ function initSocket() {
     openDeviceDetail(xr, label);
   });
 
-  // ✅ ADD THIS (still inside initSocket, before the closing brace)
+  // Guard edit/message actions when user has only READ permission on XR Hub
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('.hub-edit-btn, .hub-msg-btn');
+    if (!btn) return;
+
+    if (!hasHubWritePermission()) {
+      e.preventDefault();
+      e.stopPropagation();
+      notifyReadOnlyHub();
+    }
+  });
+
   // Re-evaluate the border every second so it auto-clears ~6s after stop/hide
   setInterval(updateConnBorder, 1000);
 } // <— end of initSocket()
@@ -817,12 +917,17 @@ function initSocket() {
 
 
 
+
 // ---------------- Boot ----------------
-document.addEventListener('DOMContentLoaded', () => {
-  // No initial render here—wait for both snapshots to avoid flicker
+document.addEventListener('DOMContentLoaded', async () => {
+  // 1) Load XR Hub permissions & lock UI if user is READ-only
+  await loadHubPermissions();
+  applyHubReadOnlyUI();
+
+  // 2) Now wire sockets + live telemetry
   initSocket();
 
-  // Paint date after DOM is ready and refresh it
+  // 3) Paint date after DOM is ready and refresh it
   paintNowStamp();
   setInterval(paintNowStamp, 60 * 1000); // update every minute
 });

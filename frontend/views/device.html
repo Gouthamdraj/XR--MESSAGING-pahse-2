@@ -32,6 +32,11 @@
 
         <!-- Controls -->
         <section class="card controls">
+
+            <!-- XR Device ID input (similar to Dock "Enter the ID") -->
+            <div class="controls-row">
+                <input id="deviceXrIdInput" class="input" placeholder="Enter Device XR ID (e.g. 1234)" />
+            </div>
             <div class="controls-row">
                 <button id="btnConnect" class="chip-btn">Connect</button>
                 <button id="btnStream" class="chip-btn">Start Stream</button>
@@ -40,20 +45,20 @@
                 <button id="btnVoice" class="chip-btn">Start Voice</button>
             </div>
             <div class="controls-row">
-                <button id="btnToggleRecording" class="chip-btn">Start Recording</button>
+                <button id="btnStartRec" class="btn-outline">Start Recording</button>
+                <button id="btnStopRec" class="btn-outline">Stop Recording</button>
             </div>
         </section>
 
         <!-- Preview -->
-        <section id="videoPanel" class="card preview">
-
+        <section class="card preview">
             <video id="preview" autoplay playsinline webkit-playsinline muted></video>
 
             <div id="noStream" class="preview-empty" hidden>Stream not ready</div>
         </section>
 
         <!-- Messages -->
-        <section id="messagesPanel" class="card messages">
+        <section class="messages card">
             <h2>Messages</h2>
             <div id="msgList" class="msg-list"></div>
         </section>

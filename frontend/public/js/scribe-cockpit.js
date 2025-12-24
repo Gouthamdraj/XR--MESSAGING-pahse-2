@@ -40,6 +40,87 @@ let soapHost = document.getElementById('soapNotePanel');
 const clearBtnEl = document.getElementById('_scribe_clear');
 const saveBtnEl = document.getElementById('_scribe_save');
 const addEhrBtnEl = document.getElementById('_scribe_add_ehr');
+const XR_DOCK_SCREEN_ID = 2;
+
+// ==========================
+// XR Dock / Scribe Cockpit permissions (READ vs WRITE)
+// ==========================
+let xrDockPermissions = null;  // { read, write, edit, delete } or null (fail-open)
+
+/**
+ * Load the logged-in user's rights for this screen from /api/platform/my-screens.
+ * We try to match by route_path first ("/scribe-cockpit"), then by screen_name
+ * containing "xr dock" or "scribe cockpit".
+ */
+async function loadDockPermissions() {
+  try {
+    const res = await fetch('/api/platform/my-screens', {
+      method: 'GET',
+      credentials: 'include',
+      headers: { 'Accept': 'application/json' }
+    });
+
+    const data = await res.json();
+    const screens = data?.screens || [];
+
+    const match = screens.find(s => s.id === XR_DOCK_SCREEN_ID);
+
+    if (!match) {
+      console.warn("[SCRIBE] XR Dock screen ID not found, defaulting to unrestricted");
+      xrDockPermissions = null;
+      return;
+    }
+
+    xrDockPermissions = {
+      read: !!match.read,
+      write: !!match.write,
+      edit: !!match.edit,
+      delete: !!match.delete
+    };
+
+    console.log("[SCRIBE] XR Dock permissions:", xrDockPermissions);
+
+  } catch (e) {
+    console.warn("[SCRIBE] loadDockPermissions failed:", e);
+    xrDockPermissions = null;
+  }
+}
+
+
+/** True if user is allowed to write on this screen. If permissions missing, don't block. */
+function hasScribeWritePermission() {
+  if (!xrDockPermissions) return true;   // keep existing behaviour if we couldn't load
+  return !!xrDockPermissions.write;
+}
+
+/** Show same style of message as Create User when user is READ-only. */
+function notifyReadOnlyScribe() {
+  const msg = 'You only have READ permission for XR Dock. Editing is not allowed.';
+  if (typeof showToast === 'function') {
+    showToast(msg, 'error');
+  } else {
+    try { alert(msg); } catch { console.warn(msg); }
+  }
+}
+
+/** Lock UI for READ-only users: make SOAP boxes read-only and disable buttons. */
+function applyScribeReadOnlyUI() {
+  if (!xrDockPermissions || xrDockPermissions.write) return; // nothing to lock
+
+  console.log('[SCRIBE] Applying read-only UI for XR Dock / Scribe Cockpit');
+
+  const scroller = soapContainerEnsure();
+  const editors = scroller.querySelectorAll('textarea[data-section]');
+  editors.forEach(t => {
+    t.readOnly = true;
+    t.classList.add('scribe-readonly');
+  });
+
+  if (clearBtnEl) clearBtnEl.disabled = true;
+  if (saveBtnEl) saveBtnEl.disabled = true;
+  if (addEhrBtnEl) addEhrBtnEl.disabled = true;
+}
+
 
 if (!soapHost) {
   console.warn('[SCRIBE] soapNotePanel not found, creating dynamically');
@@ -1272,6 +1353,11 @@ function wireSoapActionButtons() {
 
   if (clearBtnEl) {
     clearBtnEl.onclick = () => {
+      if (!hasScribeWritePermission()) {
+        notifyReadOnlyScribe();
+        return;
+      }
+
       scroller.querySelectorAll('textarea[data-section]').forEach(t => {
         t.value = '';
         autoExpandTextarea(t);
@@ -1292,8 +1378,14 @@ function wireSoapActionButtons() {
     };
   }
 
+
   if (saveBtnEl) {
     saveBtnEl.onclick = () => {
+      if (!hasScribeWritePermission()) {
+        notifyReadOnlyScribe();
+        return;
+      }
+
       persistSoapFromUI();
       scroller.querySelectorAll('textarea[data-section]').forEach(t => rebaseBoxStateToCurrent(t));
       resetAllEditCountersToZero();
@@ -1301,15 +1393,22 @@ function wireSoapActionButtons() {
     };
   }
 
+
   if (addEhrBtnEl) {
     addEhrBtnEl.disabled = true;
     addEhrBtnEl.classList.add('scribe-add-ehr-disabled');
     addEhrBtnEl.onclick = () => {
+      if (!hasScribeWritePermission()) {
+        notifyReadOnlyScribe();
+        return;
+      }
+
       console.log('[SCRIBE] Add EHR is disabled (placeholder).');
       scroller.querySelectorAll('textarea[data-section]').forEach(t => rebaseBoxStateToCurrent(t));
       resetAllEditCountersToZero();
     };
   }
+
 }
 
 // ==========================
@@ -1322,7 +1421,14 @@ function wireSoapActionButtons() {
 
     ensureMedStyles();
 
+    // 1) Restore previous transcript + SOAP from localStorage
     restoreFromLocalStorage();
+
+    // 2) Load XR Dock / Scribe Cockpit permissions, then lock UI if READ-only
+    await loadDockPermissions();
+    applyScribeReadOnlyUI();
+
+    // 3) Wire buttons (they will also guard writes at click time)
     wireSoapActionButtons();
 
     // Initial draw for medication overlay (uses persisted statuses if available)
@@ -1343,6 +1449,7 @@ function wireSoapActionButtons() {
     }
   }
 })();
+
 
 
 // ==========================

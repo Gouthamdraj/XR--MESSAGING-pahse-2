@@ -4,22 +4,107 @@
 // CITED FROM ANDROID SOURCE: WebRtcStreamer, AudioStreamer, PeerConnectionObserver.  (See upload) 
 
 import { SignalingClient } from './signaling.js';
+// ================= XR Device (/device) permissions ==================
+// System_Screens.id = 4 → "XR Device" with route_path = "/device"
+const XR_DEVICE_SCREEN_ID = 4;
+
+let xrDevicePermissions = null;
+let xrDevicePermsLoaded = false;
+
+async function loadDevicePermissionsOnce() {
+  if (xrDevicePermsLoaded) return;
+  xrDevicePermsLoaded = true;
+
+  // Only run in a browser context
+  if (typeof window === 'undefined' || typeof fetch === 'undefined') {
+    xrDevicePermissions = null; // fail-open
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/platform/my-screens', {
+      method: 'GET',
+      credentials: 'include',
+      headers: { 'Accept': 'application/json' }
+    });
+
+    if (!res.ok) {
+      console.warn('[XRDEVICE] my-screens returned', res.status);
+      xrDevicePermissions = null; // fail-open
+      return;
+    }
+
+    const data = await res.json();
+    const screens = data?.screens || [];
+
+    // ✅ Always match by screen ID to avoid route/name mismatch
+    let match = screens.find(s => s.id === XR_DEVICE_SCREEN_ID);
+
+    // Fallbacks (defensive)
+    if (!match) {
+      match = screens.find(s => (s.screen_name || '').toLowerCase() === 'xr device');
+    }
+    if (!match) {
+      match = screens.find(s => (s.route_path || '').toLowerCase() === '/device');
+    }
+
+    if (!match) {
+      console.warn('[XRDEVICE] No screen entry for XR Device; leaving unrestricted.');
+      xrDevicePermissions = null;
+      return;
+    }
+
+    xrDevicePermissions = {
+      read: !!match.read,
+      write: !!match.write,
+      edit: !!match.edit,
+      delete: !!match.delete
+    };
+
+    console.log('[XRDEVICE] Permissions:', xrDevicePermissions);
+  } catch (err) {
+    console.warn('[XRDEVICE] Failed to load my-screens:', err);
+    xrDevicePermissions = null; // fail-open
+  }
+}
+
+function hasDeviceWritePermission() {
+  // If we couldn't load permissions, do not block anything (preserve existing behaviour)
+  if (!xrDevicePermissions) return true;
+  return !!xrDevicePermissions.write;
+}
+
+function notifyReadOnlyDevice() {
+  const msg = 'You only have READ permission for XR Device. Streaming is not allowed.';
+  // Prefer global showToast if the UI defines it
+  if (typeof window !== 'undefined' && typeof window.showToast === 'function') {
+    window.showToast(msg, 'error');
+  } else if (typeof alert === 'function') {
+    alert(msg);
+  } else {
+    console.warn(msg);
+  }
+}
+
 
 export class WebRtcStreamer {
   /**
    * @param {Object} opts
    * @param {SignalingClient} opts.signaling  - instance from signaling.js
-   * @param {string} [opts.androidXrId='XR-1234'] - sender id (kept for parity)
+   * @param {string} [opts.androidXrId] - sender id (optional)
    * @param {Object} [opts.mediaConstraints]  - optional override of getUserMedia constraints
    */
-  constructor({ signaling, androidXrId = (typeof window !== 'undefined' && window.XR_DEVICE_ID) || 'XR-1234', mediaConstraints, iceServers } = {}) {
+  constructor({ signaling, androidXrId = null, mediaConstraints, iceServers } = {}) {
 
     if (!signaling) throw new Error('signaling is required');
     this.signaling = signaling;
-    this.ANDROID_XR_ID = androidXrId;
+
+    // ✅ Option B: default to the ID that this client identified as
+    this.ANDROID_XR_ID = String(androidXrId || signaling.xrId || '').toUpperCase();
 
     // Local media
     this._localStream = null;
+
     this._videoEl = null;
     // Track all streams we create/bind so Stop can kill every track
     this._allStreams = new Set();
@@ -83,6 +168,21 @@ export class WebRtcStreamer {
   async startStreaming(targetIds = []) {
     if (this._isStreaming) return;
 
+    // ===== Permission guard: XR Device READ vs WRITE =====
+    try {
+      // Only enforce in browser; skip in tests / non-browser contexts
+      if (typeof window !== 'undefined') {
+        await loadDevicePermissionsOnce();
+        if (!hasDeviceWritePermission()) {
+          notifyReadOnlyDevice();
+          return; // do not start media or create peer connections
+        }
+      }
+    } catch (e) {
+      // Never break streaming if permission check itself fails
+      console.warn('[XRDEVICE] Permission check failed, falling back to default behaviour:', e);
+    }
+
     // 1) Capture media
     await this._ensureMedia();
 
@@ -95,6 +195,7 @@ export class WebRtcStreamer {
 
     this._isStreaming = true;
   }
+
 
   /** Stop streaming to everyone and free resources. */
   async stopStreaming() {
