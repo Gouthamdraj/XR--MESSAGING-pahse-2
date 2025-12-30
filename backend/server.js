@@ -26,6 +26,8 @@ const nodemailer = require('nodemailer');
 const { sequelize, connectToDatabase, closeDatabase } = require('./database/database-config');
 const { getAzureSqlConnection } = require('./database/azure-db-helper');
 
+
+
 console.log('[BOOT] Instance:', process.env.WEBSITE_INSTANCE_ID || process.pid);
 
 // -------------------- Debug helpers --------------------
@@ -126,7 +128,7 @@ console.log('[MIDDLEWARE] CORS + JSON enabled');
 // -------------------- Session Store (Prod: Redis) --------------------
 let sessionStore;
 
-if (process.env.NODE_ENV === 'production' && process.env.REDIS_URL) {
+if (IS_PROD && process.env.REDIS_URL) {
   const connectRedis = require('connect-redis');
   const RedisStore = connectRedis.default ? connectRedis.default : connectRedis;
 
