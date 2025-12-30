@@ -130,7 +130,8 @@ let sessionStore;
 
 if (IS_PROD && process.env.REDIS_URL) {
   const connectRedis = require('connect-redis');
-  const RedisStore = connectRedis.default ? connectRedis.default : connectRedis;
+  // connect-redis v9 CommonJS: class is usually at .RedisStore
+  const RedisStore = connectRedis.RedisStore || connectRedis.default || connectRedis;
 
   const sessionRedis = createClient({
     url: process.env.REDIS_URL,
