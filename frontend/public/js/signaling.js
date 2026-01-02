@@ -253,6 +253,7 @@ export class SignalingClient {
 
   _onDisconnect(reason) {
     this.isConnected = false;
+    this.roomId = null;
     this.listener?.onDisconnected?.(reason || (this._manualClose ? 'user' : 'transport'));
   }
 
@@ -275,6 +276,13 @@ export class SignalingClient {
     // Expected from server: { roomId, members? }
     const rid = evt?.roomId || null;
     this.roomId = rid;
+    // Now that we have roomId, flush any queued signals that were waiting for pairing.
+    try {
+      for (const item of this._outbox) this.socket?.emit(item.event, item.data);
+    } finally {
+      this._outbox.length = 0;
+    }
+
 
     console.log('[SIGNAL] room_joined → roomId:', rid);
 
@@ -352,6 +360,20 @@ export class SignalingClient {
 
   _send(event, data) {
     const s = this.socket;
+
+    // Option B: never emit WebRTC signaling until we have server-issued roomId.
+    // Otherwise offers/ICE get dropped server-side (no roomId yet) and streaming won't start.
+    if (event === 'signal') {
+      const t = data?.type;
+      const webrtcTypes = new Set(['offer', 'answer', 'ice-candidate', 'request_offer']);
+      if (webrtcTypes.has(t) && !this.roomId) {
+        if (this._outbox.length < this._OUTBOX_MAX) this._outbox.push({ event, data });
+        else this._outbox.shift(), this._outbox.push({ event, data });
+        console.warn(`Queued WebRTC signal [${t}] until room_joined.`);
+        return;
+      }
+    }
+
     if (s && this.isConnected) {
       s.emit(event, data);
     } else {
