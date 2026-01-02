@@ -26,8 +26,6 @@ const nodemailer = require('nodemailer');
 const { sequelize, connectToDatabase, closeDatabase } = require('./database/database-config');
 const { getAzureSqlConnection } = require('./database/azure-db-helper');
 
-
-
 console.log('[BOOT] Instance:', process.env.WEBSITE_INSTANCE_ID || process.pid);
 
 // -------------------- Debug helpers --------------------
@@ -96,69 +94,21 @@ const IS_PROD =
 console.log('[INIT] Starting server initialization...');
 const PORT = process.env.PORT || 8080;
 console.log(`[CONFIG] Using port: ${PORT}`);
-
-// (DO NOT redeclare IS_PROD here — use the one already defined above)
-
 const app = express();
-
-// Azure App Service runs behind a reverse proxy (TLS terminated upstream)
-if (IS_PROD) {
-  app.set('trust proxy', 1);
-}
-
 const server = http.createServer(app);
 console.log('[HTTP] Server created');
-
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
-  transports: ['websocket', 'polling'], // include polling
+  transports: ['websocket', 'polling'],   // ← include polling
   allowEIO3: true,
   pingInterval: 25000,
   pingTimeout: 30000,
 });
-
 console.log('[SOCKET.IO] Socket.IO server initialized');
-
-
 // -------------------- Middleware --------------------
 app.use(cors());
 app.use(express.json());
 console.log('[MIDDLEWARE] CORS + JSON enabled');
-
-// -------------------- Session Store (Prod: Redis) --------------------
-let sessionStore;
-
-if (IS_PROD && process.env.REDIS_URL) {
-  const connectRedis = require('connect-redis');
-  // connect-redis v9 CommonJS: class is usually at .RedisStore
-  const RedisStore = connectRedis.RedisStore || connectRedis.default || connectRedis;
-
-  const sessionRedis = createClient({
-    url: process.env.REDIS_URL,
-    socket: {
-      tls: (process.env.REDIS_URL || '').startsWith('rediss://'),
-    },
-  });
-
-  sessionRedis.on('error', (err) =>
-    console.error('[SESSION][REDIS] error', err)
-  );
-
-  sessionRedis.connect().then(
-    () => console.log('[SESSION][REDIS] connected'),
-    (err) =>
-      console.error(
-        '[SESSION][REDIS] connect failed (continuing)',
-        err?.message || err
-      )
-  );
-
-  sessionStore = new RedisStore({
-    client: sessionRedis,
-    prefix: 'sess:',
-  });
-}
-
 
 // Session middleware for platform admin
 const sessionSecret = process.env.SESSION_SECRET || 'change-me-in-production';
@@ -167,25 +117,13 @@ app.use(
     secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
-
-    // ✅ critical for Azure scale-out / restarts
-    store: sessionStore || undefined,
-
-    // helps when behind proxy (pairs with trust proxy)
-    proxy: IS_PROD,
-
     cookie: {
       httpOnly: true,
-
-      // ✅ REQUIRED for HTTPS + Azure proxy
-      sameSite: IS_PROD ? 'none' : 'lax',
-      secure: IS_PROD,
-
+      sameSite: 'lax',
       maxAge: 24 * 60 * 60 * 1000,
     },
   })
 );
-
 console.log('[MIDDLEWARE] Session enabled');
 
 // ✅ Connect to Azure SQL via Sequelize on boot (non-fatal if it fails)
@@ -492,22 +430,9 @@ async function tryDbAutoPair(deviceId) {
   dlog('[DB_AUTO_PAIR] attempt for', deviceId);
 
   if (isAlreadyPaired(deviceId)) {
-    const stalePartner = clearPairByXrId(deviceId);
-    dlog('[DB_AUTO_PAIR] cleared stale pairing for', deviceId, 'oldPartner=', stalePartner);
-
-    // Also clear stale socket roomId state (safe even if already null)
-    const meSock = getClientSocketByXrIdCI(deviceId);
-    if (meSock) meSock.data.roomId = null;
-
-    if (stalePartner) {
-      const pSock = getClientSocketByXrIdCI(stalePartner);
-      if (pSock) pSock.data.roomId = null;
-    }
-
-    // Do NOT return; continue attempting fresh DB pairing
+    dlog('[DB_AUTO_PAIR] already paired:', deviceId, '->', pairedWith.get(normXr(deviceId)));
+    return false;
   }
-
-
 
   const myUserId = await resolveUserIdByXrId(deviceId);
   dlog('[DB_AUTO_PAIR] myUserId:', myUserId);
@@ -541,8 +466,8 @@ async function tryDbAutoPair(deviceId) {
   const roomId = getRoomIdForPair(deviceId, partnerXr);
   const room = io.sockets.adapter.rooms.get(roomId);
   const memberCount = room ? room.size : 0;
-  dlog('[DB_AUTO_PAIR] roomId:', roomId, 'current members:', memberCount, '(not used to block pairing)');
-
+  dlog('[DB_AUTO_PAIR] roomId:', roomId, 'current members:', memberCount);
+  if (memberCount >= 2) return false;
 
   await meSocket.join(roomId);
   await partnerSocket.join(roomId);
@@ -557,7 +482,8 @@ async function tryDbAutoPair(deviceId) {
 
   const members = listRoomMembers(roomId);
   io.to(roomId).emit('room_joined', { roomId, members });
-
+  meSocket.emit('room_joined', { roomId, members });
+  partnerSocket.emit('room_joined', { roomId, members });
 
   broadcastPairs();
   return true;
@@ -1034,27 +960,6 @@ app.post('/api/platform/login', async (req, res) => {
       console.log('[PLATFORM] ✅ Platform user logged in via System_Users:', user.email);
     }
 
-    // ✅ NEW: If logged-in user is Provider, log provider list (id/email/xr_id) as JSON.
-    // This is side-effect-free: does not change response/session and cannot block login.
-    // ✅ Provider-only: log ONLY the logged-in provider (id/email/xr_id)
-    if (String(user.persona || '').toLowerCase() === 'provider') {
-      console.log(
-        '[PLATFORM][PROVIDER_ME_JSON]',
-        JSON.stringify(
-          {
-            ok: true,
-            provider: {
-              id: user.id,
-              email: user.email,
-              xr_id: user.xr_id || null,
-            },
-          },
-          null,
-          2
-        )
-      );
-    }
-
     // Response shape kept compatible with old code (we only ADD extra fields)
     return res.json({
       ok: true,
@@ -1080,8 +985,6 @@ app.post('/api/platform/login', async (req, res) => {
       .json({ ok: false, message: 'Internal server error' });
   }
 });
-
-
 
 
 
@@ -3444,7 +3347,7 @@ io.on('connection', (socket) => {
     // ✅ normalize once (Option B)
     const XR = normXr(xrId);
 
-    // 🔒 Duplicate xrId handling (NEWEST WINS): if an old socket exists, kick it and accept this one.
+    // 🔒 GLOBAL duplicate guard
     try {
       const all = await safeFetchSockets(io, "/");
       const holder = all.find(s =>
@@ -3460,34 +3363,29 @@ io.on('connection', (socket) => {
           since: holder.data?.connectedAt || null,
           socketId: holder.id,
         };
-        dlog('[IDENTIFY] Duplicate xrId detected — disconnecting old socket, keeping new:', holderInfo);
+        dlog('[IDENTIFY] Duplicate xrId in use — rejecting:', holderInfo);
 
-        // Clear stale pairing state for this XR (and its partner) so re-pair works cleanly
-        clearPairByXrId(XR);
+        broadcastEmptyDeviceListOnce();
 
-        // Best-effort: disconnect the old socket
-        try {
-          try { holder.data.roomId = null; } catch { }
-          holder.emit('replaced_by_new_session', { xrId: XR });
-        } catch { }
-        try {
-          holder.disconnect(true);
-        } catch (e) {
-          dwarn('[IDENTIFY] failed to disconnect old holder:', e?.message || e);
-        }
+        setTimeout(async () => {
+          try { await broadcastDeviceList(); }
+          catch (e) { dwarn('[DEVICE_LIST] delayed re-broadcast failed:', e.message); }
+        }, 1200);
+
+        socket.emit('duplicate_id', { xrId: XR, holderInfo });
+        return socket.disconnect(true);
       }
     } catch (e) {
       dwarn('[IDENTIFY] fetchSockets failed; continuing cautiously:', e?.message || e);
     }
-
 
     // ✅ Accept this socket
     socket.data.deviceName = deviceName || 'Unknown';
     socket.data.xrId = XR;
     socket.data.connectedAt = Date.now();
 
-    // try { await socket.join(roomOf(XR)); }
-    // catch (e) { dwarn('[IDENTIFY] join room failed:', e?.message || e); }
+    try { await socket.join(roomOf(XR)); }
+    catch (e) { dwarn('[IDENTIFY] join room failed:', e?.message || e); }
 
     clients.set(XR, socket);
     onlineDevices.set(XR, socket);
@@ -3517,6 +3415,7 @@ io.on('connection', (socket) => {
       derr('[identify] tryDbAutoPair error:', e.message);
     }
   });
+
 
   // -------- metrics_subscribe / unsubscribe (NEW) --------
   socket.on('metrics_subscribe', ({ xrId }) => {
@@ -3627,32 +3526,17 @@ io.on('connection', (socket) => {
           });
 
           // Broadcast to dashboards (powers the connection tiles)
-          // Option B: route quality updates only to the paired room (no global emit)
-          const roomId = socket.data?.roomId;
-          if (roomId) io.to(roomId).emit('webrtc_quality_update', { deviceId, samples });
-
+          io.emit('webrtc_quality_update', { deviceId, samples });
         }
         return; // ✅ do not route as a regular signaling message
       }
 
       // 3) offer/answer/ICE path (Option B: strict pair-room only)
 
-      // ✅ Always trust socket identity, never payload
-      const from = socket.data?.xrId;
-      if (!from) {
-        dwarn('[signal] missing socket.data.xrId; ignoring');
-        return;
-      }
+      const { from, to, data } = msg;
 
-      const data = msg.data;
-
-      // ✅ OPTIONAL but recommended: allowlist only WebRTC signaling types from clients
-      const allowed = new Set(['offer', 'answer', 'ice-candidate', 'request_offer']);
-      if (!allowed.has(type)) {
-        dwarn('[signal] blocked non-webrtc client signal type:', type);
-        return;
-      }
-
+      // Option B strict isolation:
+      // Ignore "to" for WebRTC signaling; always route only within the paired room.
       const roomId = socket.data?.roomId;
       if (!roomId) {
         dwarn('[signal] no roomId (not paired yet); ignoring');
@@ -3660,11 +3544,8 @@ io.on('connection', (socket) => {
         return;
       }
 
-      dlog('[signal] pair-room forward', { roomId, type });
-      // Forward ONLY within pair room
+      dlog('[signal] pair-room forward', { roomId, ignoredTo: to || null });
       socket.to(roomId).emit('signal', { type, from, data });
-
-
 
     } catch (err) {
       derr('[signal] handler error:', err.message);
@@ -3685,12 +3566,7 @@ io.on('connection', (socket) => {
     // Accept both `command` and `action`; keep original casing for compatibility
     const cmdRaw = (p.command != null ? p.command : p.action) || '';
     const cmd = String(cmdRaw);
-    const from = socket.data?.xrId;
-    if (!from) {
-      dwarn('[control] missing socket.data.xrId; ignoring');
-      return;
-    }
-
+    const from = p.from;
     const to = p.to;
     const msg = p.message;
 
@@ -3731,12 +3607,7 @@ io.on('connection', (socket) => {
     }
 
     const type = data?.type || 'message';
-    const from = socket.data?.xrId;
-    if (!from) {
-      dwarn('[message] missing socket.data.xrId; ignoring');
-      return;
-    }
-
+    const from = data?.from;
     const to = data?.to;
     const text = data?.text;
     const urgent = !!data?.urgent;
@@ -3750,7 +3621,7 @@ io.on('connection', (socket) => {
       const out = {
         type: 'transcript',
         from,
-        to: null,
+        to,
         text,
         final: !!data?.final,
         timestamp,
@@ -3821,7 +3692,7 @@ io.on('connection', (socket) => {
       const msg = {
         type: 'message',
         from,
-        to: null,
+        to,
         text,
         urgent,
         sender: socket.data?.deviceName || from || 'unknown',
@@ -3848,35 +3719,19 @@ io.on('connection', (socket) => {
 
 
 
-
   // -------- clear-messages --------
   socket.on('clear-messages', ({ by }) => {
     dlog('[EVENT] clear-messages', { by });
-
-    const roomId = socket.data?.roomId;
-    if (!roomId) {
-      dwarn('[clear-messages] no roomId; ignoring');
-      return;
-    }
-
     const payload = { type: 'message-cleared', by, messageId: Date.now() };
-    io.to(roomId).emit('message-cleared', payload);
+    io.emit('message-cleared', payload);
   });
 
   // -------- clear_confirmation --------
   socket.on('clear_confirmation', ({ device }) => {
     dlog('[EVENT] clear_confirmation', { device });
-
-    const roomId = socket.data?.roomId;
-    if (!roomId) {
-      dwarn('[clear_confirmation] no roomId; ignoring');
-      return;
-    }
-
     const payload = { type: 'message_cleared', by: device, timestamp: new Date().toISOString() };
-    io.to(roomId).emit('message_cleared', payload);
+    io.emit('message_cleared', payload);
   });
-
 
   // -------- status_report --------
   socket.on('status_report', ({ from, status }) => {
@@ -4056,7 +3911,6 @@ io.on('connection', (socket) => {
 
 
 
-
   // Final cleanup and presence broadcast
   socket.on('disconnect', async (reason) => {
     dlog('❎ [EVENT] disconnect', {
@@ -4071,9 +3925,6 @@ io.on('connection', (socket) => {
         // Remove from your in-memory maps
         clients.delete(xrId);
         onlineDevices.delete(xrId);
-
-        // ✅ Clear authoritative room routing for this socket
-        socket.data.roomId = null;
 
         // ✅ Option B: release one-to-one lock (do this ONCE)
         const partner = clearPairByXrId(xrId);
