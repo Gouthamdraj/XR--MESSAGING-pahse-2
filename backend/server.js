@@ -606,28 +606,82 @@ async function buildDeviceListGlobal() {
   return list;
 }
 
+// ✅ NEW: Build device list strictly for a given room (pair isolation)
+async function buildDeviceListForRoom(roomId) {
+  dlog('[DEVICE_LIST] building (room via fetchSockets):', roomId);
+  if (!roomId) return [];
 
-async function broadcastDeviceList() {
-  dlog('[DEVICE_LIST] broadcast start');
+  const sockets = await safeFetchSockets(io, "/");
+  const byId = new Map();
+
+  for (const s of sockets) {
+    // ✅ Only include sockets that are actually in this room
+    if (!s?.rooms?.has(roomId)) continue;
+
+    const id = s?.data?.xrId;
+    if (!id) continue;
+
+    const b = batteryByDevice?.get(id) || {};
+    const t = telemetryByDevice?.get(id) || null;
+
+    byId.set(id, {
+      xrId: id,
+      deviceName: s.data?.deviceName || 'Unknown',
+      battery: (typeof b.pct === 'number') ? b.pct : null,
+      charging: !!b.charging,
+      batteryTs: b.ts || null,
+      ...(t ? { telemetry: t } : {}),
+    });
+  }
+
+  const list = [...byId.values()];
+
+  // ✅ Enforce strict one-to-one pair: max 2 devices
+  if (list.length > 2) {
+    dwarn('[DEVICE_LIST] Room has >2 members (should never happen):', roomId, list.map(x => x.xrId));
+    return list.slice(0, 2);
+  }
+
+  dlog('[DEVICE_LIST] built (room):', roomId, list);
+  return list;
+}
+
+
+
+// ✅ Updated: can broadcast globally (default) OR to a specific room if roomId is provided
+async function broadcastDeviceList(roomId) {
+  dlog('[DEVICE_LIST] broadcast start', roomId ? `(room: ${roomId})` : '(global)');
   try {
-    const list = await buildDeviceListGlobal();
-    io.emit('device_list', list);
-    dlog('[DEVICE_LIST] broadcast done (size:', list.length, ')');
+    const list = roomId ? await buildDeviceListForRoom(roomId) : await buildDeviceListGlobal();
+
+    if (roomId) {
+      io.to(roomId).emit('device_list', list);  // ✅ room-only
+    } else {
+      io.emit('device_list', list);             // ✅ unchanged global behavior
+    }
+
+    dlog('[DEVICE_LIST] broadcast done (size:', list.length, ')', roomId ? `(room: ${roomId})` : '(global)');
   } catch (e) {
     dwarn('[DEVICE_LIST] Failed to build list:', e.message);
   }
 }
 
 
-// Emit an empty device list once (used to drive cockpit blackout)
-function broadcastEmptyDeviceListOnce() {
+// ✅ Updated: can broadcast empty list globally (default) OR to a specific room if roomId is provided
+function broadcastEmptyDeviceListOnce(roomId) {
   try {
-    dlog('[DEVICE_LIST] broadcasting EMPTY list (blackout)');
-    io.emit('device_list', []); // force UIs to show "No devices online"
+    if (roomId) {
+      dlog('[DEVICE_LIST] broadcasting EMPTY list (room):', roomId);
+      io.to(roomId).emit('device_list', []);
+    } else {
+      dlog('[DEVICE_LIST] broadcasting EMPTY list (blackout/global)');
+      io.emit('device_list', []); // ✅ unchanged global behavior
+    }
   } catch (e) {
     dwarn('[DEVICE_LIST] empty broadcast failed:', e.message);
   }
 }
+
 
 function addToMessageHistory(message) {
   messageHistory.push({ ...message, id: Date.now(), timestamp: new Date().toISOString() });
@@ -3541,11 +3595,38 @@ io.on('connection', (socket) => {
   socket.on('request_device_list', async () => {
     dlog('[EVENT] request_device_list');
     try {
-      socket.emit('device_list', await buildDeviceListGlobal());
+      const roomId = socket.data?.roomId;
+
+      // ✅ If paired → ONLY devices in this pair room
+      if (roomId) {
+        socket.emit('device_list', await buildDeviceListForRoom(roomId));
+        return;
+      }
+
+      // ✅ NOT paired yet → ONLY show *this* device (self), never global
+      const xrId = normXr(socket.data?.xrId);
+      if (!xrId) {
+        socket.emit('device_list', []);
+        return;
+      }
+
+      const b = batteryByDevice?.get(xrId) || {};
+      const t = telemetryByDevice?.get(xrId) || null;
+
+      socket.emit('device_list', [{
+        xrId,
+        deviceName: socket.data?.deviceName || 'Unknown',
+        battery: (typeof b.pct === 'number') ? b.pct : null,
+        charging: !!b.charging,
+        batteryTs: b.ts || null,
+        ...(t ? { telemetry: t } : {}),
+      }]);
+
     } catch (e) {
       dwarn('[request_device_list] failed:', e.message);
     }
   });
+
 
   // -------- pair_with --------
   // Option B: DB-driven auto pairing is enabled.
@@ -4049,6 +4130,8 @@ io.on('connection', (socket) => {
         socket.to(roomId).emit('desktop_disconnected', { xrId, roomId });
 
         dlog('[disconnecting] notified peer_left', { xrId, roomId });
+        // ✅ NEW: update ONLY this room's device list (prevents global leak)
+        broadcastEmptyDeviceListOnce(roomId);
       }
     }
   });
@@ -4057,7 +4140,6 @@ io.on('connection', (socket) => {
 
 
 
-  // Final cleanup and presence broadcast
   socket.on('disconnect', async (reason) => {
     dlog('❎ [EVENT] disconnect', {
       reason,
@@ -4072,6 +4154,9 @@ io.on('connection', (socket) => {
         clients.delete(xrId);
         onlineDevices.delete(xrId);
 
+        // ✅ Capture room before clearing it
+        const roomIdAtDisconnect = socket.data?.roomId;
+
         // ✅ Clear authoritative room routing for this socket
         socket.data.roomId = null;
 
@@ -4085,20 +4170,21 @@ io.on('connection', (socket) => {
           desktopClients.delete(xrId);
           dlog('[disconnect] removed desktop client:', xrId);
         }
+
+        // ✅ Broadcast device list ONLY to the pair room
+        await broadcastDeviceList(roomIdAtDisconnect);
+
+        // ✅ After Socket.IO prunes rooms, reflect pair changes
+        setTimeout(() => {
+          broadcastPairs();
+        }, 0);
       }
-
-      // Broadcast device list so UIs update without manual refresh
-      await broadcastDeviceList();
-
-      // ✅ After Socket.IO prunes rooms, reflect pair changes
-      setTimeout(() => {
-        broadcastPairs();
-      }, 0);
 
     } catch (err) {
       derr('[disconnect] cleanup error:', err.message);
     }
   });
+
 
 
 
