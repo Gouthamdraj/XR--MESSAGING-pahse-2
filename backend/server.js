@@ -558,6 +558,9 @@ async function tryDbAutoPair(deviceId) {
   const members = listRoomMembers(roomId);
   io.to(roomId).emit('room_joined', { roomId, members });
 
+  await broadcastDeviceList(roomId);
+
+
 
   broadcastPairs();
   return true;
@@ -3552,14 +3555,23 @@ io.on('connection', (socket) => {
       dlog('[IDENTIFY] desktop client tracked', XR);
     }
 
-    // Send lists and maybe auto-pair
+    // Send ONLY self until DB pairing completes (prevents global device leak)
     try {
-      const list = await buildDeviceListGlobal();
-      socket.emit('device_list', list);
-      await broadcastDeviceList();
+      const b = batteryByDevice?.get(XR) || {};
+      const t = telemetryByDevice?.get(XR) || null;
+
+      socket.emit('device_list', [{
+        xrId: XR,
+        deviceName: socket.data?.deviceName || 'Unknown',
+        battery: (typeof b.pct === 'number') ? b.pct : null,
+        charging: !!b.charging,
+        batteryTs: b.ts || null,
+        ...(t ? { telemetry: t } : {}),
+      }]);
     } catch (e) {
-      derr('[identify] device_list error:', e.message);
+      derr('[identify] self device_list error:', e.message);
     }
+
 
     try {
       if (!socket.data?.roomId) {

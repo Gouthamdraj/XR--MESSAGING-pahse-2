@@ -730,6 +730,10 @@ function initSocket() {
                 : null;
             pairedPeerId = other || null;
             console.log('[PAIR] pairedPeerId =', pairedPeerId);
+
+            // ✅ NEW: immediately ask server for fresh room-scoped device list (no refresh needed)
+            try { socket?.emit('request_device_list'); } catch (e) { console.warn('[DEVICES] request_device_list failed:', e); }
+
         } catch (e) {
             console.warn('[PAIR] failed to derive pairedPeerId:', e);
             pairedPeerId = null;
@@ -740,7 +744,7 @@ function initSocket() {
         addSystemMessage(`🎯 VR Room created: ${roomId}.${memList ? ` Members: ${memList}` : ''}`);
 
         // 4) Re-render device list (unchanged)
-        if (lastDeviceList) updateDeviceList(lastDeviceList);
+        updateDeviceList(lastDeviceList || []);
 
         // ✅ Flush any WebRTC payloads that were created before room_joined existed
         if (pendingLocalAnswer && socket?.connected) {
