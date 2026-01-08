@@ -1480,8 +1480,10 @@ function updateDeviceList(devices) {
     const myId = XR_ID;
     const peerId = pairedPeerId;
 
-    // ✅ Option B UI: once room exists, show only self + paired peer
-    const wantOnlyPair = !!currentRoom && !!pairedPeerId;
+    // ✅ Always restrict visibility:
+    // - before pairing: show only self
+    // - after pairing: show only self + paired peer
+    const wantOnlyPair = true;
 
 
     const allowed = new Set([normalizeId(myId), normalizeId(peerId)].filter(Boolean));
