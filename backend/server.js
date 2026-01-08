@@ -4143,7 +4143,7 @@ io.on('connection', (socket) => {
 
         dlog('[disconnecting] notified peer_left', { xrId, roomId });
         // ✅ NEW: update ONLY this room's device list (prevents global leak)
-        broadcastEmptyDeviceListOnce(roomId);
+
       }
     }
   });
