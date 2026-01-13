@@ -78,8 +78,15 @@ async function safeFetchSockets(io, namespace = "/") {
 
   try {
     // Short guard so device-list / identify / health never stall on a stale peer
-    const guard = new Promise((_, reject) => setTimeout(() => reject(new Error("guard-timeout")), 750));
+    const guard = new Promise((_, reject) => setTimeout(() => reject(new Error("guard-timeout")), 2500));
+
     const globalSockets = await Promise.race([nsp.fetchSockets(), guard]);
+
+    if (!Array.isArray(globalSockets)) {
+      console.warn("[WARN] [safeFetchSockets] fetchSockets returned non-array; using local only:", typeof globalSockets);
+      return local;
+    }
+
 
     // Merge local + global by socket.id
     const byId = new Map(local.map(s => [s.id, s]));
@@ -130,6 +137,20 @@ console.log('[SOCKET.IO] Socket.IO server initialized');
 function dbgToSocket(socket, msg, extra = {}) {
   try {
     socket.emit("debug_log", {
+      msg,
+      ...extra,
+      t: new Date().toISOString()
+    });
+  } catch { }
+}
+
+/* =========================================================
+   DEBUG HELPER – ROOM (TEMP – SAFE)
+   ========================================================= */
+function dbgToRoom(roomId, msg, extra = {}) {
+  try {
+    if (!roomId) return;
+    io.to(roomId).emit("debug_log", {
       msg,
       ...extra,
       t: new Date().toISOString()
@@ -749,36 +770,57 @@ async function buildDeviceListGlobal() {
 async function buildDeviceListForRoom(roomId) {
   const stamp = new Date().toISOString();
   const inst = process.env.WEBSITE_INSTANCE_ID || process.env.COMPUTERNAME || 'local';
+
   dlog(`[DEVICE_LIST][${stamp}][${inst}] ▶ buildDeviceListForRoom called`, { roomId });
+  dbgToRoom(roomId, "[DEVICE_LIST] buildDeviceListForRoom called", { roomId, inst });
 
   if (!roomId || !roomId.startsWith('pair:')) {
     dwarn(`[DEVICE_LIST][${stamp}][${inst}] invalid or non-pair roomId`, { roomId });
+    dbgToRoom(roomId, "[DEVICE_LIST] invalid/non-pair roomId", { roomId, inst });
     return [];
   }
 
-  // Local room size (IMPORTANT: this is instance-local even with Redis adapter)
+  // Local room size (instance-local only)
   try {
     const localRoom = io?.sockets?.adapter?.rooms?.get?.(roomId);
+    const localRoomSize = localRoom ? localRoom.size : 0;
+
     dlog(`[DEVICE_LIST][${stamp}][${inst}] local adapter room size`, {
       roomId,
-      localRoomSize: localRoom ? localRoom.size : 0,
+      localRoomSize,
       ioRedisReady,
       IS_PROD,
       adapterName: io?.sockets?.adapter?.constructor?.name || 'unknown',
     });
+
+    dbgToRoom(roomId, "[DEVICE_LIST] local adapter room size", {
+      roomId,
+      localRoomSize,
+      ioRedisReady,
+      IS_PROD,
+      adapterName: io?.sockets?.adapter?.constructor?.name || 'unknown',
+      inst
+    });
   } catch (e) {
     dwarn(`[DEVICE_LIST][${stamp}][${inst}] failed reading local room size`, e?.message || e);
+    dbgToRoom(roomId, "[DEVICE_LIST] failed reading local room size", {
+      err: e?.message || String(e),
+      inst
+    });
   }
 
-  // ✅ Cluster-safe path (Redis adapter must be READY)
+  // ================= CLUSTER PATH =================
   if (IS_PROD && ioRedisReady && typeof io?.in === 'function') {
     dlog(`[DEVICE_LIST][${stamp}][${inst}] attempting CLUSTER fetchSockets`, { roomId });
+    dbgToRoom(roomId, "[DEVICE_LIST] attempting CLUSTER fetchSockets", { roomId, inst });
 
     let sockets;
     try {
       sockets = await Promise.race([
         io.in(roomId).fetchSockets(),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('room fetchSockets timeout')), 1500)),
+        new Promise((_, rej) =>
+          setTimeout(() => rej(new Error('room fetchSockets timeout')), 5000)
+        ),
       ]);
     } catch (e) {
       dwarn(`[DEVICE_LIST][${stamp}][${inst}] ❌ cluster fetchSockets failed`, {
@@ -787,8 +829,47 @@ async function buildDeviceListForRoom(roomId) {
         ioRedisReady,
         adapterName: io?.sockets?.adapter?.constructor?.name,
       });
-      // fallthrough to local parse
-      sockets = null;
+
+      dbgToRoom(roomId, "[DEVICE_LIST] CLUSTER fetchSockets FAILED (stable fallback)", {
+        roomId,
+        err: e?.message || String(e),
+        ioRedisReady,
+        adapterName: io?.sockets?.adapter?.constructor?.name,
+        inst
+      });
+
+      // ✅ stable fallback (unchanged)
+      const parts = String(roomId).split(':');
+      const a = normXr(parts[1] || '');
+      const b = normXr(parts[2] || '');
+      const ids = [a, b].filter(Boolean).slice(0, 2);
+
+      const list = ids.map(id => {
+        const bRec = batteryByDevice?.get(id) || {};
+        const tRec = telemetryByDevice?.get(id) || null;
+
+        return {
+          xrId: id,
+          deviceName: 'Unknown',
+          battery: (typeof bRec.pct === 'number') ? bRec.pct : null,
+          charging: !!bRec.charging,
+          batteryTs: bRec.ts || null,
+          ...(tRec ? { telemetry: tRec } : {}),
+        };
+      });
+
+      dlog(`[DEVICE_LIST][${stamp}][${inst}] ✅ built (cluster-fallback stable)`, {
+        roomId,
+        xrIds: list.map(x => x.xrId),
+      });
+
+      dbgToRoom(roomId, "[DEVICE_LIST] built (cluster-fallback stable)", {
+        roomId,
+        xrIds: list.map(x => x.xrId),
+        inst
+      });
+
+      return list;
     }
 
     if (Array.isArray(sockets)) {
@@ -804,26 +885,20 @@ async function buildDeviceListForRoom(roomId) {
         })),
       });
 
+      dbgToRoom(roomId, "[DEVICE_LIST] fetchSockets returned (cluster)", {
+        roomId,
+        count: sockets.length,
+        xrIds: sockets.map(s => normXr(s?.data?.xrId)).filter(Boolean),
+        inst
+      });
+
       const list = [];
       for (const s of sockets) {
         const id = normXr(s?.data?.xrId);
-
-        if (!id) {
-          dwarn(`[DEVICE_LIST][${stamp}][${inst}] socket missing xrId`, { sid: s?.id });
-          continue;
-        }
+        if (!id) continue;
 
         const bRec = batteryByDevice?.get(id) || {};
         const tRec = telemetryByDevice?.get(id) || null;
-
-        // Key debug: are these maps missing because telemetry/battery was stored on another instance?
-        dlog(`[DEVICE_LIST][${stamp}][${inst}] snapshot for xr`, {
-          xrId: id,
-          hasBattery: typeof bRec.pct === 'number',
-          hasTelemetry: !!tRec,
-          batteryTs: bRec.ts || null,
-          telemetryTs: tRec?.ts || null,
-        });
 
         list.push({
           xrId: id,
@@ -836,42 +911,73 @@ async function buildDeviceListForRoom(roomId) {
       }
 
       const unique = Array.from(new Map(list.map(x => [x.xrId, x])).values()).slice(0, 2);
-      dlog(`[DEVICE_LIST][${stamp}][${inst}] ✅ built (cluster)`, { roomId, xrIds: unique.map(x => x.xrId) });
+
+      dlog(`[DEVICE_LIST][${stamp}][${inst}] ✅ built (cluster)`, {
+        roomId,
+        xrIds: unique.map(x => x.xrId),
+      });
+
+      dbgToRoom(roomId, "[DEVICE_LIST] built (cluster)", {
+        roomId,
+        xrIds: unique.map(x => x.xrId),
+        inst
+      });
+
       return unique;
     } else {
-      dwarn(`[DEVICE_LIST][${stamp}][${inst}] fetchSockets returned NON-array`, { roomId, socketsType: typeof sockets });
+      dwarn(`[DEVICE_LIST][${stamp}][${inst}] fetchSockets returned NON-array`, {
+        roomId,
+        socketsType: typeof sockets,
+      });
+
+      dbgToRoom(roomId, "[DEVICE_LIST] fetchSockets NON-array (stable fallback)", {
+        roomId,
+        socketsType: typeof sockets,
+        inst
+      });
+
+      // ✅ stable fallback (unchanged)
+      const parts = String(roomId).split(':');
+      const a = normXr(parts[1] || '');
+      const b = normXr(parts[2] || '');
+      const ids = [a, b].filter(Boolean).slice(0, 2);
+
+      const list = ids.map(id => ({
+        xrId: id,
+        deviceName: 'Unknown',
+        battery: null,
+        charging: false,
+        batteryTs: null,
+      }));
+
+      dlog(`[DEVICE_LIST][${stamp}][${inst}] ✅ built (non-array fallback)`, {
+        roomId,
+        xrIds: ids,
+      });
+
+      dbgToRoom(roomId, "[DEVICE_LIST] built (non-array fallback)", {
+        roomId,
+        xrIds: ids,
+        inst
+      });
+
+      return list;
     }
-  } else {
-    dlog(`[DEVICE_LIST][${stamp}][${inst}] CLUSTER path not used`, {
-      IS_PROD,
-      ioRedisReady,
-      hasIoIn: typeof io?.in === 'function',
-      adapterName: io?.sockets?.adapter?.constructor?.name || 'unknown',
-    });
   }
 
-  // ---- Fallback: local-only ----
+  // ================= LOCAL FALLBACK (unchanged) =================
   dlog(`[DEVICE_LIST][${stamp}][${inst}] using LOCAL fallback`, { roomId });
+  dbgToRoom(roomId, "[DEVICE_LIST] using LOCAL fallback", { roomId, inst });
 
   const parts = String(roomId).split(':');
   const a = normXr(parts[1] || '');
   const b = normXr(parts[2] || '');
   const ids = [a, b].filter(Boolean);
 
-  dlog(`[DEVICE_LIST][${stamp}][${inst}] parsed ids from room`, { roomId, ids });
-
   const list = [];
   for (const id of ids) {
     const s = getClientSocketByXrIdCI(id);
-
-    if (!s || !s.connected) {
-      dwarn(`[DEVICE_LIST][${stamp}][${inst}] local socket missing/disconnected`, {
-        xrId: id,
-        found: !!s,
-        connected: !!s?.connected,
-      });
-      continue;
-    }
+    if (!s || !s.connected) continue;
 
     const bRec = batteryByDevice?.get(id) || {};
     const tRec = telemetryByDevice?.get(id) || null;
@@ -887,36 +993,46 @@ async function buildDeviceListForRoom(roomId) {
   }
 
   const finalList = list.slice(0, 2);
-  dlog(`[DEVICE_LIST][${stamp}][${inst}] built (local)`, { roomId, xrIds: finalList.map(x => x.xrId) });
+  dlog(`[DEVICE_LIST][${stamp}][${inst}] built (local)`, {
+    roomId,
+    xrIds: finalList.map(x => x.xrId),
+  });
+
+  dbgToRoom(roomId, "[DEVICE_LIST] built (local)", {
+    roomId,
+    xrIds: finalList.map(x => x.xrId),
+    inst
+  });
+
   return finalList;
 }
-
-
-
 
 
 
 // ✅ Broadcast device list: global OR room-scoped (Option B safe)
 async function broadcastDeviceList(roomId) {
   dlog('[DEVICE_LIST] broadcast start', roomId ? `(room: ${roomId})` : '(global)');
+  if (roomId) dbgToRoom(roomId, "[DEVICE_LIST] broadcast start", { roomId });
 
   try {
     const list = roomId
-      ? await buildDeviceListForRoom(roomId)   // ✅ MUST await
+      ? await buildDeviceListForRoom(roomId)
       : await buildDeviceListGlobal();
 
     if (roomId) {
-      io.to(roomId).emit('device_list', list); // ✅ room-only
+      io.to(roomId).emit('device_list', list);
+      dbgToRoom(roomId, "[DEVICE_LIST] broadcast done", {
+        roomId,
+        size: Array.isArray(list) ? list.length : "INVALID",
+        xrIds: Array.isArray(list) ? list.map(x => x.xrId) : null
+      });
     } else {
-      // Option B production safety: never broadcast global device_list
-      // Global lists cause cross-pair UI contamination when multiple devices are online.
       if (IS_PROD) {
         dwarn('[DEVICE_LIST] Refusing global broadcast in prod (Option B).');
         return;
       }
-      io.emit('device_list', list); // keep legacy behavior in dev only
+      io.emit('device_list', list);
     }
-
 
     dlog(
       '[DEVICE_LIST] broadcast done (size:',
@@ -926,6 +1042,10 @@ async function broadcastDeviceList(roomId) {
     );
   } catch (e) {
     dwarn('[DEVICE_LIST] Failed to build list:', e?.message || e);
+    if (roomId) dbgToRoom(roomId, "[DEVICE_LIST] Failed to build list", {
+      roomId,
+      err: e?.message || String(e)
+    });
   }
 }
 
