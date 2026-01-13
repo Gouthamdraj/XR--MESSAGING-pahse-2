@@ -657,25 +657,24 @@ function initSocket() {
         stopHeartbeat();
 
         if (manualDisconnect) {
-            // Already wiped in toggleConnection(); nothing extra here
             console.log('[SOCKET] Manual disconnect completed');
         } else {
-            console.log('[SOCKET] Non-manual disconnect (e.g., refresh or network) — preserving messages');
+            console.log('[SOCKET] Non-manual disconnect (e.g. refresh or network) — preserving messages');
         }
 
-        currentRoom = null; // we’ll re-pair on next connect if needed
-        pairedPeerId = null; // ✅ prevent stale peer filtering after disconnect
+        currentRoom = null;
+        pairedPeerId = null;
+        manualDisconnect = false;
 
-        manualDisconnect = false; // reset the latch
+        // ✅ IMPORTANT: clear UI, don’t re-render stale server list while disconnected
+        lastDeviceList = [];
+        updateDeviceList([]);
 
-        // do not clear AUTO_KEY; preserves refresh auto-connect if enabled
-        updateDeviceList(lastDeviceList);
         announcePresence('idle');
 
-
-        // 🔴 stop desktop telemetry loop
         if (dockTelTimer) { clearInterval(dockTelTimer); dockTelTimer = null; }
     });
+
 
     socket.on('error', (data) => {
         // If the server warns about duplicate desktops, surface that to the UI
