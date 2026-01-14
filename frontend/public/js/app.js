@@ -243,6 +243,7 @@ function mergeIncremental(prev, next) {
 // 🔷 ROOM: track the private room we're paired into (if any)
 let currentRoom = null;
 let pairedPeerId = null; // set when server emits room_joined
+let pairingInProgress = false; // flag to ignore device_list during pairing
 
 
 // 🔒 Sticky autoconnect flag (persist across refresh)
@@ -665,6 +666,7 @@ function initSocket() {
         currentRoom = null;
         pairedPeerId = null;
         manualDisconnect = false;
+        pairingInProgress = false; // reset pairing flag on disconnect
 
         // ✅ IMPORTANT: clear UI, don’t re-render stale server list while disconnected
         lastDeviceList = [];
@@ -722,6 +724,8 @@ function initSocket() {
 
     socket.on('room_joined', ({ roomId, members }) => {
         console.log('[PAIR] room_joined:', roomId, members);
+
+        pairingInProgress = false; // stop ignoring device_list
 
         // 1) Authoritative room routing
         currentRoom = roomId;
@@ -878,6 +882,9 @@ function toggleConnection() {
         console.log('[SOCKET] Manual connect requested with allowed ID:', XR_ID);
         // Re-enable reconnection for active sessions
         if (socket?.io) socket.io.opts.reconnection = true;
+
+        pairingInProgress = true; // start ignoring device_list updates
+        updateDeviceList([]); // clear UI during pairing
 
         setStatus('Connecting');
         try { localStorage.setItem(AUTO_KEY, '1'); } catch { }
@@ -1474,6 +1481,11 @@ function updateDeviceList(devices) {
         return;
     }
 
+    if (pairingInProgress) {
+        console.log('[DEVICES] Ignoring device_list update during pairing:', devices.length, 'devices');
+        return;
+    }
+
     lastDeviceList = devices;
 
     console.log('[DEVICES] Updating device list with', devices.length, 'devices');
@@ -1928,6 +1940,9 @@ window.addEventListener('load', async () => {
         const chosenId = normalizeId(xrIdInput.value) || ALLOWED_ID;
         XR_ID = chosenId;
         DEVICE_NAME = isAllowedId(XR_ID) ? `Desktop${ALLOWED_ID_NUM}` : 'Desktop';
+
+        pairingInProgress = true; // start ignoring device_list
+        updateDeviceList([]); // clear UI
 
         setStatus('Connecting');
         if (socket?.io) socket.io.opts.reconnection = true;
