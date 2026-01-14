@@ -104,6 +104,14 @@ const IS_PROD =
   (process.env.NODE_ENV || '').toLowerCase().startsWith('prod') ||
   !!process.env.WEBSITE_SITE_NAME; // Azure sets this
 
+// ✅ SECURITY FIX (scanner requirement)
+// Force Express to run in production mode when deployed.
+// Express reads NODE_ENV at app creation time.
+if (IS_PROD && String(process.env.NODE_ENV || '').toLowerCase() !== 'production') {
+  process.env.NODE_ENV = 'production';
+  console.log('[SECURITY] Forced NODE_ENV=production');
+}
+
 // -------------------- Config & Servers --------------------
 console.log('[INIT] Starting server initialization...');
 const PORT = process.env.PORT || 8080;
@@ -117,6 +125,7 @@ const app = express();
 if (IS_PROD) {
   app.set('trust proxy', 1);
 }
+
 
 const server = http.createServer(app);
 console.log('[HTTP] Server created');
