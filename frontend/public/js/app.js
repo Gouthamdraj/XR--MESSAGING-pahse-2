@@ -1,4 +1,4 @@
-// --------------------------------27-5:12-----/////////-------------App.js ----------------duplicate id working version ----29-08-25------------------------------------
+// --------------------------------27-5:12-----///////-------------App.js ----------------duplicate id working version ----29-08-25------------------------------------
 
 // -------------------------------------------- --------------dashbaord and cockpit working verison============================
 console.log('[INIT] Initializing DOM elements');
@@ -797,25 +797,16 @@ function initSocket() {
 
     socket.on('peer_left', ({ xrId, roomId }) => {
         console.log('[PAIR] peer_left', xrId, roomId);
-
         if (currentRoom === roomId) {
             addSystemMessage(`${xrId} left the room.`);
-            currentRoom = null;
-            pairedPeerId = null;
+            currentRoom = null; // ensure we don’t keep signaling into an empty room
+            pairedPeerId = null; // ✅ prevent stale peer filtering after peer_left
 
             stopStream();
-
-            // ✅ do NOT reuse lastDeviceList here
-            updateDeviceList([]);
-
-            // optional: only if connected
-            if (socket?.connected) {
-                try { socket.emit('request_device_list'); } catch { }
-            }
+            // ✅ refresh list so it stops filtering to a stale pair
+            if (lastDeviceList) updateDeviceList(lastDeviceList);
         }
     });
-
-
 }
 
 // ---------------- Clickable status pill: Connect/Disconnect ----------------
@@ -1480,27 +1471,15 @@ function updateDeviceList(devices) {
     deviceListElement.innerHTML = '';
 
     const myId = XR_ID;
-
-    // ✅ Auto-heal pairedPeerId from device_list when in a room
-    if (currentRoom) {
-        const myNorm = normalizeId(myId);
-        const others = devices
-            .map(d => normalizeId(d?.xrId))
-            .filter(id => id && id !== myNorm);
-
-        if (others.length === 1) {
-            const guessedPeer = others[0];
-            if (!pairedPeerId || normalizeId(pairedPeerId) !== guessedPeer) {
-                pairedPeerId = guessedPeer;
-                console.log('[PAIR] auto-heal pairedPeerId ->', pairedPeerId);
-            }
-        }
-    }
-
     const peerId = pairedPeerId;
 
-    // Restrict only after room_joined + peer known
-    const wantOnlyPair = !!(currentRoom && peerId);
+    // ✅ Always restrict visibility:
+    // - before pairing: show only self
+    // - after pairing: show only self + paired peer
+    const wantOnlyPair = !!(currentRoom && peerId); // ✅ only restrict after room_joined
+
+
+
     const allowed = new Set([normalizeId(myId), normalizeId(peerId)].filter(Boolean));
 
     let peerOnline = false;
@@ -1509,6 +1488,7 @@ function updateDeviceList(devices) {
     devices.forEach((device) => {
         const devIdNorm = normalizeId(device?.xrId);
 
+        // ✅ Filter: if paired (room exists), ignore any device not in the pair
         if (wantOnlyPair && !allowed.has(devIdNorm)) return;
 
         const isSelfId = devIdNorm === normalizeId(myId);
@@ -1531,16 +1511,17 @@ function updateDeviceList(devices) {
         }
     });
 
+    // Duplicate-tab notice if same XR ID is observed more than once
     if (sameIdCount > 1 && !duplicateNotified) {
         addSystemMessage('⚠️ This XR ID is active in another tab/window. Only one desktop should use the same XR ID.');
         duplicateNotified = true;
     }
 
+    // Keep your existing log
     if (peerId && !peerOnline) {
         console.log(`[PAIR] Peer (${peerId}) is not online yet — waiting`);
     }
 }
-
 
 
 function sendMessage() {
