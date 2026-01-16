@@ -133,9 +133,6 @@ let duplicateLock = false; // 🔒 prevents reconnect loops once server says ID 
 let handlingOffer = false;          // prevent overlapping handleOffer() runs
 let lastRemoteOfferSdp = '';        // drop duplicate re-sent offers
 
-// ✅ OPTIMAL FIX: Debounce timer for zero-flicker 1-to-1 pairing (works for n pairs simultaneously)
-let pendingDeviceListRender = null;  // debounce timer per room
-
 
 // --- Desktop network telemetry (renderer) ---
 let dockTelTimer = null;
@@ -712,49 +709,7 @@ function initSocket() {
     // --- your existing handlers ---
     socket.on('signal', handleSignalMessage);
     socket.on('message', handleChatMessage);
-    socket.on('device_list', (devices) => {
-        // ✅ REAL-TIME: Update device list immediately with no delay
-        // No debounce - instant updates when XR devices connect
-        
-        if (!Array.isArray(devices)) {
-            console.log('[DEVICES] Invalid device_list (not array); ignoring');
-            return;
-        }
-
-        const myNorm = normalizeId(XR_ID);
-        const peerNorm = normalizeId(pairedPeerId);
-        const deviceNorms = devices.map(d => normalizeId(d?.xrId)).filter(Boolean);
-        
-        const hasMe = myNorm && deviceNorms.includes(myNorm);
-        const hasPeer = peerNorm && deviceNorms.includes(peerNorm);
-
-        // Case 1: Not paired - render immediately
-        if (!currentRoom) {
-            console.log('[DEVICES] Not paired; rendering immediately (NO DELAY)');
-            clearTimeout(pendingDeviceListRender);
-            updateDeviceList(devices);
-            return;
-        }
-
-        // Case 2: Paired mode (1-to-1) - validate BOTH devices before rendering
-        if (peerNorm && hasMe && hasPeer) {
-            // ✅ BOTH CONFIRMED - render immediately with NO debounce for instant updates
-            console.log('[DEVICES] ✅ Both devices confirmed; rendering immediately (NO DELAY)');
-            
-            clearTimeout(pendingDeviceListRender);
-            pendingDeviceListRender = null;
-            updateDeviceList(devices);
-        } else if (!peerNorm) {
-            // Peer not yet known - too early
-            console.log('[DEVICES] ⏸️ Peer not yet extracted from room_joined; waiting for stability');
-        } else if (!hasMe) {
-            // Missing local device - invalid
-            console.log('[DEVICES] ⏸️ Missing local device; blocking incomplete render');
-        } else {
-            // Missing peer - transient incomplete state
-            console.log('[DEVICES] ⏸️ Missing peer (1-device snapshot); blocking to prevent flicker');
-        }
-    });
+    socket.on('device_list', updateDeviceList);
     socket.on('control', handleControlCommand);
     socket.on('message-cleared', handleMessagesCleared);
     socket.on('message_history', handleMessageHistory);
@@ -781,6 +736,11 @@ function initSocket() {
             pairedPeerId = other || pairedPeerId || null;
             console.log('[PAIR] pairedPeerId =', pairedPeerId);
 
+            // ✅ Ask server for authoritative room-scoped list
+            try { socket?.emit('request_device_list'); } catch (e) {
+                console.warn('[DEVICES] request_device_list failed:', e);
+            }
+
         } catch (e) {
             console.warn('[PAIR] failed to derive pairedPeerId:', e);
             pairedPeerId = null;
@@ -790,13 +750,11 @@ function initSocket() {
         const memList = Array.isArray(members) ? members.join(', ') : '';
         addSystemMessage(`🎯 VR Room created: ${roomId}.${memList ? ` Members: ${memList}` : ''}`);
 
-        // ✅ pairing complete = connected (AFTER room established)
-        setStatus('Connected');
+        // 4) Clear UI immediately; device_list will repaint shortly
+        updateDeviceList([]);
 
-        // 4) Request device_list with grace period 
-        // ✅ OPTIMAL: Always request after grace period - server consolidation ensures both devices present
-        // Device list will be requested after roomReady event fires (server-guaranteed both present)
-        // This replaces timing-dependent grace period with server-confirmed state
+        // ✅ pairing complete = connected (AFTER room + request + UI clear)
+        setStatus('Connected');
 
         // ---- WebRTC flush unchanged ----
         if (pendingLocalAnswer && socket?.connected) {
@@ -832,20 +790,6 @@ function initSocket() {
 
         if (startWasDeferred) {
             try { socket?.emit('signal', { type: 'request_offer', from: XR_ID, roomId: currentRoom }); } catch { }
-        }
-    });
-
-    // ✅ OPTIMAL: roomReady event - server emits when both devices confirmed in room
-    // This eliminates timing-based grace period; server GUARANTEES room is ready
-    socket.on('roomReady', ({ roomId, members }) => {
-        console.log('[PAIR] ✅ roomReady event - both devices confirmed by server', { roomId, members });
-        
-        // Now safely request device_list - server GUARANTEES both devices present
-        try {
-            console.log('[DEVICES] Requesting device list (roomReady confirmed by server)');
-            socket?.emit('request_device_list');
-        } catch (e) {
-            console.warn('[DEVICES] roomReady: request_device_list failed:', e);
         }
     });
 
