@@ -281,16 +281,27 @@ function requestDeviceListThrottled(why) {
 let _lastDeviceListSig = null;
 
 
-function updateConnectionStatus(src = '') {
+function updateConnectionStatus(src = '', devices = []) {
   const connected = !!(socket && socket.connected);
+  const count = Array.isArray(devices) ? devices.length : 0;
+
+  // If socket itself is disconnected → always red
+  if (!connected) {
+    console.log('[COCKPIT][STATUS]', { src, connected, count, status: 'Disconnected' });
+    setStatus('Disconnected');
+    return;
+  }
+
+  // XR Vision Dock logic
   const status =
-    !connected ? 'Disconnected' :
-      !currentRoom ? 'Connecting' :
+    count === 0 ? 'Disconnected' :
+      count === 1 ? 'Connecting' :
         'Connected';
 
-  console.log('[COCKPIT][STATUS]', { src, connected, currentRoom, status });
+  console.log('[COCKPIT][STATUS]', { src, connected, count, status });
   setStatus(status);
 }
+
 
 // ==========================
 function showNoDevices() {
@@ -315,7 +326,7 @@ function updateDeviceList(devices) {
   // 🔥 Always clear first (prevents stale XR-8005)
   deviceListEl.innerHTML = '';
 
-  // ✅ Empty is allowed (cockpit may be unpaired or joining). Render it, but never drive status by count.
+  // ✅ XR Vision Dock status rule: based on device_list count (0=red, 1=yellow, 2+=green)
   if (devices.length === 0) {
     showNoDevices();
   } else {
@@ -329,13 +340,14 @@ function updateDeviceList(devices) {
     });
   }
 
-  // ✅ Status rule: socket + room only (never device count)
+  // ✅ XR Vision Dock status rule: based on device_list count (0=red, 1=yellow, 2+=green)
   console.log('[COCKPIT][DEVICES] render', {
     count: devices.length,
     xrIds: devices.map(d => d?.xrId).filter(Boolean),
     currentRoom
   });
-  updateConnectionStatus('device_list');
+  updateConnectionStatus('device_list', devices);
+
 
 }
 
