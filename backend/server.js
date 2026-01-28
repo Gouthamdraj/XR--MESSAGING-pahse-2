@@ -192,9 +192,15 @@ if (IS_PROD && process.env.REDIS_URL) {
       console.log('[SOCKET.IO][REDIS] adapter attached (multi-instance room sync ON)');
     })
     .catch((err) => {
-      console.error('[SOCKET.IO][REDIS] adapter connect failed (continuing WITHOUT adapter):', err?.message || err);
-      // NOTE: continuing keeps existing functionality, but multi-instance device_list will remain inconsistent.
+      console.error(
+        '[SOCKET.IO][REDIS] adapter connect failed — exiting (prod requires Redis adapter):',
+        err?.message || err
+      );
+
+      // ❌ Do NOT allow server to run without adapter in prod
+      process.exit(1);
     });
+
 } else {
   console.log('[SOCKET.IO][REDIS] adapter not enabled (dev or missing REDIS_URL)');
 }
@@ -526,8 +532,10 @@ async function getClientSocketByXrIdCI_Cluster(XR, debugSocket = null) {
     const found = sockets.find(s =>
       typeof s.data?.xrId === 'string' &&
       normXr(s.data.xrId) === wanted &&
-      s.data?.clientType !== 'cockpit'
+      s.data?.clientType !== 'cockpit' &&
+      s.data?.clientType !== 'dashboard'
     ) || null;
+
 
     if (debugSocket) {
       dbgToSocket(debugSocket, "[COCKPIT][FIND_PRIMARY] result", {
@@ -554,6 +562,36 @@ async function getClientSocketByXrIdCI_Cluster(XR, debugSocket = null) {
     return null;
   }
 }
+
+// Notify any cockpit viewers watching this XR (even when not paired yet).
+async function notifyCockpitsWatchingXr(XR, payloadDevices) {
+  try {
+    const wanted = normXr(XR);
+    if (!wanted) return;
+
+    // Needs Redis adapter to be truly cluster-wide in prod.
+    const sockets = await io.fetchSockets();
+
+    const watchers = sockets.filter(s =>
+      s?.data?.clientType === 'cockpit' &&
+      normXr(s.data?.cockpitForXrId) === wanted &&
+      !s.data?.roomId // only push when they are NOT in a pair room yet
+    );
+
+    for (const w of watchers) {
+      try {
+        // Keep cockpit unpaired state consistent
+        w.emit('room_joined', { roomId: null, reason: 'watch_update' });
+        w.emit('device_list', Array.isArray(payloadDevices) ? payloadDevices : []);
+      } catch { }
+    }
+
+    dlog('[COCKPIT][WATCH_NOTIFY] pushed', { wanted, watchers: watchers.length, count: payloadDevices?.length || 0 });
+  } catch (e) {
+    dwarn('[COCKPIT][WATCH_NOTIFY] failed', { XR, err: e?.message || e });
+  }
+}
+
 
 // Helper: clear pairing on disconnect (we will call this in disconnect later)
 function clearPairByXrId(xrId) {
@@ -4132,6 +4170,21 @@ io.on('connection', (socket) => {
   socket.on('identify', async ({ deviceName, xrId, clientType }) => {
     dlog('[EVENT] identify', { deviceName, xrId, clientType });
 
+    // ✅ NEW: XR Hub Dashboard (view-only)
+    if (clientType === 'dashboard') {
+      socket.data.clientType = 'dashboard';
+      socket.data.deviceName = deviceName || 'XR Hub Dashboard';
+      socket.data.connectedAt = Date.now();
+
+      // Do NOT set socket.data.xrId
+      // Do NOT touch owner locks
+      // Do NOT add to clients/onlineDevices
+      socket.emit('dashboard_ready', { ok: true });
+      dlog('[DASHBOARD][IDENTIFY] viewer socket ready', { socketId: socket.id });
+
+      return; // IMPORTANT: prevent running XR-device logic
+    }
+
     // Validate
     if (!xrId || typeof xrId !== 'string') {
       dwarn('[IDENTIFY] missing/invalid xrId');
@@ -4339,6 +4392,25 @@ io.on('connection', (socket) => {
     } catch (e) {
       derr('[identify] self device_list error:', e.message);
     }
+    // ✅ NEW: push single-device list to any cockpit watching this XR (prod cold-start fix)
+    try {
+      const b = batteryByDevice?.get(XR) || {};
+      const t = telemetryByDevice?.get(XR) || null;
+
+      await notifyCockpitsWatchingXr(XR, [{
+        xrId: XR,
+        deviceName: socket.data?.deviceName || 'Unknown',
+        battery: (typeof b.pct === 'number') ? b.pct : null,
+        charging: !!b.charging,
+        batteryTs: b.ts || null,
+        ...(t ? { telemetry: t } : {}),
+      }]);
+    } catch (e) {
+      // never break identify flow
+      dwarn('[COCKPIT][WATCH_NOTIFY] failed (ignored)', { XR, err: e?.message || e });
+    }
+
+
 
 
     try {
@@ -4369,6 +4441,30 @@ io.on('connection', (socket) => {
   socket.on('metrics_unsubscribe', ({ xrId }) => {
     if (!xrId) return;
     socket.leave(`metrics:${xrId}`);
+  });
+  socket.on('dashboard_subscribe_pairs', async ({ rooms }) => {
+    if (socket.data?.clientType !== 'dashboard') return;
+
+    const safeRooms = (Array.isArray(rooms) ? rooms : [])
+      .filter(r => typeof r === 'string')
+      .filter(r => r.startsWith('pair:') && r.split(':').length === 3)
+      .slice(0, 500);
+
+    for (const roomId of safeRooms) {
+      try { await socket.join(roomId); } catch { }
+    }
+
+    // send initial device_list per room so UI updates instantly
+    for (const roomId of safeRooms) {
+      try {
+        const dl = await buildDeviceListForRoom(roomId);
+        socket.emit('device_list', Array.isArray(dl) ? dl : []);
+      } catch {
+        socket.emit('device_list', []);
+      }
+    }
+
+    dlog('[DASHBOARD] subscribed rooms', { socketId: socket.id, count: safeRooms.length });
   });
 
 
@@ -5033,7 +5129,7 @@ io.on('connection', (socket) => {
   // ✅ IMPORTANT: disconnecting runs before Socket.IO removes the socket from rooms.
   // We use it ONLY to notify the peer. Never emit device_list here.
   socket.on('disconnecting', (reason) => {
-    if (socket.data?.clientType === 'cockpit') return;
+    if (socket.data?.clientType === 'cockpit' || socket.data?.clientType === 'dashboard') return;
     try {
       const xrId = normXr(socket.data?.xrId);
 
@@ -5061,7 +5157,7 @@ io.on('connection', (socket) => {
 
 
   socket.on('disconnect', async (reason) => {
-    if (socket.data?.clientType === 'cockpit') return;
+    if (socket.data?.clientType === 'cockpit' || socket.data?.clientType === 'dashboard') return;
     dlog('❎ [EVENT] disconnect', {
       reason,
       xrId: socket.data?.xrId,
@@ -5110,6 +5206,14 @@ io.on('connection', (socket) => {
         // Remove from your in-memory maps (done after partner cleanup)
         clients.delete(xrId);
         onlineDevices.delete(xrId);
+
+        // ✅ NEW: If any cockpit is watching this XR (and not yet in a pair room),
+        // push empty list so UI goes red immediately (prod consistency).
+        try {
+          await notifyCockpitsWatchingXr(xrId, []);
+        } catch (e) {
+          dwarn('[COCKPIT][WATCH_NOTIFY] disconnect push failed (ignored)', { xrId, err: e?.message || e });
+        }
 
         if (desktopClients.get(xrId) === socket) {
           desktopClients.delete(xrId);
