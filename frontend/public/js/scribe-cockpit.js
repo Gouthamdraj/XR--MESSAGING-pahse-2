@@ -1,3 +1,21 @@
+// ============================================================================
+// SCRIBE COCKPIT (WebSocket-only) — FULL UPDATED FILE
+// - NO BroadcastChannel / mirroring (websocket only)
+// - Room-scoped persistence + strict room isolation for transcript/SOAP
+// - Device status pill logic (2+ Connected / 1 Connecting / 0 Disconnected)
+// - Accurate device list without refresh (watchdog poll + tab focus refresh)
+// - Transcript rendering only for the active room; clears UI on room switch
+// - SOAP default note binds to correct transcript via FIFO queue
+// - Timer UI for BOTH:
+//    (A) default SOAP generation (from transcript -> soap_note_console)
+//    (B) template-generated note (/api/notes/generate)
+// - Incremental edit tracking + persistence per section
+// - Medication availability inline emojis + persistence; API called only on med box edit
+// - EHR sidebar logic preserved (separate escapeHtml helper)
+// ============================================================================
+
+console.log('[SCRIBE] Booting Scribe Cockpit (WebSocket-only + room isolation + timers + templates + edit tracking)');
+
 // ====
 // DOM elements
 // ====
@@ -27,19 +45,19 @@ const PLACEHOLDER_ID = 'scribe-transcript-placeholder';
 const MAX_TRANSCRIPT_LINES = 300;
 
 /**
- * ROOM-SCOPED STORAGE (from scribe.js)
- * - When currentRoom is set (room_joined), all transcript/SOAP state is isolated per room.
- * - When not paired (currentRoom = null), we fall back to legacy keys to preserve existing behavior.
+ * ROOM-SCOPED STORAGE
+ * - When currentRoom is set (room_joined), transcript/SOAP state is isolated per room.
+ * - When not paired (currentRoom = null), we fall back to legacy keys to preserve behavior.
  */
-let currentRoom = null; // cockpit view-only room, set from room_joined
-let COCKPIT_FOR_XR_ID = null; // client-known xrId (from /api/platform/me)
+let currentRoom = null;              // set from room_joined
+let COCKPIT_FOR_XR_ID = null;         // from /api/platform/me
 
 function roomLS(base) {
   const r = currentRoom || '__noroom__';
   return `scribe:${r}:${base}`;
 }
 
-// Legacy (your existing working cockpit keys)
+// Legacy keys (pre-room)
 const LEGACY_KEYS = {
   HISTORY: 'scribe.history',
   LATEST_SOAP: 'scribe.latestSoap',
@@ -49,12 +67,12 @@ const LEGACY_KEYS = {
 
 const LS_KEYS = {
   HISTORY: () => (currentRoom ? roomLS('history') : LEGACY_KEYS.HISTORY),
-  LATEST_SOAP: () => (currentRoom ? roomLS('latestSoap') : LEGACY_KEYS.LATEST_SOAP), // kept for backward compatibility
+  LATEST_SOAP: () => (currentRoom ? roomLS('latestSoap') : LEGACY_KEYS.LATEST_SOAP),
   ACTIVE_ITEM_ID: () => (currentRoom ? roomLS('activeItem') : LEGACY_KEYS.ACTIVE_ITEM_ID),
   MED_AVAIL: () => (currentRoom ? roomLS('medAvailability') : LEGACY_KEYS.MED_AVAIL),
 };
 
-// Rename per your request
+// Endpoints
 const local = 'http://localhost:8080';
 const production = 'https://xr-messaging-geexbheshbghhab7.centralindia-01.azurewebsites.net';
 
@@ -80,45 +98,27 @@ let SERVER_URL = null;
 let socket = null;
 
 // UI state
-let latestSoapNote = {}; // currently displayed note (default/template for active transcript)
-const transcriptState = { byKey: {} };
+let latestSoapNote = {};                      // currently rendered note
+const transcriptState = { byKey: {} };        // partial merge per (from->to)
+let currentActiveItemId = null;
+
+// SOAP generation timer (DEFAULT: transcript -> soap_note_console)
+let soapGenerating = false;
 let soapNoteTimer = null;
 let soapNoteStartTime = null;
-let currentActiveItemId = null;
-let soapGenerating = false;
 
-// Tracks which transcript item the next incoming soap_note_console belongs to
-let pendingSoapItemId = null;
+// FIFO binding: each transcript item appended -> push its id
+const pendingSoapItemQueue = [];
 
 // Total edits badge element
 let totalEditsBadgeEl = null;
 
 // Per-textarea incremental state (runtime), persisted into note._editMeta
-const editStateMap = new WeakMap();
-/*
-  For each <textarea>:
-  {
-    ann: Array<{ch: string, tag: 'B'|'U'}>,
-    ins: number,
-    del: number
-  }
-*/
+const editStateMap = new WeakMap(); /* { ann: Array<{ch,tag}>, ins, del } */
 
-// ====
-// BroadcastChannels (optional multi-tab sync)
-// ====
-let transcriptBC = null;
-let soapBC = null;
-try {
-  transcriptBC = new BroadcastChannel('scribe-transcript');
-  soapBC = new BroadcastChannel('scribe-soap-note');
-} catch (e) {
-  console.warn('[SCRIBE] BroadcastChannel unavailable:', e);
-}
-
-// ====
+// ============================================================================
 // localStorage helpers
-// ====
+// ============================================================================
 function lsSafeParse(key, fallback) {
   try {
     const raw = localStorage.getItem(key);
@@ -127,6 +127,7 @@ function lsSafeParse(key, fallback) {
     return fallback;
   }
 }
+
 function saveHistory(arr) {
   localStorage.setItem(LS_KEYS.HISTORY(), JSON.stringify(arr || []));
 }
@@ -149,55 +150,56 @@ function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-// ====
-// UI Styles (dropdown + readability)
-// ====
+// ============================================================================
+// UI Styles (dropdown + SOAP panel readability) — preserved from your update
+// ============================================================================
 function ensureUiStyles() {
   if (document.getElementById('scribe-ui-css')) return;
 
-  // Match your screen (dark navy main background + slightly lighter input box)
-  const MAIN_BG = '#0b1220';   // main screen bg (heading bar should match this)
-  const BOX_BG  = '#111827';   // soap note box background (textarea + section body)
-  const TEXT    = '#e5e7eb';   // primary text
-  const MUTED   = '#94a3b8';   // secondary text
-  const BORDER  = 'rgba(148,163,184,0.25)';
+  const MAIN_BG = '#0b1220';
+  const BOX_BG = '#111827';
+  const TEXT = '#e5e7eb';
+  const MUTED = '#94a3b8';
+  const BORDER = 'rgba(148,163,184,0.25)';
 
   const s = document.createElement('style');
   s.id = 'scribe-ui-css';
   s.textContent = `
-    /* Template dropdown requested styling */
     #templateSelect {
-      background: #111827 !important;
-      color: #ffff !important;
-      border: 1px solid rgba(255,255,255,0.25) !important;
+      background: #0f1724 !important;
+      color: #ffffff !important;
+      border: 1px solid rgba(255,255,255,0.12) !important;
       border-radius: 8px;
-      padding: 6px 10px;
+      padding: 8px 10px;
       outline: none;
+      width: 320px;
+      max-width: 48vw;
+      min-width: 220px;
+      box-sizing: border-box;
+      font-size: 14px;
+      appearance: auto;
     }
-    #templateSelect:hover {
-      background: rgba(55, 65, 81, 0.75) !important; /* grey hover */
-    }
-    #templateSelect:focus {
-      box-shadow: 0 0 0 2px rgba(96,165,250,0.55);
-    }
-    #templateSelect option {
-      background: ${MAIN_BG} !important;
-      color: #ffff !important;
-    }
+    #templateSelect:hover { background: rgba(55, 65, 81, 0.75) !important; }
+    #templateSelect:focus { box-shadow: 0 0 0 2px rgba(96,165,250,0.35); }
+    #templateSelect option { background: ${MAIN_BG} !important; color: #fff !important; padding: 6px 10px; }
 
-    /* SOAP NOTE PANEL: only adjust the SOAP box theme (dark like your screenshot) */
-    #soapNotePanel, #soapScroller {
-      background: ${MAIN_BG} !important;
-      color: ${TEXT} !important;
+    select::-webkit-scrollbar, .scribe-soap-scroll::-webkit-scrollbar, .med-overlay::-webkit-scrollbar { width: 10px; height: 10px; }
+    select::-webkit-scrollbar-thumb, .scribe-soap-scroll::-webkit-scrollbar-thumb, .med-overlay::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,0.08); border-radius: 8px; border: 2px solid rgba(0,0,0,0.0);
     }
+    select::-webkit-scrollbar-track, .scribe-soap-scroll::-webkit-scrollbar-track, .med-overlay::-webkit-scrollbar-track {
+      background: transparent; border-radius: 8px;
+    }
+    select { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.08) transparent; }
 
+    #soapNotePanel, #soapScroller { background: ${MAIN_BG} !important; color: ${TEXT} !important; }
     .scribe-soap-scroll {
       padding: 10px 12px;
       height: 100%;
       overflow: auto;
       background: ${MAIN_BG} !important;
+      border-radius: 6px;
     }
-
     .scribe-section {
       margin: 10px 0;
       border: 1px solid ${BORDER};
@@ -205,8 +207,6 @@ function ensureUiStyles() {
       overflow: hidden;
       background: ${BOX_BG} !important;
     }
-
-    /* Heading bar should match main screen bg */
     .scribe-section-head {
       display: flex;
       align-items: center;
@@ -217,20 +217,8 @@ function ensureUiStyles() {
       color: ${TEXT} !important;
       border-bottom: 1px solid ${BORDER};
     }
-
-    .scribe-section-head h3 {
-      margin: 0;
-      font-size: 14px;
-      font-weight: 700;
-      color: ${TEXT} !important;
-    }
-
-    .scribe-section-meta {
-      font-size: 12px;
-      color: ${MUTED} !important;
-      white-space: nowrap;
-      opacity: 0.95;
-    }
+    .scribe-section-head h3 { margin: 0; font-size: 14px; font-weight: 700; color: ${TEXT} !important; }
+    .scribe-section-meta { font-size: 12px; color: ${MUTED} !important; white-space: nowrap; opacity: 0.95; }
 
     .scribe-textarea {
       width: 100%;
@@ -239,250 +227,93 @@ function ensureUiStyles() {
       border: none;
       outline: none;
       resize: none;
-      background: ${BOX_BG} !important; /* FIX: was ##111827 */
-      color: ${TEXT} !important;        /* FIX: was #ffff */
+      background: ${BOX_BG} !important;
+      color: ${TEXT} !important;
       font-size: 14px;
       line-height: 1.45;
       min-height: 80px;
+    }
+
+    .scribe-heading-flex { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    ._scribe_total_edits {
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:6px 10px;
+      border-radius:999px;
+      background: rgba(255,255,255,0.08);
+      color: ${TEXT};
+      font-weight: 700;
+      font-size: 12px;
+      white-space: nowrap;
     }
   `;
   document.head.appendChild(s);
 }
 
-// ====
-// Per-transcript template workflow (MAIN CHANGE)
-// ====
-/**
- * Each transcript item stores:
- * item.notes = { default: noteObj|null, templates: { [templateId]: noteObj } }
- * item.activeTemplateId = 'default' | '<id>'
- *
- * Selecting a template ONLY affects the active transcript item.
- */
-function normalizeHistoryItems(hist) {
-  let changed = false;
-
-  for (const item of hist) {
-    // Backward compatibility:
-    // old code may have: item.soap (single note)
-    // treat it as default note
-    if (!item.notes) {
-      item.notes = { default: null, templates: {} };
-      changed = true;
-    }
-    if (item.soap && !item.notes.default) {
-      item.notes.default = item.soap;
-      delete item.soap;
-      changed = true;
-    }
-    if (!item.notes.templates) {
-      item.notes.templates = {};
-      changed = true;
-    }
-    if (!item.activeTemplateId) {
-      item.activeTemplateId = 'default';
-      changed = true;
-    }
-  }
-
-  if (changed) saveHistory(hist);
-  return hist;
-}
-
-function getActiveHistoryContext() {
-  const hist = normalizeHistoryItems(loadHistory());
-  const activeId = loadActiveItemId();
-  const idx = activeId ? hist.findIndex(x => x.id === activeId) : -1;
-  const i = idx !== -1 ? idx : (hist.length ? hist.length - 1 : -1);
-  return { hist, index: i, item: i !== -1 ? hist[i] : null };
-}
-
-function getNoteForItem(item) {
-  if (!item) return {};
-  const t = String(item.activeTemplateId || 'default');
-  if (t === 'default') return item.notes?.default || {};
-  return item.notes?.templates?.[t] || item.notes?.default || {};
-}
-
-function setTemplateSelectValue(value) {
-  if (!templateSelectEl) return;
-  const v = String(value ?? 'default');
-  const has = Array.from(templateSelectEl.options || []).some(o => o.value === v);
-  templateSelectEl.value = has ? v : 'default';
-}
-
-function syncDropdownToActiveTranscript() {
-  if (!templateSelectEl) return;
-  const { item } = getActiveHistoryContext();
-  setTemplateSelectValue(item?.activeTemplateId || 'default');
-}
-
-async function applyTemplateToActiveTranscript(newTemplateId) {
-  if (!SERVER_URL) return;
-  const templateId = String(newTemplateId || 'default');
-
-  const ctx = getActiveHistoryContext();
-  if (!ctx.item) return;
-
-  const item = ctx.item;
-  item.activeTemplateId = templateId;
-
-  // Save now (so switching transcripts remembers selection)
-  saveHistory(ctx.hist);
-  saveActiveItemId(item.id);
-
-  // If default: show default note only
-  if (templateId === 'default') {
-    latestSoapNote = item.notes?.default || {};
-    saveLatestSoap(latestSoapNote);
-    soapGenerating = false;
-    renderSoapNote(latestSoapNote);
-    return;
-  }
-
-  // If already generated for this template, reuse it
-  if (item.notes?.templates?.[templateId]) {
-    latestSoapNote = item.notes.templates[templateId];
-    saveLatestSoap(latestSoapNote);
-    soapGenerating = false;
-    renderSoapNote(latestSoapNote);
-    return;
-  }
-
-  // Generate template note for THIS transcript only
-  const transcript = String(item.text || '').trim();
-  if (!transcript) {
-    latestSoapNote = item.notes?.default || {};
-    renderSoapNote(latestSoapNote);
-    return;
-  }
-
-  if (soapNoteTimer) { clearInterval(soapNoteTimer); soapNoteTimer = null; }
-
-  soapGenerating = true;
-  renderSoapNoteGenerating(0);
-
-  try {
-    const resp = await fetch(`${SERVER_URL}/api/notes/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ transcript, templateId }),
-    });
-
-    if (!resp.ok) {
-      console.warn('[TEMPLATE] /api/notes/generate failed:', resp.status);
-      soapGenerating = false;
-      latestSoapNote = getNoteForItem(item);
-      renderSoapNote(latestSoapNote);
-      return;
-    }
-
-    const data = await resp.json();
-    const note = data.note || {};
-
-    // New AI baseline -> reset counters for this newly generated note
-    initializeEditMetaForSoap(note);
-
-    // Store ONLY on this transcript item
-    item.notes = item.notes || { default: null, templates: {} };
-    item.notes.templates = item.notes.templates || {};
-    item.notes.templates[templateId] = note;
-
-    // Persist history
-    ctx.hist[ctx.index] = item;
-    saveHistory(ctx.hist);
-
-    latestSoapNote = note;
-    saveLatestSoap(latestSoapNote);
-
-    soapGenerating = false;
-    renderSoapNote(latestSoapNote);
-  } catch (e) {
-    console.warn('[TEMPLATE] regenerate error', e);
-    soapGenerating = false;
-    latestSoapNote = getNoteForItem(item);
-    renderSoapNote(latestSoapNote);
-  }
-}
-
-// ====
-// Templates dropdown population
-// ====
-async function initTemplateDropdown() {
-  if (!templateSelectEl || !SERVER_URL) return;
-
-  templateSelectEl.innerHTML = '';
-
-  const optDefault = document.createElement('option');
-  optDefault.value = 'default';
-  optDefault.textContent = 'SOAP Note';
-  templateSelectEl.appendChild(optDefault);
-
-  try {
-    const resp = await fetch(`${SERVER_URL}/api/templates`);
-    if (resp.ok) {
-      const data = await resp.json();
-      const templates = data.templates || [];
-      templates.forEach(t => {
-        const opt = document.createElement('option');
-        opt.value = String(t.id);
-        opt.textContent = t.name || t.short_name || `Template ${t.id}`;
-        templateSelectEl.appendChild(opt);
-      });
-    } else {
-      console.warn('[TEMPLATE] /api/templates failed:', resp.status);
-    }
-  } catch (e) {
-    console.warn('[TEMPLATE] template fetch error', e);
-  }
-
-  // Set dropdown to the ACTIVE transcript's selection
-  syncDropdownToActiveTranscript();
-
-  templateSelectEl.onchange = () => {
-    applyTemplateToActiveTranscript(templateSelectEl.value || 'default');
-  };
-}
-
-// ====
+// ============================================================================
 // Status pill
-// ====
+// ============================================================================
 function setStatus(status) {
   if (!statusPill) return;
   statusPill.textContent = status;
   statusPill.setAttribute('aria-label', `Connection status: ${status}`);
+
   statusPill.classList.remove('bg-yellow-500', 'bg-green-500', 'bg-red-600');
   switch ((status || '').toLowerCase()) {
-    case 'connected': statusPill.classList.add('bg-green-500'); break;
-    case 'disconnected': statusPill.classList.add('bg-red-600'); break;
-    default: statusPill.classList.add('bg-yellow-500');
+    case 'connected':
+      statusPill.classList.add('bg-green-500');
+      break;
+    case 'disconnected':
+      statusPill.classList.add('bg-red-600');
+      break;
+    default:
+      statusPill.classList.add('bg-yellow-500');
   }
 }
 
-// ====
-// Devices list + device-aware status  (UPDATED: room/connection logic from scribe.js)
-// ====
+/**
+ * DEVICE STATUS PILL LOGIC (strict)
+ * - 2+ devices => Connected (green)
+ * - 1 device => Connecting (yellow)
+ * - 0 devices => Disconnected (red)
+ * Note: if socket disconnected, always Disconnected.
+ */
+function updateConnectionStatus(src = '', devices = []) {
+  const connected = !!(socket && socket.connected);
+  const count = Array.isArray(devices) ? devices.length : 0;
 
-// --- cockpit request_device_list throttling (prevents server log "shake") ---
+  if (!connected) {
+    console.log('[COCKPIT][STATUS]', { src, connected, count, status: 'Disconnected' });
+    setStatus('Disconnected');
+    return;
+  }
+
+  const status = count === 0 ? 'Disconnected' : count === 1 ? 'Connecting' : 'Connected';
+  console.log('[COCKPIT][STATUS]', { src, connected, count, status, currentRoom });
+  setStatus(status);
+}
+
+// ============================================================================
+// Devices list + watchdog poll (no refresh needed)
+// ============================================================================
 let _reqListTimer = null;
 let _lastReqListAt = 0;
+let _deviceListPollTimer = null;
 
 function requestDeviceListThrottled(why) {
   const now = Date.now();
-
-  // If we’re not in a room yet, throttle harder (pairing phase)
   const minGapMs = currentRoom ? 250 : 1200;
 
   if (now - _lastReqListAt < minGapMs) {
     console.debug('[COCKPIT][REQ_LIST] throttled', { why, currentRoom, sinceMs: now - _lastReqListAt });
     return;
   }
-
   if (_reqListTimer) return;
+
   _reqListTimer = setTimeout(() => {
     _reqListTimer = null;
     _lastReqListAt = Date.now();
-
     if (!socket?.connected) return;
     try {
       socket.emit('request_device_list');
@@ -493,26 +324,26 @@ function requestDeviceListThrottled(why) {
   }, 50);
 }
 
-function updateConnectionStatus(src = '', devices = []) {
-  const connected = !!(socket && socket.connected);
-  const count = Array.isArray(devices) ? devices.length : 0;
-
-  // If socket itself is disconnected → always red
-  if (!connected) {
-    console.log('[COCKPIT][STATUS]', { src, connected, count, status: 'Disconnected' });
-    setStatus('Disconnected');
-    return;
-  }
-
-  // XR Vision Dock logic: based on device_list count
-  const status =
-    count === 0 ? 'Disconnected' :
-    count === 1 ? 'Connecting' :
-    'Connected';
-
-  console.log('[COCKPIT][STATUS]', { src, connected, count, status, currentRoom });
-  setStatus(status);
+function startDeviceListWatchdog() {
+  stopDeviceListWatchdog();
+  _deviceListPollTimer = setInterval(() => {
+    if (!socket?.connected) return;
+    if (document.visibilityState === 'hidden') return;
+    requestDeviceListThrottled('watchdog_poll');
+  }, 1500);
 }
+function stopDeviceListWatchdog() {
+  if (_deviceListPollTimer) {
+    clearInterval(_deviceListPollTimer);
+    _deviceListPollTimer = null;
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    requestDeviceListThrottled('tab_visible');
+  }
+});
 
 function showNoDevices() {
   if (!deviceListEl) return;
@@ -523,31 +354,31 @@ function showNoDevices() {
   deviceListEl.appendChild(li);
 }
 
-/**
- * - 2+ devices  -> Connected
- * - 1 device    -> Connecting
- * - 0 devices   -> Disconnected
- */
 function updateDeviceList(devices) {
   if (!Array.isArray(devices)) devices = [];
   if (!deviceListEl) return;
 
   deviceListEl.innerHTML = '';
+  if (devices.length === 0) {
+    showNoDevices();
+    updateConnectionStatus('device_list', devices);
+    return;
+  }
+
   devices.forEach(d => {
-    const name = d.deviceName || d.name || (d.xrId ? `Device (${d.xrId})` : 'Unknown');
+    const name = d?.deviceName || d?.name || (d?.xrId ? `Device (${d.xrId})` : 'Unknown');
     const li = document.createElement('li');
     li.className = 'text-gray-300';
-    li.textContent = d.xrId ? `${name} (${d.xrId})` : name;
+    li.textContent = d?.xrId ? `${name} (${d.xrId})` : name;
     deviceListEl.appendChild(li);
   });
-  if (devices.length === 0) showNoDevices();
 
   updateConnectionStatus('device_list', devices);
 }
 
-// ====
+// ============================================================================
 // Transcript helpers
-// ====
+// ============================================================================
 function transcriptKey(from, to) {
   return `${from || 'unknown'}->${to || 'unknown'}`;
 }
@@ -572,6 +403,7 @@ function ensureTranscriptPlaceholder() {
     transcriptEl.appendChild(ph);
   }
 }
+
 function removeTranscriptPlaceholder() {
   const ph = document.getElementById(PLACEHOLDER_ID);
   if (ph && ph.parentNode) ph.parentNode.removeChild(ph);
@@ -604,11 +436,11 @@ function createTranscriptCard(item) {
 
   const header = document.createElement('div');
   header.className = 'text-sm mb-1';
+
   const time = timestamp ? new Date(timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
-  header.innerHTML =
-    `🗣️ <span class="font-bold">${escapeHtml(from || 'Unknown')}</span> ` +
-    `<span class="opacity-60">→ ${escapeHtml(to || 'Unknown')}</span> ` +
-    `<span class="opacity-60">(${time})</span>`;
+  header.innerHTML = `🗣️ <span class="font-bold">${escapeHtml(from || 'Unknown')}</span>
+    <span class="opacity-60">→ ${escapeHtml(to || 'Unknown')}</span>
+    <span class="opacity-60">(${time})</span>`;
   card.appendChild(header);
 
   const body = document.createElement('div');
@@ -647,6 +479,100 @@ function highlightActiveCard() {
   if (active) active.classList.add('scribe-card-active');
 }
 
+// ============================================================================
+// Per-transcript templates workflow
+// ============================================================================
+function normalizeHistoryItems(hist) {
+  let changed = false;
+  for (const item of hist) {
+    if (!item.notes) {
+      item.notes = { default: null, templates: {} };
+      changed = true;
+    }
+    if (item.soap && !item.notes.default) {
+      item.notes.default = item.soap;
+      delete item.soap;
+      changed = true;
+    }
+    if (!item.notes.templates) {
+      item.notes.templates = {};
+      changed = true;
+    }
+    if (!item.activeTemplateId) {
+      item.activeTemplateId = 'default';
+      changed = true;
+    }
+  }
+  if (changed) saveHistory(hist);
+  return hist;
+}
+
+function getActiveHistoryContext() {
+  const hist = normalizeHistoryItems(loadHistory());
+  const activeId = loadActiveItemId();
+  const idx = activeId ? hist.findIndex(x => x.id === activeId) : -1;
+  const i = idx !== -1 ? idx : (hist.length ? hist.length - 1 : -1);
+  return { hist, index: i, item: i !== -1 ? hist[i] : null };
+}
+
+function getNoteForItem(item) {
+  if (!item) return {};
+  const t = String(item.activeTemplateId || 'default');
+  if (t === 'default') return item.notes?.default || {};
+  return item.notes?.templates?.[t] || item.notes?.default || {};
+}
+
+function setTemplateSelectValue(value) {
+  if (!templateSelectEl) return;
+  const v = String(value ?? 'default');
+  const has = Array.from(templateSelectEl.options || []).some(o => o.value === v);
+  templateSelectEl.value = has ? v : 'default';
+}
+
+function syncDropdownToActiveTranscript() {
+  if (!templateSelectEl) return;
+  const { item } = getActiveHistoryContext();
+  setTemplateSelectValue(item?.activeTemplateId || 'default');
+}
+
+// ============================================================================
+// SOAP generation timer helpers
+// ============================================================================
+function stopSoapGenerationTimer() {
+  try {
+    if (soapNoteTimer) {
+      clearInterval(soapNoteTimer);
+      soapNoteTimer = null;
+    }
+  } catch {}
+  soapNoteStartTime = null;
+}
+
+function startSoapGenerationTimer(kind = 'default') {
+  // kind is informational (default/template); UI text already generic below.
+  stopSoapGenerationTimer();
+  soapGenerating = true;
+  soapNoteStartTime = Date.now();
+  renderSoapNoteGenerating(0);
+  soapNoteTimer = setInterval(() => {
+    const elapsedSec = Math.floor((Date.now() - soapNoteStartTime) / 1000);
+    renderSoapNoteGenerating(elapsedSec);
+  }, 1000);
+}
+
+function maybeContinueSoapTimerForQueue() {
+  // If more transcripts are still waiting for SOAP, keep timer running for next.
+  if (pendingSoapItemQueue.length > 0) {
+    startSoapGenerationTimer('default_next');
+  } else {
+    stopSoapGenerationTimer();
+    soapGenerating = false;
+  }
+}
+
+// ============================================================================
+// Transcript list operations
+// ============================================================================
 function setActiveTranscriptId(id) {
   currentActiveItemId = id;
   saveActiveItemId(id);
@@ -654,10 +580,9 @@ function setActiveTranscriptId(id) {
 
   const ctx = getActiveHistoryContext();
   latestSoapNote = getNoteForItem(ctx.item) || loadLatestSoap() || {};
-
   if (!soapGenerating) renderSoapNote(latestSoapNote);
 
-  // IMPORTANT: dropdown reflects THIS transcript's template selection (per-transcript)
+  // Dropdown reflects THIS transcript's template selection
   syncDropdownToActiveTranscript();
 }
 
@@ -684,8 +609,6 @@ function appendTranscriptItem({ from, to, text, timestamp }) {
     to: to || 'Unknown',
     text: String(text || '').trim(),
     timestamp: timestamp || Date.now(),
-
-    // NEW: per-transcript notes + per-transcript template selection
     notes: { default: null, templates: {} },
     activeTemplateId: 'default',
   };
@@ -699,12 +622,15 @@ function appendTranscriptItem({ from, to, text, timestamp }) {
   trimTranscriptIfNeeded();
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 
-  // Set active transcript & remember upcoming SOAP belongs to this transcript
-  pendingSoapItemId = item.id;
+  // FIFO binding: this transcript is now awaiting SOAP
+  pendingSoapItemQueue.push(item.id);
+
+  // Set active transcript
   setActiveTranscriptId(item.id);
 
-  // Broadcast (optional) + include roomId to avoid cross-room mixing
-  transcriptBC?.postMessage?.({ type: 'transcript_console', roomId: currentRoom, data: { ...item, final: true } });
+  // Start default SOAP generation timer (one per pending queue)
+  // Start only if not already running (prevents flicker)
+  if (!soapGenerating) startSoapGenerationTimer('default');
 }
 
 function deleteTranscriptItem(id) {
@@ -717,6 +643,10 @@ function deleteTranscriptItem(id) {
 
   const node = transcriptEl?.querySelector(`.scribe-card[data-id="${CSS.escape(id)}"]`);
   if (node) node.remove();
+
+  // Remove from pending queue if present (prevents misbinding)
+  const qIdx = pendingSoapItemQueue.indexOf(id);
+  if (qIdx !== -1) pendingSoapItemQueue.splice(qIdx, 1);
 
   const remaining = transcriptEl?.querySelectorAll('.scribe-card') || [];
   if (remaining.length === 0) {
@@ -738,9 +668,9 @@ function deleteTranscriptItem(id) {
   }
 }
 
-// ====
+// ============================================================================
 // SOAP sections ordering
-// ====
+// ============================================================================
 function getSoapSections(soap) {
   const defaultSections = [
     'Chief Complaints',
@@ -759,7 +689,6 @@ function getSoapSections(soap) {
       .sort((a, b) => Number(a.position ?? 0) - Number(b.position ?? 0))
       .map(x => String(x.name || '').trim())
       .filter(Boolean);
-
     if (ordered.length) return ordered;
   }
 
@@ -772,23 +701,28 @@ function getSoapSections(soap) {
   return defaultSections;
 }
 
-// ====
+// ============================================================================
 // INCREMENTAL EDIT TRACKING (persistent)
-// ====
+// ============================================================================
 const MAX_DELTA_CELLS = 20000;
 
-// RLE encode/decode for provenance tags ('B'/'U')
+// RLE encode/decode tags ('B'/'U')
 function rleEncodeTags(tags) {
   if (!tags || !tags.length) return [];
   const out = [];
   let last = tags[0], count = 1;
   for (let i = 1; i < tags.length; i++) {
     if (tags[i] === last) count++;
-    else { out.push([last, count]); last = tags[i]; count = 1; }
+    else {
+      out.push([last, count]);
+      last = tags[i];
+      count = 1;
+    }
   }
   out.push([last, count]);
   return out;
 }
+
 function rleDecodeToTags(rle, targetLen) {
   if (!Array.isArray(rle) || rle.length === 0) return new Array(targetLen).fill('B');
   const tags = [];
@@ -835,12 +769,14 @@ function fastGreedyDelta(prevAnn, nextText, state) {
     prevChars[prevChars.length - 1 - s] === nextChars[nextChars.length - 1 - s]
   ) s++;
 
+  // removals
   for (let i = p; i < prevChars.length - s; i++) {
     const removed = prevAnn[i];
     if (removed.tag === 'U') state.ins = Math.max(0, state.ins - 1);
     else state.del += 1;
   }
 
+  // insertions
   const inserted = [];
   for (let j = p; j < nextChars.length - s; j++) {
     inserted.push({ ch: nextChars[j], tag: 'U' });
@@ -947,9 +883,9 @@ function rebaseBoxStateToCurrent(box) {
   persistSectionState(box.dataset.section, state);
 }
 
-// ====
+// ============================================================================
 // SOAP note rendering
-// ====
+// ============================================================================
 function soapContainerEnsure() {
   let scroller = document.getElementById('soapScroller');
   if (!scroller) {
@@ -960,15 +896,18 @@ function soapContainerEnsure() {
   }
   return scroller;
 }
+
 function renderSoapBlank() {
   soapContainerEnsure().innerHTML = '';
 }
+
 function autoExpandTextarea(el) {
   el.style.height = 'auto';
   el.style.height = el.scrollHeight + 'px';
 }
 
 function ensureTopHeadingBadge() {
+  // Prefer an existing slot if you have it in HTML:
   const slot = document.getElementById('totalEditsSlot');
   if (!slot) return null;
 
@@ -999,6 +938,7 @@ function updateTotalsAndEhrState() {
   const badge = ensureTopHeadingBadge();
   if (badge) badge.textContent = `Total Edits: ${total}`;
 
+  // Always disabled per your requirement
   if (addEhrBtnEl) {
     addEhrBtnEl.disabled = true;
     addEhrBtnEl.classList.add('scribe-add-ehr-disabled');
@@ -1008,19 +948,21 @@ function updateTotalsAndEhrState() {
 function initializeEditMetaForSoap(soap) {
   soap._aiMeta = soap._aiMeta || {};
   soap._editMeta = soap._editMeta || {};
-
   const sections = getSoapSections(soap);
   sections.forEach(section => {
     const val = soap?.[section] || '';
     const textBlock = Array.isArray(val) ? val.join('\n') : String(val || '');
     soap._aiMeta[section] = { text: textBlock };
     soap._editMeta[section] = {
-      edits: 0,
-      ins: 0,
-      del: 0,
+      edits: 0, ins: 0, del: 0,
       provRLE: rleEncodeTags(new Array(textBlock.length).fill('B')),
     };
   });
+}
+
+function isMedicationSectionName(section) {
+  const s = String(section || '').trim().toLowerCase();
+  return s === 'medication' || s === 'medications' || s.includes('medication');
 }
 
 function persistActiveNoteFromUI() {
@@ -1029,9 +971,11 @@ function persistActiveNoteFromUI() {
 
   const scroller = soapContainerEnsure();
   const editors = scroller.querySelectorAll('textarea[data-section]');
-
   const soap = {};
-  editors.forEach(t => { soap[t.dataset.section] = t.value || ''; });
+
+  editors.forEach(t => {
+    soap[t.dataset.section] = t.value || '';
+  });
 
   soap._aiMeta = latestSoapNote?._aiMeta || {};
   soap._editMeta = latestSoapNote?._editMeta || {};
@@ -1046,14 +990,17 @@ function persistActiveNoteFromUI() {
       .filter(Boolean)
       .map(name => ({
         name,
-        available: medAvailability.has(normalizeDrugKey(name)) ? medAvailability.get(normalizeDrugKey(name)) : null,
+        available: medAvailability.has(normalizeDrugKey(name))
+          ? medAvailability.get(normalizeDrugKey(name))
+          : null,
       }));
     soap.medications = medications;
   }
 
-  // Update currently active note slot (default OR selected template for THIS transcript)
+  // Update currently active note slot (default OR selected template) for THIS transcript
   const item = ctx.item;
   const t = String(item.activeTemplateId || 'default');
+
   item.notes = item.notes || { default: null, templates: {} };
   item.notes.templates = item.notes.templates || {};
 
@@ -1069,17 +1016,19 @@ function persistActiveNoteFromUI() {
 
 function resetAllEditCountersToZero() {
   const scroller = soapContainerEnsure();
+
   scroller.querySelectorAll('textarea[data-section]').forEach(textarea => {
     rebaseBoxStateToCurrent(textarea);
     textarea.dataset.editCount = '0';
+
     const headMeta = scroller.querySelector(
       `.scribe-section[data-section="${CSS.escape(textarea.dataset.section)}"] .scribe-section-meta`
     );
-    if (headMeta) headMeta.textContent = `Edits: 0`;
+    if (headMeta) headMeta.textContent = 'Edits: 0';
   });
 
   if (latestSoapNote) latestSoapNote._editMeta = latestSoapNote._editMeta || {};
-  Object.keys(latestSoapNote._aiMeta || {}).forEach(section => {
+  Object.keys(latestSoapNote?._aiMeta || {}).forEach(section => {
     latestSoapNote._editMeta[section] = latestSoapNote._editMeta[section] || {};
     latestSoapNote._editMeta[section].edits = 0;
     latestSoapNote._editMeta[section].ins = 0;
@@ -1109,8 +1058,8 @@ function attachEditTrackingToTextarea(box, aiText) {
   let rafId = null;
   box.addEventListener('input', () => {
     autoExpandTextarea(box);
-
     if (rafId) cancelAnimationFrame(rafId);
+
     rafId = requestAnimationFrame(() => {
       try {
         const now = box.value || '';
@@ -1181,7 +1130,10 @@ function renderSoapNote(soap) {
     box.dataset.section = section;
 
     const rawVal = latestSoapNote?.[section];
-    const contentText = Array.isArray(rawVal) ? rawVal.join('\n') : (typeof rawVal === 'string' ? rawVal : '');
+    const contentText = Array.isArray(rawVal)
+      ? rawVal.join('\n')
+      : (typeof rawVal === 'string' ? rawVal : '');
+
     box.value = contentText;
     autoExpandTextarea(box);
 
@@ -1205,7 +1157,6 @@ function renderSoapNote(soap) {
 
   updateTotalsAndEhrState();
   renderMedicationInline();
-
   scroller.scrollTop = 0;
 }
 
@@ -1219,25 +1170,172 @@ function renderSoapNoteGenerating(elapsed) {
   ensureTopHeadingBadge();
 }
 
-// ====
+function renderSoapNoteError(msg) {
+  const scroller = soapContainerEnsure();
+  scroller.innerHTML = `
+    <div class="scribe-section" style="text-align:center; color:#f87171; padding:16px;">
+      Error generating note: ${escapeHtml(String(msg || 'Unknown error'))}
+    </div>
+  `;
+  ensureTopHeadingBadge();
+}
+
+// ============================================================================
+// Template generation (per transcript)
+// ============================================================================
+async function applyTemplateToActiveTranscript(newTemplateId) {
+  if (!SERVER_URL) return;
+
+  const templateId = String(newTemplateId || 'default');
+  const ctx = getActiveHistoryContext();
+  if (!ctx.item) return;
+
+  const item = ctx.item;
+  item.activeTemplateId = templateId;
+
+  // Save now so switching transcripts remembers selection
+  saveHistory(ctx.hist);
+  saveActiveItemId(item.id);
+
+  // If default: show default note only
+  if (templateId === 'default') {
+    stopSoapGenerationTimer();
+    soapGenerating = false;
+
+    latestSoapNote = item.notes?.default || {};
+    saveLatestSoap(latestSoapNote);
+    renderSoapNote(latestSoapNote);
+    return;
+  }
+
+  // If already generated for this template, reuse it
+  if (item.notes?.templates?.[templateId]) {
+    stopSoapGenerationTimer();
+    soapGenerating = false;
+
+    latestSoapNote = item.notes.templates[templateId];
+    saveLatestSoap(latestSoapNote);
+    renderSoapNote(latestSoapNote);
+    return;
+  }
+
+  const transcript = String(item.text || '').trim();
+  if (!transcript) {
+    stopSoapGenerationTimer();
+    soapGenerating = false;
+
+    latestSoapNote = item.notes?.default || {};
+    renderSoapNote(latestSoapNote);
+    return;
+  }
+
+  // TEMPLATE TIMER (explicit requirement)
+  startSoapGenerationTimer('template');
+
+  try {
+    const resp = await fetch(`${SERVER_URL}/api/notes/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transcript, templateId }),
+    });
+
+    if (!resp.ok) {
+      stopSoapGenerationTimer();
+      soapGenerating = false;
+      renderSoapNoteError(`Server returned ${resp.status} ${resp.statusText || ''}`);
+
+      // Keep latestSoapNote unchanged
+      latestSoapNote = getNoteForItem(item) || loadLatestSoap() || {};
+      saveLatestSoap(latestSoapNote);
+      return;
+    }
+
+    const data = await resp.json();
+    const note = data.note || {};
+
+    // New AI baseline
+    initializeEditMetaForSoap(note);
+
+    // Store ONLY on this transcript item
+    item.notes = item.notes || { default: null, templates: {} };
+    item.notes.templates = item.notes.templates || {};
+    item.notes.templates[templateId] = note;
+
+    ctx.hist[ctx.index] = item;
+    saveHistory(ctx.hist);
+
+    stopSoapGenerationTimer();
+    soapGenerating = false;
+
+    latestSoapNote = note;
+    saveLatestSoap(latestSoapNote);
+    renderSoapNote(latestSoapNote);
+  } catch (e) {
+    stopSoapGenerationTimer();
+    soapGenerating = false;
+
+    renderSoapNoteError(String(e?.message || e));
+
+    latestSoapNote = getNoteForItem(item) || loadLatestSoap() || {};
+    saveLatestSoap(latestSoapNote);
+  }
+}
+
+// ============================================================================
+// Templates dropdown population
+// ============================================================================
+async function initTemplateDropdown() {
+  if (!templateSelectEl || !SERVER_URL) return;
+
+  templateSelectEl.innerHTML = '';
+
+  const optDefault = document.createElement('option');
+  optDefault.value = 'default';
+  optDefault.textContent = 'SOAP Note';
+  templateSelectEl.appendChild(optDefault);
+
+  try {
+    const resp = await fetch(`${SERVER_URL}/api/templates`);
+    if (resp.ok) {
+      const data = await resp.json();
+      const templates = data.templates || [];
+      templates.forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = String(t.id);
+        opt.textContent = t.name || t.short_name || `Template ${t.id}`;
+        templateSelectEl.appendChild(opt);
+      });
+    } else {
+      console.warn('[TEMPLATE] /api/templates failed:', resp.status);
+    }
+  } catch (e) {
+    console.warn('[TEMPLATE] template fetch error', e);
+  }
+
+  syncDropdownToActiveTranscript();
+
+  templateSelectEl.onchange = () => {
+    applyTemplateToActiveTranscript(templateSelectEl.value || 'default');
+  };
+}
+
+// ============================================================================
 // Medication availability (inline emojis) + persistence
-// ====
+// ============================================================================
 const medAvailability = new Map();
 let medicationValidationPending = false;
 let medicationDebounceTimer = null;
 
-// Persisted med statuses (keyed by normalized drug names)
 function saveMedStatus(byName, lastText) {
-  localStorage.setItem(LS_KEYS.MED_AVAIL(), JSON.stringify({ byName: byName || {}, lastText: lastText || '' }));
+  localStorage.setItem(
+    LS_KEYS.MED_AVAIL(),
+    JSON.stringify({ byName: byName || {}, lastText: lastText || '' })
+  );
 }
 function loadMedStatus() {
-  const { byName = {}, lastText = '' } = lsSafeParse(LS_KEYS.MED_AVAIL(), { byName: {}, lastText: '' }) || {};
+  const { byName = {}, lastText = '' } =
+    lsSafeParse(LS_KEYS.MED_AVAIL(), { byName: {}, lastText: '' }) || {};
   return { byName, lastText };
-}
-
-function isMedicationSectionName(section) {
-  const s = String(section || '').trim().toLowerCase();
-  return s === 'medication' || s === 'medications' || s.includes('medication');
 }
 
 function normalizeDrugKey(str) {
@@ -1265,7 +1363,7 @@ async function checkMedicationsFromTextarea(textarea) {
   const currentNormalized = normalizedMedicationBlock(textarea);
   const { byName: persistedByName, lastText } = loadMedStatus();
 
-  // If unchanged since last validation: use cached statuses
+  // unchanged => use cache, NO API call
   if (currentNormalized === lastText) {
     medAvailability.clear();
     Object.entries(persistedByName).forEach(([k, v]) => medAvailability.set(k, !!v));
@@ -1310,12 +1408,10 @@ async function checkMedicationsFromTextarea(textarea) {
       const rawName = (item.name ?? item.query ?? item.drug ?? item.drugName ?? '').toString();
       const key = normalizeDrugKey(rawName);
       if (!key) return;
-
       const available =
         typeof item.available === 'boolean'
           ? item.available
           : (item.status === 'exists' || item.status === 'available' || item.status === true);
-
       medAvailability.set(key, !!available);
       newByName[key] = !!available;
     });
@@ -1336,19 +1432,21 @@ function ensureMedStyles() {
   const s = document.createElement('style');
   s.id = 'med-inline-css';
   s.textContent = `
-    .med-line { display: flex; align-items: center; gap: 8px; }
-    .med-emoji { font-weight: 800; display:inline-block; transform-origin: center; }
+    .med-line { display:flex; align-items:center; gap:8px; }
+    .med-emoji { font-weight: 800; display:inline-block; transform-origin:center; }
     .med-wrap { position: relative; }
     .med-overlay {
-      position: absolute; inset: 0; pointer-events: none;
-      white-space: pre-wrap; overflow: hidden;
-      font: inherit; line-height: inherit; color: inherit;
-      z-index: 2;
+      position:absolute;
+      inset:0;
+      pointer-events:none;
+      white-space: pre-wrap;
+      overflow:hidden;
+      font: inherit;
+      line-height: inherit;
+      color: inherit;
+      z-index:2;
     }
-    @keyframes pulse {
-      0%, 100% { transform: scale(1); opacity: 1; }
-      50% { transform: scale(0.9); opacity: .7; }
-    }
+    @keyframes pulse { 0%,100% { transform:scale(1); opacity:1; } 50% { transform:scale(.9); opacity:.7; } }
     .med-pending { animation: pulse 1.2s ease-in-out infinite; }
   `;
   document.head.appendChild(s);
@@ -1385,7 +1483,9 @@ function ensureMedicationWrap(medSection) {
     overlay = document.createElement('div');
     overlay.className = 'med-overlay';
     wrap.appendChild(overlay);
-    textarea.addEventListener('scroll', () => { overlay.scrollTop = textarea.scrollTop; });
+    textarea.addEventListener('scroll', () => {
+      overlay.scrollTop = textarea.scrollTop;
+    });
   }
 
   return wrap;
@@ -1393,7 +1493,6 @@ function ensureMedicationWrap(medSection) {
 
 function renderMedicationInline() {
   ensureMedStyles();
-
   const scroller = soapContainerEnsure();
   const medSection = getMedicationSectionElement(scroller);
   if (!medSection) return;
@@ -1403,6 +1502,7 @@ function renderMedicationInline() {
   const overlay = wrap?.querySelector('.med-overlay');
   if (!wrap || !textarea || !overlay) return;
 
+  // mirror metrics
   const cs = getComputedStyle(textarea);
   overlay.style.padding = cs.padding;
   overlay.style.lineHeight = cs.lineHeight;
@@ -1410,6 +1510,7 @@ function renderMedicationInline() {
   overlay.style.fontFamily = cs.fontFamily;
   overlay.scrollTop = textarea.scrollTop;
 
+  // hydrate in-memory from cache if matches
   const currentNormalized = normalizedMedicationBlock(textarea);
   const { byName, lastText } = loadMedStatus();
   if (currentNormalized === lastText) {
@@ -1427,7 +1528,7 @@ function renderMedicationInline() {
 
     const nameSpan = document.createElement('span');
     nameSpan.textContent = line;
-    nameSpan.style.color = 'transparent';
+    nameSpan.style.color = 'transparent'; // keep alignment without duplicating visible text
     row.appendChild(nameSpan);
 
     if (line) {
@@ -1457,14 +1558,15 @@ function updateMedicationAvailabilityIndicators() {
   renderMedicationInline();
 }
 
-// ====
-// Signal handling (Socket.IO / BroadcastChannel) (UPDATED: ignore cross-room BC)
-// ====
+// ============================================================================
+// Signal handling (Socket.IO only) — room isolation + FIFO SOAP binding
+// ============================================================================
 function ingestDrugAvailabilityPayload(payload) {
   const arr = Array.isArray(payload) ? payload : (payload ? [payload] : []);
-  medAvailability.clear();
 
+  medAvailability.clear();
   const newByName = {};
+
   for (const item of arr) {
     const raw = (item?.name ?? item?.query ?? item?.drug ?? item?.drugName ?? '').toString();
     const key = normalizeDrugKey(raw);
@@ -1488,7 +1590,7 @@ function ingestDrugAvailabilityPayload(payload) {
 function handleSignalMessage(packet) {
   if (!packet?.type) return;
 
-  // Room isolation (from scribe.js): if message includes a roomId, ignore if not our current room
+  // Strict room isolation:
   const msgRoom = packet.roomId ?? packet?.data?.roomId ?? packet?.data?.room ?? null;
   if (msgRoom && !currentRoom) return;
   if (msgRoom && currentRoom && msgRoom !== currentRoom) return;
@@ -1518,26 +1620,10 @@ function handleSignalMessage(packet) {
     slot.flushTimer = setTimeout(() => {
       if (slot.paragraph) {
         appendTranscriptItem({ from, to, text: slot.paragraph, timestamp });
-        transcriptBC?.postMessage?.({
-          type: 'transcript_console',
-          roomId: currentRoom,
-          data: { from, to, text: slot.paragraph, final: true, timestamp }
-        });
         slot.paragraph = '';
       }
       slot.flushTimer = null;
     }, 800);
-
-    if (!soapNoteTimer) {
-      soapGenerating = true;
-      renderSoapNoteGenerating(0);
-
-      soapNoteStartTime = Date.now();
-      soapNoteTimer = setInterval(() => {
-        const elapsedSec = Math.floor((Date.now() - soapNoteStartTime) / 1000);
-        renderSoapNoteGenerating(elapsedSec);
-      }, 1000);
-    }
 
     return;
   }
@@ -1546,59 +1632,54 @@ function handleSignalMessage(packet) {
     const soap = packet.data || {};
     initializeEditMetaForSoap(soap);
 
-    // Attach this as DEFAULT note ONLY to the transcript that started the generation
     const hist = normalizeHistoryItems(loadHistory());
-    const targetId = pendingSoapItemId || loadActiveItemId();
+
+    // Bind to correct transcript via FIFO
+    const targetId = pendingSoapItemQueue.length ? pendingSoapItemQueue.shift() : loadActiveItemId();
     const idx = hist.findIndex(x => x.id === targetId);
 
     if (idx !== -1) {
       hist[idx].notes = hist[idx].notes || { default: null, templates: {} };
       hist[idx].notes.default = soap;
 
-      // If that transcript is currently in default mode, show it immediately
-      if (hist[idx].activeTemplateId === 'default' && loadActiveItemId() === targetId) {
+      // If that transcript is active AND currently in default mode, show immediately
+      const isActive = (loadActiveItemId() === targetId);
+      const isDefault = (String(hist[idx].activeTemplateId || 'default') === 'default');
+
+      if (isActive && isDefault) {
         latestSoapNote = soap;
         saveLatestSoap(latestSoapNote);
-        if (soapNoteTimer) { clearInterval(soapNoteTimer); soapNoteTimer = null; }
-        soapGenerating = false;
         renderSoapNote(latestSoapNote);
         syncDropdownToActiveTranscript();
       }
     } else {
-      // fallback: keep behavior (store as latest)
+      // fallback behavior
       latestSoapNote = soap;
       saveLatestSoap(latestSoapNote);
-      if (soapNoteTimer) { clearInterval(soapNoteTimer); soapNoteTimer = null; }
-      soapGenerating = false;
       renderSoapNote(latestSoapNote);
     }
 
     saveHistory(hist);
 
-    soapBC?.postMessage?.({ type: 'soap_note_console', roomId: currentRoom, data: soap, timestamp: packet.timestamp || Date.now() });
+    // Stop/restart default SOAP timer based on queue
+    maybeContinueSoapTimerForQueue();
 
-    // IMPORTANT: no auto template formatting here (per your requirement: only when user selects)
-    // IMPORTANT: no auto meds API here
+    // IMPORTANT: do not auto-call meds API; just render from cache if present
     renderMedicationInline();
-
-    // Reset pending id after use (prevents accidental overwrite)
-    pendingSoapItemId = null;
+    return;
   }
 }
 
-if (transcriptBC) transcriptBC.onmessage = (e) => handleSignalMessage(e.data);
-if (soapBC) soapBC.onmessage = (e) => handleSignalMessage(e.data);
-
-// ====
+// ============================================================================
 // Socket.IO loader + connection
-// ====
+// ============================================================================
 async function loadScript(src, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
     const s = document.createElement('script');
     s.src = src;
     s.async = true;
-
     let done = false;
+
     const timer = setTimeout(() => {
       if (done) return;
       done = true;
@@ -1643,27 +1724,21 @@ async function loadSocketIoClientFor(endpointBase) {
   if (!window.io) throw new Error('Socket.IO client not available after CDN load.');
 }
 
-/*
+/**
+ * Room switch cleanup
  * - Stops pending flush timers
  * - Clears transcript DOM & SOAP UI
- * - Resets pendingSoapItemId so old room SOAP doesn't attach to new room
- * - DOES NOT delete room storage (history stays per room key)
+ * - Clears pending SOAP queue (so old room SOAP doesn't attach to new room)
+ * - DOES NOT delete room storage (history stays under its room key)
  */
 function clearCockpitUiForRoomSwitch(prevRoom, nextRoom) {
   if (prevRoom === nextRoom) return;
 
-  console.warn('[COCKPIT][ROOM][CLEAR] switching rooms', {
-    prevRoom,
-    nextRoom,
-    prevHistoryKey: prevRoom ? `scribe:${prevRoom}:history` : null,
-    nextHistoryKey: nextRoom ? `scribe:${nextRoom}:history` : null,
-    prevSoapKey: prevRoom ? `scribe:${prevRoom}:latestSoap` : null,
-    nextSoapKey: nextRoom ? `scribe:${nextRoom}:latestSoap` : null,
-  });
+  console.warn('[COCKPIT][ROOM][CLEAR] switching rooms', { prevRoom, nextRoom });
 
-  // stop note timer
-  try { if (soapNoteTimer) { clearInterval(soapNoteTimer); soapNoteTimer = null; } } catch {}
-  soapNoteStartTime = null;
+  // stop default SOAP generation timer
+  stopSoapGenerationTimer();
+  soapGenerating = false;
 
   // stop any pending transcript flush timers
   try {
@@ -1677,20 +1752,20 @@ function clearCockpitUiForRoomSwitch(prevRoom, nextRoom) {
   try { if (transcriptEl) transcriptEl.innerHTML = ''; } catch {}
   try { ensureTranscriptPlaceholder(); } catch {}
 
-  // wipe in-memory SOAP/transcript selection (do NOT delete room storage)
+  // wipe in-memory selection + pending queue
   currentActiveItemId = null;
-  pendingSoapItemId = null;
+  pendingSoapItemQueue.length = 0;
   latestSoapNote = {};
-  soapGenerating = false;
 
-  // clear SOAP UI to blank immediately (room isolation)
+  // clear SOAP UI
   try { renderSoapBlank(); } catch {}
 
-  // dropdown resets visually until restore happens
+  // dropdown resets visually until restore
   try { if (templateSelectEl) setTemplateSelectValue('default'); } catch {}
 
-  // clear med in-memory; restore() will rehydrate from the correct room if applicable
+  // clear med in-memory; restore() will rehydrate if matching cached text
   try { medAvailability.clear(); } catch {}
+  medicationValidationPending = false;
 }
 
 function connectTo(endpointBase, onFailover) {
@@ -1705,17 +1780,23 @@ function connectTo(endpointBase, onFailover) {
       secure: SERVER_URL.startsWith('https://'),
     };
 
-    try { socket?.close(); } catch { /* ignore */ }
+    // stop poller for old socket before swapping
+    stopDeviceListWatchdog();
+
+    try { socket?.close(); } catch {}
+
     socket = window.io(SERVER_URL, opts);
 
     let connected = false;
-    const failTimer = setTimeout(() => { if (!connected) onFailover?.(); }, 4000);
+    const failTimer = setTimeout(() => {
+      if (!connected) onFailover?.();
+    }, 4000);
 
     socket.on('connect', async () => {
       connected = true;
       clearTimeout(failTimer);
 
-      // attach core listeners
+      // attach core listeners (ensure no duplicates)
       socket.off('device_list', updateDeviceList);
       socket.off('signal', handleSignalMessage);
       socket.off('room_joined');
@@ -1730,18 +1811,15 @@ function connectTo(endpointBase, onFailover) {
       socket.on('room_update', ({ pairs } = {}) => {
         try {
           if (!COCKPIT_FOR_XR_ID) return;
-
           const me = String(COCKPIT_FOR_XR_ID).trim().toUpperCase();
           const list = Array.isArray(pairs) ? pairs : [];
-
           const inAnyPair = list.some(p => {
             const a = String(p?.a || '').trim().toUpperCase();
             const b = String(p?.b || '').trim().toUpperCase();
             return a === me || b === me;
           });
-
           if (inAnyPair && !currentRoom) {
-            console.log('[COCKPIT][ROOM_UPDATE] pair detected for me; requesting device_list', { me, currentRoom });
+            console.log('[COCKPIT][ROOM_UPDATE] pair detected for me; requesting device_list');
             requestDeviceListThrottled('room_update_pair_detected');
           }
         } catch (e) {
@@ -1753,23 +1831,17 @@ function connectTo(endpointBase, onFailover) {
       socket.on('telemetry_update', (t = {}) => {
         try {
           if (!COCKPIT_FOR_XR_ID) return;
-
           const me = String(COCKPIT_FOR_XR_ID).trim().toUpperCase();
           const xr = String(t?.xrId || '').trim().toUpperCase();
           if (!xr) return;
-
           if (xr !== me) return;
-
-          if (!currentRoom) {
-            requestDeviceListThrottled('telemetry_bootstrap_single_device');
-          }
+          if (!currentRoom) requestDeviceListThrottled('telemetry_bootstrap_single_device');
         } catch (e) {
           console.warn('[COCKPIT][TELEMETRY_UPDATE] handler error', e);
         }
       });
 
       socket.on('peer_left', ({ xrId, roomId, reason } = {}) => {
-        // ignore peer_left for other rooms
         if (roomId && currentRoom && roomId !== currentRoom) return;
 
         const prevRoom = currentRoom;
@@ -1781,7 +1853,6 @@ function connectTo(endpointBase, onFailover) {
 
         showNoDevices();
         updateConnectionStatus('peer_left', []);
-
         requestDeviceListThrottled('after_peer_left');
       });
 
@@ -1789,20 +1860,14 @@ function connectTo(endpointBase, onFailover) {
         const prevRoom = currentRoom;
         const nextRoom = roomId || null;
 
-        console.log('[COCKPIT][ROOM] room_joined (raw)', {
-          prevRoom,
-          nextRoom,
-          reason,
-          members,
-          socketId: socket.id,
-          cockpitForXrId: COCKPIT_FOR_XR_ID,
-        });
+        console.log('[COCKPIT][ROOM] room_joined (raw)', { prevRoom, nextRoom, reason, members, socketId: socket.id });
 
         clearCockpitUiForRoomSwitch(prevRoom, nextRoom);
 
-        // set room before restore (restore uses currentRoom for storage keys)
+        // Set room BEFORE restore (restore uses currentRoom for storage keys)
         currentRoom = nextRoom;
 
+        // Status pill depends on device_list; we still show "Connecting" until list arrives
         updateConnectionStatus('room_joined', []);
 
         try {
@@ -1816,12 +1881,10 @@ function connectTo(endpointBase, onFailover) {
           console.warn('[COCKPIT][RESTORE] failed after room_joined', e);
         }
 
-        if (currentRoom) {
-          requestDeviceListThrottled('after_room_joined');
-        }
+        if (currentRoom) requestDeviceListThrottled('after_room_joined');
       });
 
-      // Identify as cockpit using logged-in user's mapped xrId
+      // Identify as cockpit using /api/platform/me xrId
       try {
         const meRes = await fetch('/api/platform/me', { credentials: 'include' });
         const me = await meRes.json();
@@ -1841,13 +1904,17 @@ function connectTo(endpointBase, onFailover) {
         console.warn('[SCRIBE] Failed to load /api/platform/me for identify:', e);
       }
 
-      // request list after identify (throttled)
+      // request list after identify
       requestDeviceListThrottled('after_identify');
+
+      // start watchdog so device list stays accurate without refresh
+      startDeviceListWatchdog();
 
       resolve();
     });
 
     socket.on('connect_error', err => console.warn('[SCRIBE] connect_error:', err));
+
     socket.on('disconnect', (reason) => {
       console.warn('[COCKPIT] disconnect', { reason, socketId: socket?.id, currentRoom });
 
@@ -1855,16 +1922,19 @@ function connectTo(endpointBase, onFailover) {
       currentRoom = null;
 
       _lastReqListAt = 0;
+      stopDeviceListWatchdog();
+
       clearCockpitUiForRoomSwitch(prevRoom, null);
+
       showNoDevices();
       updateConnectionStatus('disconnect', []);
     });
   });
 }
 
-// ====
-// Restore state from localStorage
-// ====
+// ============================================================================
+// Restore state from localStorage (strictly for currentRoom)
+// ============================================================================
 function restoreFromLocalStorage() {
   // Transcript history
   if (transcriptEl) transcriptEl.innerHTML = '';
@@ -1883,9 +1953,10 @@ function restoreFromLocalStorage() {
   highlightActiveCard();
   ensureTopHeadingBadge();
 
-  // Render the active transcript's note (default/template)
+  // Render active transcript's note (default/template)
   const ctx = getActiveHistoryContext();
   latestSoapNote = getNoteForItem(ctx.item) || loadLatestSoap() || {};
+
   if (!hist.length) renderSoapBlank();
   else renderSoapNote(latestSoapNote);
 
@@ -1906,9 +1977,9 @@ function restoreFromLocalStorage() {
   renderMedicationInline();
 }
 
-// ====
+// ============================================================================
 // Wire HTML buttons
-// ====
+// ============================================================================
 function wireSoapActionButtons() {
   const scroller = soapContainerEnsure();
 
@@ -1923,12 +1994,12 @@ function wireSoapActionButtons() {
         const headMeta = scroller.querySelector(
           `.scribe-section[data-section="${CSS.escape(t.dataset.section)}"] .scribe-section-meta`
         );
-        if (headMeta) headMeta.textContent = `Edits: 0`;
+        if (headMeta) headMeta.textContent = 'Edits: 0';
       });
 
       persistActiveNoteFromUI();
 
-      // Clear med cache for this note text
+      // Clear med cache for this room note text
       saveMedStatus({}, '');
       medAvailability.clear();
       medicationValidationPending = false;
@@ -1959,18 +2030,19 @@ function wireSoapActionButtons() {
   }
 }
 
-// ====
+// ============================================================================
 // Boot
-// ====
+// ============================================================================
 (async function boot() {
   try {
     ensureUiStyles();
     ensureMedStyles();
-
     ensureTranscriptPlaceholder();
     showNoDevices();
 
+    // restore whatever we have before pairing (legacy or last room keys)
     restoreFromLocalStorage();
+
     wireSoapActionButtons();
 
     await loadSocketIoClientFor(preferred);
@@ -1986,14 +2058,15 @@ function wireSoapActionButtons() {
     console.error('[SCRIBE] Failed to initialize:', e);
     setStatus('Disconnected');
     if (deviceListEl) {
-      deviceListEl.innerHTML = `<li class="text-red-400">Could not initialize cockpit. Ensure your signaling server is live (${isLocal ? 'local' : 'production'}).</li>`;
+      deviceListEl.innerHTML =
+        `<li class="text-red-400">Could not initialize cockpit. Ensure your signaling server is live (${isLocal ? 'local' : 'production'}).</li>`;
     }
   }
 })();
 
-// ====
-// Helpers
-// ====
+// ============================================================================
+// Helpers (Cockpit)
+// ============================================================================
 function escapeHtml(str) {
   return String(str || '')
     .replaceAll('&', '&amp;')
@@ -2003,55 +2076,44 @@ function escapeHtml(str) {
     .replaceAll("'", '&#039;');
 }
 
-// ====
-// EHR Integration (MRN -> Clinical Notes by short_name)
-// Summary always first
-// ====
-
+// ============================================================================
+// EHR Integration (MRN -> Clinical Notes by short_name) — Summary always first
+// (No logic change; uses separate escapeHtmlEhr)
+// ============================================================================
 const ehrButton = document.getElementById('ehrButton');
 const ehrSidebar = document.getElementById('ehrSidebar');
 const ehrOverlay = document.getElementById('ehrOverlay');
 const ehrCloseButton = document.getElementById('ehrCloseButton');
-
 const mrnInput = document.getElementById('mrnInput');
 const mrnSearchButton = document.getElementById('mrnSearchButton');
-
 const ehrError = document.getElementById('ehrError');
 const ehrInitialState = document.getElementById('ehrInitialState');
 const ehrPatientState = document.getElementById('ehrPatientState');
-
 const patientNameDisplay = document.getElementById('patientNameDisplay');
 const patientMRNDisplay = document.getElementById('patientMRNDisplay');
 const patientEmailDisplay = document.getElementById('patientEmailDisplay');
 const patientMobileDisplay = document.getElementById('patientMobileDisplay');
-
 const notesList = document.getElementById('notesList');
 const noteDetail = document.getElementById('noteDetail');
 
 let currentPatient = null;
 let currentNotes = [];
 
-// NOTE CACHE (noteId → API response)
-const noteCache = new Map();
-
+const noteCache = new Map(); // noteId -> API response
 const SUMMARY_NOTE_ID = 'summary';
-
-
-/* ====
-    ADDITION: Session persistence helpers (NO LOGIC CHANGE)
-==== */
 
 const EHR_STORAGE_KEY = 'ehr_state_v1';
 
 function persistEHRState() {
-  sessionStorage.setItem(EHR_STORAGE_KEY, JSON.stringify({
-    currentPatient,
-    currentNotes,
-    activeNoteId:
-      document.querySelector('.ehr-note-item.active')?.dataset?.noteId
-      || SUMMARY_NOTE_ID,
-    noteCache: [...noteCache.entries()]
-  }));
+  sessionStorage.setItem(
+    EHR_STORAGE_KEY,
+    JSON.stringify({
+      currentPatient,
+      currentNotes,
+      activeNoteId: document.querySelector('.ehr-note-item.active')?.dataset?.noteId || SUMMARY_NOTE_ID,
+      noteCache: [...noteCache.entries()],
+    })
+  );
 }
 
 function restoreEHRState() {
@@ -2060,7 +2122,6 @@ function restoreEHRState() {
 
   const state = JSON.parse(raw);
 
-  // ✅ ADDITION: if no valid patient or notes, reset to MRN entry flow
   if (!state.currentPatient || !state.currentNotes || state.currentNotes.length === 0) {
     sessionStorage.removeItem(EHR_STORAGE_KEY);
     resetEHRState();
@@ -2069,34 +2130,22 @@ function restoreEHRState() {
 
   currentPatient = state.currentPatient;
   currentNotes = state.currentNotes || [];
-
   state.noteCache?.forEach(([k, v]) => noteCache.set(k, v));
 
   renderPatient(currentPatient);
   renderClinicalNotes(currentNotes);
 
   const activeId = state.activeNoteId || SUMMARY_NOTE_ID;
-
   setActiveNote(activeId);
 
-  // Restore content exactly as before refresh
-  if (activeId === SUMMARY_NOTE_ID) {
-    loadSummary();
-  } else {
-    loadNote(activeId);
-  }
+  if (activeId === SUMMARY_NOTE_ID) loadSummary();
+  else loadNote(activeId);
 }
 
-
 window.addEventListener('beforeunload', persistEHRState);
 window.addEventListener('load', restoreEHRState);
 
-
-window.addEventListener('beforeunload', persistEHRState);
-window.addEventListener('load', restoreEHRState);
-
-// ---- UI helpers ----
-function escapeHtml(str) {
+function escapeHtmlEhr(str) {
   return String(str ?? 'N/A')
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
@@ -2111,53 +2160,47 @@ function fmtDate(dt) {
   return isNaN(d.getTime()) ? 'N/A' : d.toLocaleDateString();
 }
 
-// ---- API helper ----
 async function apiGetJson(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Request failed (${res.status})`);
   return res.json();
 }
 
-// ---- Sidebar ----
-ehrButton.onclick = () => {
-  ehrSidebar.classList.add('active');
-  ehrOverlay.classList.add('active');
-};
+if (ehrButton) {
+  ehrButton.onclick = () => {
+    ehrSidebar.classList.add('active');
+    ehrOverlay.classList.add('active');
+  };
+}
 
-// Overlay click: ONLY close sidebar (NO RESET)
-ehrOverlay.onclick = () => {
-  ehrSidebar.classList.remove('active');
-  ehrOverlay.classList.remove('active');
-};
+if (ehrOverlay) {
+  ehrOverlay.onclick = () => {
+    ehrSidebar.classList.remove('active');
+    ehrOverlay.classList.remove('active');
+  };
+}
 
-// Cancel button: FULL RESET
-ehrCloseButton.onclick = () => {
-  sessionStorage.removeItem(EHR_STORAGE_KEY); 
-  resetEHRState();
-};
+if (ehrCloseButton) {
+  ehrCloseButton.onclick = () => {
+    sessionStorage.removeItem(EHR_STORAGE_KEY);
+    resetEHRState();
+  };
+}
 
-// ---- RESET EVERYTHING ----
 function resetEHRState() {
   ehrSidebar.classList.remove('active');
   ehrOverlay.classList.remove('active');
-
   ehrInitialState.style.display = 'flex';
   ehrPatientState.style.display = 'none';
-
   mrnInput.value = '';
   ehrError.style.display = 'none';
-
   notesList.innerHTML = '';
   noteDetail.innerHTML = '';
-
   currentPatient = null;
   currentNotes = [];
-
-  // CLEAR CACHE (ONLY here + new MRN)
   noteCache.clear();
 }
 
-// ---- MRN Search ----
 async function searchMRN() {
   const mrn = mrnInput.value.trim();
   if (!mrn) return;
@@ -2166,26 +2209,22 @@ async function searchMRN() {
   mrnSearchButton.disabled = true;
   mrnSearchButton.textContent = 'Searching...';
 
-  // ✅ CLEAR CACHE ON NEW MRN
   noteCache.clear();
-  sessionStorage.removeItem(EHR_STORAGE_KEY); 
+  sessionStorage.removeItem(EHR_STORAGE_KEY);
 
   try {
     const data = await apiGetJson(`${SERVER_URL}/ehr/patient/${encodeURIComponent(mrn)}`);
-
     currentPatient = data.patient || {};
     currentNotes = (data.notes || []).map(n => ({
       note_id: n.note_id ?? n.patient_note_id,
       short_name: n.short_name,
       template: n.template,
-      document_created_date: n.document_created_date
+      document_created_date: n.document_created_date,
     }));
 
     renderPatient(currentPatient);
     renderClinicalNotes(currentNotes);
-
-    noteDetail.innerHTML =
-      `<div class="text-gray-400 text-sm">Select a note to view details</div>`;
+    noteDetail.innerHTML = `<div class="text-gray-400 text-sm">Select a note to view details</div>`;
   } catch (e) {
     ehrError.textContent = e.message;
     ehrError.style.display = 'block';
@@ -2195,24 +2234,21 @@ async function searchMRN() {
   }
 }
 
-mrnSearchButton.onclick = searchMRN;
-mrnInput.addEventListener('keypress', e => e.key === 'Enter' && searchMRN());
+if (mrnSearchButton) mrnSearchButton.onclick = searchMRN;
+if (mrnInput) mrnInput.addEventListener('keypress', e => e.key === 'Enter' && searchMRN());
 
-// ---- Render Patient ----
 function renderPatient(p) {
   ehrInitialState.style.display = 'none';
   ehrPatientState.style.display = 'flex';
-
   patientNameDisplay.textContent = p.full_name || 'N/A';
   patientMRNDisplay.textContent = p.mrn_no || 'N/A';
   patientEmailDisplay.textContent = p.email || 'N/A';
   if (patientMobileDisplay) patientMobileDisplay.textContent = p.mobile || 'N/A';
 }
 
-// ---- Clinical Notes List ----
 function renderClinicalNotes(notes) {
   notesList.innerHTML = '';
-  notesList.classList.add('ehr-notes-scroll'); // IMPORTANT
+  notesList.classList.add('ehr-notes-scroll');
 
   const summary = document.createElement('div');
   summary.className = 'ehr-note-item';
@@ -2227,51 +2263,38 @@ function renderClinicalNotes(notes) {
     const item = document.createElement('div');
     item.className = 'ehr-note-item';
     item.dataset.noteId = note.note_id;
-    item.title = note.short_name; // tooltip for long names
+    item.title = note.short_name;
     item.textContent = note.short_name;
-
     item.onclick = () => {
       setActiveNote(note.note_id);
       loadNote(note.note_id);
     };
-
     notesList.appendChild(item);
   });
 }
 
-// ---- Active Highlight ----
 function setActiveNote(noteId) {
-  document.querySelectorAll('.ehr-note-item')
-    .forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.ehr-note-item').forEach(el => el.classList.remove('active'));
 
-  const active = [...document.querySelectorAll('.ehr-note-item')]
-    .find(el =>
-      el.dataset.noteId == noteId ||
-      (noteId === SUMMARY_NOTE_ID && el.textContent === 'Summary')
-    );
-
+  const items = [...document.querySelectorAll('.ehr-note-item')];
+  const active = items.find(el =>
+    el.dataset.noteId == noteId || (noteId === SUMMARY_NOTE_ID && el.textContent === 'Summary')
+  );
   if (active) active.classList.add('active');
 }
 
-// ---- Load Single Note (CACHED) ----
 async function loadNote(noteId) {
   noteDetail.innerHTML = `<div class="text-gray-400 text-sm">Loading...</div>`;
 
   if (noteCache.has(noteId)) {
     const cached = noteCache.get(noteId);
-    renderNoteDetail(
-      cached.note.template,
-      cached.note.document_created_date,
-      cached.sections,
-      false
-    );
+    renderNoteDetail(cached.note.template, cached.note.document_created_date, cached.sections, false);
     return;
   }
 
   try {
     const data = await apiGetJson(`${SERVER_URL}/ehr/notes/${noteId}`);
     noteCache.set(noteId, data);
-
     renderNoteDetail(
       data.note?.template || 'Clinical Note',
       data.note?.document_created_date,
@@ -2279,59 +2302,41 @@ async function loadNote(noteId) {
       false
     );
   } catch {
-    noteDetail.innerHTML =
-      `<div class="text-red-500 text-sm">Failed to load note</div>`;
+    noteDetail.innerHTML = `<div class="text-red-500 text-sm">Failed to load note</div>`;
   }
 }
 
-// ---- Summary ----
 async function loadSummary() {
-  noteDetail.innerHTML =
-    `<div class="text-gray-400 text-sm">Generating summary...</div>`;
+  noteDetail.innerHTML = `<div class="text-gray-400 text-sm">Generating summary...</div>`;
 
   const res = await fetch(`${SERVER_URL}/ehr/ai/summary`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mrn: currentPatient?.mrn_no })
+    body: JSON.stringify({ mrn: currentPatient?.mrn_no }),
   });
 
   const data = await res.json();
-
-  renderNoteDetail(
-    data.template_title || 'AI Summary',
-    data.document_created_date,
-    data.sections || [],
-    true
-  );
+  renderNoteDetail(data.template_title || 'AI Summary', data.document_created_date, data.sections || [], true);
 }
 
-// ---- Render Note Detail ----
 function renderNoteDetail(template, createdDate, sections, isSummary) {
   let html = '';
 
   if (!isSummary) {
-    html += `
-      <div style="font-size:12px;font-weight:600;margin-bottom:12px;">
-        DATE: ${escapeHtml(fmtDate(createdDate))}
-      </div>
-    `;
+    html += `<div style="font-size:12px;font-weight:600;margin-bottom:12px;">
+      DATE: ${escapeHtmlEhr(fmtDate(createdDate))}
+    </div>`;
   }
 
-  html += `
-    <div style="text-align:center;font-size:18px;font-weight:800;margin-top:22px;margin-bottom:20px;">
-      ${escapeHtml(template)}
-    </div>
-  `;
+  html += `<div style="text-align:center;font-size:18px;font-weight:800;margin-top:22px;margin-bottom:20px;">
+    ${escapeHtmlEhr(template)}
+  </div>`;
 
   sections.forEach(s => {
-    html += `
-      <div style="margin-bottom:18px;">
-        <div style="font-weight:700;margin-bottom:6px;">
-          ${escapeHtml(s.component)}
-        </div>
-        <div>${escapeHtml(s.text || 'N/A')}</div>
-      </div>
-    `;
+    html += `<div style="margin-bottom:18px;">
+      <div style="font-weight:700;margin-bottom:6px;">${escapeHtmlEhr(s.component)}</div>
+      <div>${escapeHtmlEhr(s.text || 'N/A')}</div>
+    </div>`;
   });
 
   noteDetail.innerHTML = html;
