@@ -866,12 +866,15 @@ elBtnMute.addEventListener('click', async () => {
     // 1) Apply locally immediately (Android parity)
     applyMute(wantMuted);
 
-    // 2) Notify connected desktops (same as voice path)
-    for (const targetId of connectedDesktops) {
-        emitSafe('control', { from: ANDROID_XR_ID, to: targetId, command, action: command });
+    // 2) Notify ONLY paired desktop
+    const targetId = pairedDesktopId;
+    if (!targetId) {
+        msg('System', '⚠️ Not paired yet. Wait for room_joined.');
+        return;
     }
-});
+    emitSafe('control', { from: ANDROID_XR_ID, to: targetId, command, action: command });
 
+});
 
 
 
@@ -882,15 +885,31 @@ elBtnVideo.addEventListener('click', () => {
         return;
     }
     if (!isServerConnected || !streamActive) { msg('System', 'Stream not active'); return; }
+
+    // Toggle local state + choose command
+    let cmd;
     if (videoVisible) {
         videoVisible = false;
         ensureStreamer().hideVideo();
+        cmd = 'hide_video';
     } else {
         videoVisible = true;
         ensureStreamer().showVideo();
+        cmd = 'show_video';
     }
+
+    // ✅ Tell ONLY paired dock (Option B strict)
+    const targetId = pairedDesktopId;
+    if (!targetId) {
+        msg('System', '⚠️ Not paired yet. Wait for room_joined.');
+        setStatus(true);
+        return;
+    }
+    emitSafe('control', { from: ANDROID_XR_ID, to: targetId, command: cmd, action: cmd });
+
     setStatus(true);
 });
+
 
 // ----------------- Voice + Notes (partial/final transcripts) -----------------
 let SR = null, rec = null, speechIntentLang = 'en-US';
@@ -975,15 +994,21 @@ function processVoiceCommand(cmd) {
         if (isServerConnected) elBtnConnect.click(); else msg('Voice', 'Already disconnected.');
         return;
     }
-    if (/\bunmute\b/.test(c)) { if (micMuted) sendControlCommand('unmute'); else msg('Voice', 'Already unmuted.'); return; }
-    if (/\bmute\b/.test(c)) { if (!micMuted) sendControlCommand('mute'); else msg('Voice', 'Already muted.'); return; }
-    if (/\bstart\b/.test(c)) { sendControlCommand('start_stream'); return; }
-    if (/\bstop\b/.test(c)) { sendControlCommand('stop_stream'); return; }
-    if (/\bhide\b/.test(c)) { sendControlCommand('hide_video'); return; }
-    if (/\bshow\b/.test(c)) { sendControlCommand('show_video'); return; }
+
+    // ✅ Voice uses the SAME path as UI buttons (prevents double-trigger)
+    if (/\bunmute\b/.test(c)) { if (micMuted) elBtnMute.click(); else msg('Voice', 'Already unmuted.'); return; }
+    if (/\bmute\b/.test(c)) { if (!micMuted) elBtnMute.click(); else msg('Voice', 'Already muted.'); return; }
+
+    if (/\bstart\b/.test(c)) { if (!streamActive) elBtnStream.click(); else msg('Voice', 'Stream already active.'); return; }
+    if (/\bstop\b/.test(c)) { if (streamActive) elBtnStream.click(); else msg('Voice', 'Stream already stopped.'); return; }
+
+    if (/\bhide\b/.test(c)) { if (videoVisible) elBtnVideo.click(); else msg('Voice', 'Video already hidden.'); return; }
+    if (/\bshow\b/.test(c)) { if (!videoVisible) elBtnVideo.click(); else msg('Voice', 'Video already shown.'); return; }
 
     msg('Voice', `Unrecognized command: ${cmd}`);
 }
+
+
 
 elBtnVoice.addEventListener('click', () => {
     if (!hasDeviceWritePermission()) {
@@ -1014,17 +1039,18 @@ function finalizeRecordingNote() {
     if (finalText) sendTranscript(finalText, true);
 
     // 🚀 Trigger SOAP on Dock/Scribe (action+command for compatibility)
-    if (connectedDesktops.length > 0) {
-        for (const targetId of connectedDesktops) {
-            emitSafe('control', {
-
-                from: ANDROID_XR_ID,
-                to: targetId,
-                command: 'scribe_flush',
-                action: 'scribe_flush'
-            });
-        }
+    const targetId = pairedDesktopId;
+    if (!targetId) {
+        msg('System', '⚠️ Not paired yet. Wait for room_joined.');
+    } else {
+        emitSafe('control', {
+            from: ANDROID_XR_ID,
+            to: targetId,
+            command: 'scribe_flush',
+            action: 'scribe_flush'
+        });
     }
+
 
     noteBuffer = '';
 }
@@ -1065,7 +1091,6 @@ async function sendTranscript(text, isFinal) {
 }
 
 // ----------------- Control & Chat sending -----------------
-
 function sendControlCommand(command) {
     // 🔒 READ-only guard for any remote control / streaming
     if (!hasDeviceWritePermission()) {
@@ -1073,26 +1098,18 @@ function sendControlCommand(command) {
         return;
     }
 
-    // ✅ Option B strict: prefer paired desktop only, else fallback to current list
-    const targets = pairedDesktopId ? [pairedDesktopId] : connectedDesktops.slice();
+    // ✅ Option B strict: ONLY the paired desktop (never broadcast to connectedDesktops)
+    const targetId = pairedDesktopId;
 
-    if (targets.length === 0) {
-        msg('System', 'No desktops connected to send command');
+    if (!targetId) {
+        msg('System', '⚠️ Not paired yet. Wait for room_joined before sending voice commands.');
         return;
     }
 
-    for (const targetId of targets) {
-        // ✅ Use emitSafe so signaling queue + roomId logic is preserved
-        emitSafe('control', { from: ANDROID_XR_ID, to: targetId, command, action: command });
-    }
+    // ✅ Use emitSafe so signaling queue + roomId logic is preserved
+    emitSafe('control', { from: ANDROID_XR_ID, to: targetId, command, action: command });
 
-    // local handling mirrors Android’s immediate UI update:
-    if (command === 'start_stream') elBtnStream.click();
-    else if (command === 'stop_stream') elBtnStream.click();
-    else if (command === 'mute') { if (!micMuted) elBtnMute.click(); }
-    else if (command === 'unmute') { if (micMuted) elBtnMute.click(); }
-    else if (command === 'hide_video') { if (videoVisible) elBtnVideo.click(); }
-    else if (command === 'show_video') { if (!videoVisible) elBtnVideo.click(); }
+
 }
 
 

@@ -5245,7 +5245,7 @@ io.on('connection', (socket) => {
       }
 
       dlog('[control] pair-room emit', { roomId, ignoredTo: to || null });
-      io.to(roomId).emit('control', payload);
+      socket.to(roomId).emit('control', payload); // ✅ do not echo back to sender
 
     } catch (err) {
       derr('[control] handler error:', err.message);
