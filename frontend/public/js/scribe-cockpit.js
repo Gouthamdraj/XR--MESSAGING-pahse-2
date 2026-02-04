@@ -371,7 +371,7 @@ function updateDeviceList(payload) {
     pendingEmptyDeviceListTimer = null;
   }
 
-  deviceListEl.innerHTML = '';
+
 
   if (devices.length === 0) {
     // Delay rendering empty to avoid flicker from transient races
@@ -382,6 +382,8 @@ function updateDeviceList(payload) {
     }, 800);
     return;
   }
+
+  deviceListEl.innerHTML = '';
 
 
   devices.forEach(d => {
@@ -1888,7 +1890,8 @@ function connectTo(endpointBase, onFailover) {
 
         clearCockpitUiForRoomSwitch(prevRoom, null);
 
-        showNoDevices();
+        // ✅ use debounced empty handling (prevents bounce)
+        updateDeviceList([]);
         updateConnectionStatus('peer_left', []);
         requestDeviceListThrottled('after_peer_left');
       });
@@ -1963,7 +1966,7 @@ function connectTo(endpointBase, onFailover) {
 
       clearCockpitUiForRoomSwitch(prevRoom, null);
 
-      showNoDevices();
+      updateDeviceList([]);
       updateConnectionStatus('disconnect', []);
     });
   });
