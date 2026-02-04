@@ -355,6 +355,7 @@ function showNoDevices() {
 }
 // ✅ ADD THIS LINE HERE
 let pendingEmptyDeviceListTimer = null;
+let lastRenderedDeviceKey = '';
 
 function updateDeviceList(payload) {
   const devices = Array.isArray(payload)
@@ -371,11 +372,25 @@ function updateDeviceList(payload) {
     pendingEmptyDeviceListTimer = null;
   }
 
+  // ✅ NEW: Build stable membership key (sorted xrIds)
+  const ids = devices
+    .map(d => String(d?.xrId || '').trim().toUpperCase())
+    .filter(Boolean)
+    .sort();
 
+  const nextKey = ids.join('|');
+
+  // ✅ NEW: If nothing changed, do NOT repaint DOM (prevents up/down bouncing)
+  if (nextKey && nextKey === lastRenderedDeviceKey) {
+    updateConnectionStatus('device_list', devices);
+    return;
+  }
 
   if (devices.length === 0) {
     // Delay rendering empty to avoid flicker from transient races
     pendingEmptyDeviceListTimer = setTimeout(() => {
+      // ✅ NEW: reset key when truly empty
+      lastRenderedDeviceKey = '';
       showNoDevices();
       updateConnectionStatus('device_list', []);
       pendingEmptyDeviceListTimer = null;
@@ -383,10 +398,19 @@ function updateDeviceList(payload) {
     return;
   }
 
+  // ✅ NEW: membership changed → repaint once and lock key
+  lastRenderedDeviceKey = nextKey;
+
   deviceListEl.innerHTML = '';
 
+  // ✅ NEW: Render in stable order so list never flips
+  const sortedDevices = devices.slice().sort((a, b) => {
+    const ax = String(a?.xrId || '').trim().toUpperCase();
+    const bx = String(b?.xrId || '').trim().toUpperCase();
+    return ax.localeCompare(bx);
+  });
 
-  devices.forEach(d => {
+  sortedDevices.forEach(d => {
     const name = d?.deviceName || d?.name || (d?.xrId ? `Device (${d.xrId})` : 'Unknown');
     const li = document.createElement('li');
     li.className = 'text-gray-300';
@@ -396,6 +420,8 @@ function updateDeviceList(payload) {
 
   updateConnectionStatus('device_list', devices);
 }
+
+
 
 
 // ============================================================================
