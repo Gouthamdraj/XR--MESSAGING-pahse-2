@@ -244,16 +244,6 @@ function mergeIncremental(prev, next) {
 let currentRoom = null;
 let pairedPeerId = null; // set when server emits room_joined
 
-function messageHistoryKey(roomId) {
-    // If not paired yet, still isolate per XR (never global)
-    const solo = `solo:${normalizeId(XR_ID || 'unknown')}`;
-
-    return roomId
-        ? `messageHistory:${roomId}`
-        : `messageHistory:${solo}`;
-}
-
-
 
 // 🔒 Sticky autoconnect flag (persist across refresh)
 const AUTO_KEY = 'XR_AUTOCONNECT';
@@ -748,7 +738,7 @@ function initSocket() {
         console.log('[SOCKET] device_list event received', {
             currentRoom,
             roomIdFromPayload,
-            len:devices.length
+            len:devices.length 
         });
         updateDeviceList(devices);
     });
@@ -769,12 +759,6 @@ function initSocket() {
         // 1) Authoritative room routing
         currentRoom = roomId || null;
         console.log('[PAIR] currentRoom set', { currentRoom });
-        // ✅ Load ONLY this room’s local history (clears old XR-9002 UI too)
-        loadMessageHistory(currentRoom);
-
-        // ✅ Ask server for authoritative room-scoped history
-        socket.emit('message_history');
-
 
 
         // 2) Determine peer safely
@@ -1058,19 +1042,13 @@ function handleSignalMessage(data) {
 
 
 
-
 function handleChatMessage(msg) {
     console.log('[CHAT] Received chat message:', msg);
-
     const normalized = normalizeMessage(msg);
-
-    // ✅ preserve roomId (server includes it OR fall back to currentRoom)
-    const roomId = msg?.roomId || currentRoom;
-    addMessageToHistory({ ...normalized, roomId });
-
-    addToRecentMessages({ ...normalized, roomId });
+    console.log('[CHAT] Normalized message:', normalized);
+    addMessageToHistory(normalized);
+    addToRecentMessages(normalized);
 }
-
 
 function handleMessagesCleared(data) {
     if (!clearedMessages.has(data.messageId)) {
@@ -1086,26 +1064,13 @@ function handleMessagesCleared(data) {
 function handleMessageHistory(data) {
     if (ignoreHistoryOnce) {
         console.log('[CHAT] Dropping server message_history once for fresh start');
-        ignoreHistoryOnce = false;
+        ignoreHistoryOnce = false;  // consume the one-time ignore
         return;
     }
-
-    const roomId = data?.roomId || currentRoom;   // ✅ authoritative
-    const msgs = Array.isArray(data?.messages) ? data.messages : [];
-
-    console.log('[CHAT] Received message_history', { roomId, count: msgs.length });
-
-    // ✅ Safety: if server history is for a different room, ignore it
-    if (roomId && currentRoom && roomId !== currentRoom) {
-        console.warn('[CHAT] Ignoring message_history for stale room', { roomId, currentRoom });
-        return;
-    }
-
-    msgs.forEach((msg) => {
+    console.log('[CHAT] Received message history with', (data?.messages || []).length, 'messages');
+    (data?.messages || []).forEach((msg) => {
         const normalized = normalizeMessage(msg);
-
-        // ✅ preserve roomId so storage goes to the correct key
-        addMessageToHistory({ ...normalized, roomId });
+        addMessageToHistory(normalized);
     });
 }
 
@@ -1635,6 +1600,11 @@ function sendMessage() {
     console.log('[CHAT] Emitting message payload:', message);
     socket.emit('message', message);
 
+    // Show locally
+    addMessageToHistory({
+        ...message,
+        timestamp: new Date().toLocaleTimeString(),
+    });
 
     messageInput.value = '';
 }
@@ -1652,12 +1622,9 @@ function normalizeMessage(message) {
 }
 
 
+// }
 function addMessageToHistory(message) {
     const msg = normalizeMessage(message);
-
-    // ✅ enforce room ownership (never store global)
-    msg.roomId = msg.roomId || currentRoom;
-    if (!msg.roomId) return;
 
     // Add to UI
     const el = document.createElement('div');
@@ -1676,22 +1643,14 @@ function addMessageToHistory(message) {
     messageHistoryDiv.appendChild(el);
     messageHistoryDiv.scrollTop = messageHistoryDiv.scrollHeight;
 
-    // ✅ Save to ROOM-SCOPED localStorage
-    const key = messageHistoryKey(msg.roomId);
-    const history = JSON.parse(localStorage.getItem(key) || '[]');
+    // Save to localStorage
+    const history = JSON.parse(localStorage.getItem('messageHistory') || '[]');
     history.push(msg);
-    localStorage.setItem(key, JSON.stringify(history));
+    localStorage.setItem('messageHistory', JSON.stringify(history));
 }
 
-
-
-function loadMessageHistory(roomId = null) {
-    const key = messageHistoryKey(roomId || currentRoom);
-    const history = JSON.parse(localStorage.getItem(key) || '[]');
-
-    // ✅ clear UI first (prevents XR-9002 history staying on screen)
-    messageHistoryDiv.innerHTML = '';
-
+function loadMessageHistory() {
+    const history = JSON.parse(localStorage.getItem('messageHistory') || '[]');
     history.forEach(msg => {
         const el = document.createElement('div');
         el.className = `message ${msg.priority}`;
@@ -1708,12 +1667,10 @@ function loadMessageHistory(roomId = null) {
     `;
         messageHistoryDiv.appendChild(el);
     });
-
     messageHistoryDiv.scrollTop = messageHistoryDiv.scrollHeight;
 }
 
-
-
+document.addEventListener('DOMContentLoaded', loadMessageHistory);
 
 function addToRecentMessages(message) {
     console.log('[CHAT] Adding to recent messages:', message);
@@ -1759,10 +1716,8 @@ function clearMessages() {
     recentMessagesDiv.innerHTML = '<div class="system-message">Messages cleared</div>';
     addSystemMessage(`🧹 Cleared messages locally by ${DEVICE_NAME}`);
 
-    // Clear ONLY this room’s message history
-    if (currentRoom) {
-        localStorage.removeItem(messageHistoryKey(currentRoom));
-    }
+    // Clear localStorage
+    localStorage.removeItem('messageHistory');
 }
 
 /* =========================
