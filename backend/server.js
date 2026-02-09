@@ -912,6 +912,36 @@ function roomOf(xrId) {
   return `xr:${normXr(xrId)}`;
 }
 
+// Message history MUST be isolated per pair room
+// Key = canonical roomId (pair:<XR-A>:<XR-B>) or solo:<XR-ID> if not paired yet
+const messageHistoryByRoom = new Map(); // Map<roomId, Array<Message>>
+const MAX_MESSAGES_PER_ROOM = 200;
+
+function roomForHistory(socket) {
+  // Option B: paired sockets have socket.data.roomId set
+  const roomId = socket?.data?.roomId;
+  if (roomId) return roomId;
+
+  // If not paired yet, keep history isolated per XR (never global)
+  const xrId = socket?.data?.xrId || 'unknown';
+  return `solo:${normXr(xrId)}`;
+}
+
+function appendMessage(roomId, msg) {
+  const arr = messageHistoryByRoom.get(roomId) || [];
+  arr.push(msg);
+  if (arr.length > MAX_MESSAGES_PER_ROOM) arr.splice(0, arr.length - MAX_MESSAGES_PER_ROOM);
+  messageHistoryByRoom.set(roomId, arr);
+}
+
+function getMessages(roomId) {
+  return messageHistoryByRoom.get(roomId) || [];
+}
+
+dlog('[STATE] messageHistoryByRoom initialized'); function roomOf(xrId) {
+  return `xr:${normXr(xrId)}`;
+}
+
 const messageHistory = [];
 dlog('[STATE] messageHistory initialized');
 
@@ -1357,16 +1387,22 @@ async function broadcastDeviceList(roomId) {
 }
 
 
+function addToMessageHistory(socket, message) {
+  const roomId = roomForHistory(socket);
 
+  const msg = {
+    ...message,
+    id: Date.now(),
+    timestamp: new Date().toISOString(),
+    roomId, // tag for safety/debug
+  };
 
+  appendMessage(roomId, msg);
 
-function addToMessageHistory(message) {
-  messageHistory.push({ ...message, id: Date.now(), timestamp: new Date().toISOString() });
-  if (messageHistory.length > 100) {
-    messageHistory.shift();
-  }
-  dlog('[MSG_HISTORY] added; len=', messageHistory.length);
+  const len = getMessages(roomId).length;
+  dlog('[MSG_HISTORY] added; room=', roomId, 'len=', len);
 }
+
 
 // -------------------- Routes --------------------
 app.get('/health', async (_req, res) => {
@@ -3269,6 +3305,26 @@ app.get('/api/platform/scribe-provider-mapping', requireLogin, requireScreen(8),
       sessionUser.type === 'SuperAdmin';
     const isMasterAdminBit = isMasterAdmin ? 1 : 0;
 
+    // ✅ Global mapped provider IDs (used to compute "Unmapped Providers" correctly)
+    // Important: this is NOT scoped by manager, and it does not expose scribe details.
+    const mappedProviderRows = await sequelize.query(
+      `
+      SELECT DISTINCT provider_user_id
+      FROM [dbo].[Scribe_Provider_Mapping]
+      WHERE row_status = 1
+        AND provider_user_id IS NOT NULL
+      `,
+      { type: Sequelize.QueryTypes.SELECT }
+    );
+
+    const mappedProviderIdsAll = (mappedProviderRows || [])
+      .map(r => r.provider_user_id)
+      .filter(v => v != null)
+      .map(v => Number(v))
+      .filter(n => Number.isFinite(n))
+      .map(n => String(n)); // normalize to string for easy frontend Set usage
+
+
     const rows = await sequelize.query(
       `
       SELECT
@@ -3326,12 +3382,6 @@ app.get('/api/platform/scribe-provider-mapping', requireLogin, requireScreen(8),
     // Shape it nicely for the frontend (no behavior impact on other routes)
     const mappings = rows.map((r) => ({
       id: r.id,
-
-      // ✅ flat XR IDs for dashboard (non-breaking)
-      scribe_xr_id: r.scribe_xr_id,
-      provider_xr_id: r.provider_xr_id,
-
-      // existing structure (Platform continues to work)
       scribe: {
         id: r.scribe_id,
         name: r.scribe_name,
@@ -3344,13 +3394,15 @@ app.get('/api/platform/scribe-provider-mapping', requireLogin, requireScreen(8),
         name: r.provider_name,
         email: r.provider_email,
         xrId: r.provider_xr_id,
+        // ✅ add these
         clinic_id: r.provider_clinic_id,
         clinic_name: r.provider_clinic_name,
+
       },
     }));
 
+    return res.json({ ok: true, mappings, mappedProviderIdsAll });
 
-    return res.json({ ok: true, mappings });
   } catch (err) {
     console.error('[PLATFORM] /api/platform/scribe-provider-mapping (GET) error:', err);
     return res
@@ -4721,12 +4773,7 @@ io.on('connection', (socket) => {
   console.log(`🔌 [CONNECTION] ${socket.id}`);
   dlog('[CONNECTION] handshake.query:', safeDataPreview(socket.handshake?.query));
 
-  // Send recent message history
-  if (messageHistory.length > 0) {
-    const recent = messageHistory.slice(-10);
-    dlog('[CONNECTION] sending message_history size=', recent.length);
-    socket.emit('message_history', { type: 'message_history', messages: recent });
-  }
+
 
   // after sending message_history (or right at the top of the connection handler)
   (async () => {
@@ -5603,13 +5650,16 @@ io.on('connection', (socket) => {
         xrId: from,
         timestamp,
       };
-      addToMessageHistory(msg);
+
 
       if (!pairRoomId) {
         dwarn('[message] no pairRoomId (not paired yet); ignoring');
         socket.emit('message_error', { message: 'Not paired yet (no room)' });
         return;
       }
+
+      // ✅ store only after we know the pair room
+      addToMessageHistory(socket, msg);
 
       dlog('[message] pair-room emit', { roomId: pairRoomId, ignoredTo: to || null });
       io.to(pairRoomId).emit('message', msg);
@@ -5842,12 +5892,16 @@ io.on('connection', (socket) => {
 
   // -------- message_history (on demand) --------
   socket.on('message_history', () => {
-    dlog('[EVENT] message_history request');
+    const roomId = roomForHistory(socket);
+    dlog('[EVENT] message_history request; room=', roomId);
+
     socket.emit('message_history', {
       type: 'message_history',
-      messages: messageHistory.slice(-10),
+      roomId,
+      messages: getMessages(roomId).slice(-10),
     });
   });
+
 
 
 
