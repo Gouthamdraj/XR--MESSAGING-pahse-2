@@ -327,7 +327,9 @@ export class SignalingClient {
 
     for (const o of arr) {
       const xrId = o?.xrId;
-      const name = o?.deviceName || o?.name || 'Unknown';
+      const name =
+        o?.fullName || o?.full_name || o?.deviceName || o?.name || 'Unknown';
+
       if (xrId && xrId !== this.xrId) list.push([name, xrId]);
       if (this.DESKTOP_ID && xrId && String(xrId).toUpperCase() === this.DESKTOP_ID) desktopOnline = true;
 

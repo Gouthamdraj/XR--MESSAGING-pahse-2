@@ -69,7 +69,7 @@ export class Message {
 
     const header = document.createElement('div');
     header.className = 'msg-header';
-    header.textContent = `${this.sender} [${this.xrId}]`;
+    header.textContent = `${this.sender}`;
 
     const ts = document.createElement('div');
     ts.className = 'msg-timestamp';
@@ -98,11 +98,12 @@ export class Message {
     const cls = this.urgent ? 'msg msg-urgent' : 'msg';
     return (
       `<div class="${cls}">` +
-        `<div class="msg-header">${escapeHTML(this.sender)} [${escapeHTML(this.xrId)}]` +
-          (this.urgent ? ` <span class="msg-badge-urgent">URGENT</span>` : '') +
-        `</div>` +
-        `<div class="msg-timestamp">${escapeHTML(this.formatTime())}</div>` +
-        `<div class="msg-text">${escapeHTML(this.text)}</div>` +
+      `<div class="msg-header">${escapeHTML(this.sender)}` +
+
+      (this.urgent ? ` <span class="msg-badge-urgent">URGENT</span>` : '') +
+      `</div>` +
+      `<div class="msg-timestamp">${escapeHTML(this.formatTime())}</div>` +
+      `<div class="msg-text">${escapeHTML(this.text)}</div>` +
       `</div>`
     );
   }

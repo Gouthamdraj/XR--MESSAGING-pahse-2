@@ -1,3 +1,4 @@
+
 (() => {
   'use strict';
 
@@ -161,6 +162,87 @@
     lastNoteTouchedAt: 0,
   };
 
+  // =====================================================================================
+  //  XR NAME CACHE (UI ONLY) — do NOT affect routing/storage
+  // =====================================================================================
+  const xrNameById = new Map();
+
+  // Normalize XR-ID to match app.js format (e.g., "1234" → "XR-1234", "xr-1234" → "XR-1234")
+  function normalizeId(v) {
+    const s = (v || '').trim();
+    if (!s) return '';
+    // If it's just digits, add XR- prefix
+    if (/^\d+$/.test(s)) return `XR-${s}`;
+    // Otherwise uppercase it
+    return s.toUpperCase();
+  }
+
+  function rememberXrName(xrId, fullName) {
+    const xr = normalizeId(xrId);
+    const nm = String(fullName || '').trim();
+    if (!xr || !nm) return;
+    xrNameById.set(xr, nm);
+
+    // Persist for refresh
+    saveXrNameCache();
+  }
+
+
+  function fullNameForXrId(xrId) {
+    const xr = normalizeId(xrId);
+    return xrNameById.get(xr) || '';
+  }
+
+  // Never show XR-#### or Desktop#### in transcript header
+  function displayOnlyFullName(xrIdOrLabel) {
+    const raw = String(xrIdOrLabel || '').trim();
+
+    if (!raw) return 'Peer';
+
+    // Always try to get full name first (normalizeId handles the format)
+    const fullName = fullNameForXrId(raw);
+    if (fullName) return fullName;
+
+    // If it's an internal ID (XR-#### or Desktop####), show "Peer" instead
+    const looksInternal =
+      /^XR-\d+$/i.test(raw) ||
+      /^DESKTOP\d+$/i.test(raw) ||
+      /^\d+$/.test(raw); // Also match plain numbers like "9001"
+
+    if (looksInternal) {
+      return 'Peer';
+    }
+
+    // If server sends a human-readable label (not in our map), allow it
+    // But don't show "Unknown" - convert it to "Peer"
+    if (/^unknown$/i.test(raw)) {
+      return 'Peer';
+    }
+
+    return raw;
+  }
+
+  function peerXrIdForFrom(fromXrId) {
+    const room = String(state.currentRoom || '').trim();
+    if (!room) return '';
+
+    // Canonical room: pair:<XR-A>:<XR-B>
+    const m = room.match(/^pair:([^:]+):([^:]+)$/i);
+    if (!m) return '';
+
+    const a = normalizeId(m[1]);
+    const b = normalizeId(m[2]);
+    const f = normalizeId(fromXrId);
+
+    if (!a || !b || !f) return '';
+    if (f === a) return b;
+    if (f === b) return a;
+
+    // If from isn't one of the two in the room, can't infer safely
+    return '';
+  }
+
+
   // =============================================================================
   //  STORAGE KEYS (room-scoped + legacy fallback)
   // =============================================================================
@@ -178,6 +260,17 @@
 
   const LS_KEYS = {
     HISTORY: () => (state.currentRoom ? roomLS('history') : LEGACY_KEYS.HISTORY),
+    LATEST_SOAP: () =>
+      state.currentRoom ? roomLS('latestSoap') : LEGACY_KEYS.LATEST_SOAP,
+    ACTIVE_ITEM_ID: () =>
+      state.currentRoom ? roomLS('activeItem') : LEGACY_KEYS.ACTIVE_ITEM_ID,
+    MED_AVAIL: () =>
+      state.currentRoom ? roomLS('medAvailability') : LEGACY_KEYS.MED_AVAIL,
+
+    // ✅ ADD THIS (UI-only name cache)
+    XR_NAMES: () =>
+      state.currentRoom ? roomLS('xrNames') : 'scribe.xrNames',
+
     LATEST_SOAP: () => (state.currentRoom ? roomLS('latestSoap') : LEGACY_KEYS.LATEST_SOAP),
     ACTIVE_ITEM_ID: () => (state.currentRoom ? roomLS('activeItem') : LEGACY_KEYS.ACTIVE_ITEM_ID),
     MED_AVAIL: () => (state.currentRoom ? roomLS('medAvailability') : LEGACY_KEYS.MED_AVAIL),
@@ -206,6 +299,26 @@
       return fallback;
     }
   }
+
+  function saveXrNameCache() {
+    try {
+      const obj = Object.fromEntries(xrNameById.entries());
+      localStorage.setItem(LS_KEYS.XR_NAMES(), JSON.stringify(obj));
+    } catch { }
+  }
+
+  function loadXrNameCache() {
+    try {
+      const raw = lsSafeParse(LS_KEYS.XR_NAMES(), {}) || {};
+      xrNameById.clear();
+      Object.entries(raw).forEach(([xr, nm]) => {
+        const id = normalizeId(xr);
+        const name = String(nm || '').trim();
+        if (id && name) xrNameById.set(id, name);
+      });
+    } catch { }
+  }
+
 
   function lsSafeParse(key, fallback) {
     try {
@@ -728,6 +841,163 @@
     setStatus(status);
   }
 
+  // =====================================================================================
+  //  DEVICE LIST (throttle + watchdog)
+  // =====================================================================================
+  function showNoDevices() {
+    if (!dom.deviceList) return;
+    dom.deviceList.innerHTML = '';
+    const li = document.createElement('li');
+    li.className = 'text-gray-400';
+    li.textContent = 'No devices online';
+    dom.deviceList.appendChild(li);
+  }
+
+  function requestDeviceListThrottled(_why) {
+    const now = Date.now();
+    const minGapMs = state.currentRoom
+      ? CONST.DEVICE_LIST_THROTTLE_ROOM_MS
+      : CONST.DEVICE_LIST_THROTTLE_NO_ROOM_MS;
+
+    if (now - state.lastReqListAt < minGapMs) return;
+    if (state.reqListTimer) return;
+
+    state.reqListTimer = setTimeout(() => {
+      state.reqListTimer = null;
+      state.lastReqListAt = Date.now();
+      if (!state.socket?.connected) return;
+      try {
+        state.socket.emit('request_device_list');
+      } catch { }
+    }, 50);
+  }
+
+  function stopDeviceListWatchdog() {
+    if (state.deviceListPollTimer) {
+      clearInterval(state.deviceListPollTimer);
+      state.deviceListPollTimer = null;
+    }
+  }
+
+  function startDeviceListWatchdog() {
+    stopDeviceListWatchdog();
+    state.deviceListPollTimer = setInterval(() => {
+      if (!state.socket?.connected) return;
+      if (document.visibilityState === 'hidden') return;
+      requestDeviceListThrottled('watchdog_poll');
+    }, CONST.DEVICE_LIST_POLL_MS);
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') requestDeviceListThrottled('tab_visible');
+  });
+
+  function updateDeviceList(payload) {
+    let devices = Array.isArray(payload)
+      ? payload
+      : Array.isArray(payload?.devices)
+        ? payload.devices
+        : [];
+
+    // If the server includes room metadata on device entries, filter to the current room.
+    // This prevents showing devices from other rooms if the backend emits a broader list.
+    if (state.currentRoom && Array.isArray(devices) && devices.length) {
+      const cr = String(state.currentRoom).trim();
+      const filtered = devices.filter((d) => {
+        const r =
+          d?.roomId ??
+          d?.room ??
+          d?.pairId ??
+          d?.pair_id ??
+          d?.data?.roomId ??
+          d?.data?.room ??
+          d?.data?.pairId ??
+          null;
+        if (!r) return true; // if backend doesn't attach room on device, keep it
+        return String(r).trim() === cr;
+      });
+      devices = filtered;
+    }
+
+    if (!dom.deviceList) return;
+
+    if (state.pendingEmptyDeviceListTimer) {
+      clearTimeout(state.pendingEmptyDeviceListTimer);
+      state.pendingEmptyDeviceListTimer = null;
+    }
+
+    const keys = devices
+      .map((d) => {
+        const xr = normalizeId(d?.xrId);
+        if (!xr) return '';
+        const nm = String(
+          d?.fullName ||
+          d?.full_name ||
+          d?.deviceName ||
+          d?.name ||
+          ''
+        ).trim();
+        rememberXrName(xr, nm); // Store normalized XR-ID → Full Name
+        // include name in the key so UI re-renders when fullName arrives later
+        return `${xr}:${nm}`;
+      })
+      .filter(Boolean)
+      .sort();
+
+    const nextKey = keys.join('|');
+
+    if (nextKey && nextKey === state.lastRenderedDeviceKey) {
+      updateConnectionStatus('device_list', devices);
+      return;
+    }
+
+
+    if (devices.length === 0) {
+      state.pendingEmptyDeviceListTimer = setTimeout(() => {
+        state.lastRenderedDeviceKey = '';
+        showNoDevices();
+        updateConnectionStatus('device_list', []);
+        state.pendingEmptyDeviceListTimer = null;
+      }, CONST.EMPTY_DEVICE_DELAY_MS);
+      return;
+    }
+
+    state.lastRenderedDeviceKey = nextKey;
+    dom.deviceList.innerHTML = '';
+
+    const sorted = devices.slice().sort((a, b) => {
+      const ax = String(a?.xrId || '').trim().toUpperCase();
+      const bx = String(b?.xrId || '').trim().toUpperCase();
+      return ax.localeCompare(bx);
+    });
+
+    sorted.forEach((d) => {
+      const fullName = d?.fullName || d?.full_name || '';
+      const xrId = d?.xrId || '';
+
+      let displayName;
+      if (fullName) {
+        // Show only the full name when available
+        displayName = fullName;
+      } else {
+        // Fallback to XR-ID if no full name
+        displayName = xrId || 'Unknown';
+      }
+
+      const li = document.createElement('li');
+      li.className = 'text-gray-300';
+      li.textContent = displayName;
+      li.dataset.xrId = xrId;
+
+      dom.deviceList.appendChild(li);
+    });
+
+    updateConnectionStatus('device_list', devices);
+  }
+
+  // =====================================================================================
+  //  HISTORY STORAGE (UPDATED MODEL)
+  // =====================================================================================
   // =============================================================================
   //  HISTORY STORAGE
   // =============================================================================
@@ -970,9 +1240,22 @@
     const header = document.createElement('div');
     header.className = 'text-sm mb-1';
     const time = timestamp ? new Date(timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
-    header.innerHTML = `🗣️ <span class="font-bold">${escapeHtml(from || 'Unknown')}</span>
-      <span class="opacity-60">→ ${escapeHtml(to || 'Unknown')}</span>
-      <span class="opacity-60">(${escapeHtml(time)})</span>`;
+    const fromLabel = displayOnlyFullName(from || '');
+    let toLabel;
+    const rawTo = String(to || '').trim();
+
+    // If to is missing OR literally "Unknown", infer peer from room and display peer full name
+    if (!rawTo || /^unknown$/i.test(rawTo)) {
+      const peerXr = peerXrIdForFrom(from || '');
+      toLabel = peerXr ? displayOnlyFullName(peerXr) : 'Peer';
+    } else {
+      toLabel = displayOnlyFullName(rawTo);
+    }
+
+
+    header.innerHTML = `🗣️ <span class="font-bold">${escapeHtml(fromLabel)}</span>
+      <span class="opacity-60">→ ${escapeHtml(toLabel)}</span>
+      <span class="opacity-60">(${time})</span>`;
     card.appendChild(header);
 
     const body = document.createElement('div');
@@ -1082,6 +1365,7 @@
 
     removeTranscriptPlaceholder();
 
+    // Store the original XR-IDs so we can look up names dynamically later
     const item = {
       id: uid(),
       from: from || 'Unknown',
@@ -2572,10 +2856,10 @@
 
       const rawVal = state.latestSoapNote?.[section];
       const contentText = Array.isArray(rawVal)
-        ? rawVal.join('\n')
-        : typeof rawVal === 'string'
-          ? rawVal
-          : '';
+      ? rawVal.join('\n')
+      : typeof rawVal === 'string'
+      ? rawVal
+      : '';
       box.value = contentText;
       autoExpandTextarea(box);
 
@@ -2800,79 +3084,6 @@
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') requestDeviceListThrottled();
   });
-
-  function updateDeviceList(payload) {
-    let devices = Array.isArray(payload)
-      ? payload
-      : Array.isArray(payload?.devices)
-        ? payload.devices
-        : [];
-
-    // If room is set, filter device list by room when the payload includes room info
-    if (state.currentRoom && Array.isArray(devices) && devices.length) {
-      const cr = String(state.currentRoom).trim();
-      devices = devices.filter((d) => {
-        const r =
-          d?.roomId ??
-          d?.room ??
-          d?.pairId ??
-          d?.pair_id ??
-          d?.data?.roomId ??
-          d?.data?.room ??
-          d?.data?.pairId ??
-          null;
-        if (!r) return true;
-        return String(r).trim() === cr;
-      });
-    }
-
-    if (!dom.deviceList) return;
-
-    if (state.pendingEmptyDeviceListTimer) {
-      clearTimeout(state.pendingEmptyDeviceListTimer);
-      state.pendingEmptyDeviceListTimer = null;
-    }
-
-    const ids = devices
-      .map((d) => String(d?.xrId || '').trim().toUpperCase())
-      .filter(Boolean)
-      .sort();
-    const nextKey = ids.join('|');
-
-    if (nextKey && nextKey === state.lastRenderedDeviceKey) {
-      updateConnectionStatus('device_list', devices);
-      return;
-    }
-
-    if (devices.length === 0) {
-      state.pendingEmptyDeviceListTimer = setTimeout(() => {
-        state.lastRenderedDeviceKey = '';
-        showNoDevices();
-        updateConnectionStatus('device_list', []);
-        state.pendingEmptyDeviceListTimer = null;
-      }, CONFIG.EMPTY_DEVICE_DELAY_MS);
-      return;
-    }
-
-    state.lastRenderedDeviceKey = nextKey;
-    dom.deviceList.innerHTML = '';
-
-    const sorted = devices.slice().sort((a, b) => {
-      const ax = String(a?.xrId || '').trim().toUpperCase();
-      const bx = String(b?.xrId || '').trim().toUpperCase();
-      return ax.localeCompare(bx);
-    });
-
-    sorted.forEach((d) => {
-      const name = d?.deviceName || d?.name || (d?.xrId ? `Device (${d.xrId})` : 'Unknown');
-      const li = document.createElement('li');
-      li.className = 'text-gray-300';
-      li.textContent = d?.xrId ? `${name} (${d.xrId})` : name;
-      dom.deviceList.appendChild(li);
-    });
-
-    updateConnectionStatus('device_list', devices);
-  }
 
   // =============================================================================
   //  SOCKET SIGNAL HANDLING
@@ -3211,6 +3422,8 @@
           const nextRoom = roomId || null;
           clearCockpitUiForRoomSwitch(prevRoom, nextRoom);
           state.currentRoom = nextRoom;
+          // ✅ Load saved XR → fullName map BEFORE restoring history
+          try { loadXrNameCache(); } catch { }
           updateConnectionStatus('room_joined', []);
           try { restoreFromLocalStorage(); } catch { }
           if (state.currentRoom) requestDeviceListThrottled();
@@ -4405,6 +4618,9 @@
 
       ensureAiDiagnosisPaneHeader();
       clearAiDiagnosisPaneUi();
+
+      // Load XR name cache before restoring history so full names display correctly
+      try { loadXrNameCache(); } catch { }
 
       restoreFromLocalStorage();
       wireSoapActionButtons();
