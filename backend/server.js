@@ -5589,6 +5589,11 @@ io.on('connection', (socket) => {
     // ✅ Accept this socket
     socket.data.deviceName = deviceName || 'Unknown';
     socket.data.xrId = XR;
+    // ✅ NEW: resolve and attach DB fullName for this XR (UI-friendly)
+    try {
+      const fn = await resolveFullNameByXrId(XR);
+      if (fn) socket.data.fullName = fn;
+    } catch { }
 
     // ✅ Option B: Redis owner lock (authoritative online/offline)
     try {
