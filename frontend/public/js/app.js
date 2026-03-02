@@ -96,6 +96,27 @@ function applyDockReadOnlyUI() {
     if (clearMessagesBtn) clearMessagesBtn.disabled = true;
 }
 
+// =======================
+// Auto XR-ID fetch (Platform session -> Dock)
+// =======================
+async function fetchLoggedInXrIdFromSession() {
+    try {
+        // server.js already exposes /api/platform/me (returns { ok, xrId, ... })
+        const res = await fetch('/api/platform/me', {
+            method: 'GET',
+            credentials: 'include',
+            headers: { 'Accept': 'application/json' }
+        });
+
+        if (!res.ok) return null;
+        const data = await res.json();
+        const xr = (data?.xrId || '').trim();
+        return xr ? xr : null;
+    } catch (e) {
+        console.warn('[AUTO-XR] Failed to fetch /api/platform/me:', e);
+        return null;
+    }
+}
 
 // Mirror helper for the scribe view
 function setMirror(on) {
@@ -127,6 +148,10 @@ let isStreamActive = false;
 let reconnectTimeout = null;
 let heartbeatInterval = null;
 let lastDeviceList = []; // remember last list we got
+const xrNameById = new Map(); // xrId -> full name (for message history display)
+let lastNameSig = ''; // prevents re-render spam when device_list repeats
+
+
 let duplicateNotified = false; // notify once per session about duplicate tabs
 let duplicateLock = false; // 🔒 prevents reconnect loops once server says ID is in use
 // --- perfect-negotiation helpers (for safe offer handling) ---
@@ -934,6 +959,10 @@ function toggleConnection() {
 
         setStatus('Connecting');
         try { localStorage.setItem(AUTO_KEY, '1'); } catch { }
+
+        // ✅ Clear immediately so "Desktop####" never flashes
+        lastDeviceList = [];
+        updateDeviceList([]);
         socket.connect();
     }, 300); // small window to receive presence replies
 }
@@ -1505,6 +1534,31 @@ function updateDeviceList(devices) {
     }
 
     lastDeviceList = devices;
+    // ✅ Build XR_ID -> Full Name map (used by Message History display)
+    // IMPORTANT: do NOT clear on empty lists (empty device_list can occur during pairing/reconnect)
+    if (devices.length > 0) {
+        xrNameById.clear();
+        devices.forEach(d => {
+            const id = normalizeId(d?.xrId);
+            const nm = (d?.fullName || d?.full_name || '').trim();
+            if (id && nm) xrNameById.set(id, nm);
+        });
+    }
+
+    // ✅ ADD THIS BLOCK HERE (before console.log device_list recv)
+    const nameSig = Array.from(xrNameById.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([id, nm]) => `${id}=${nm}`)
+        .join('|');
+
+    if (nameSig && nameSig !== lastNameSig) {
+        lastNameSig = nameSig;
+
+        // Re-render message history so XR IDs change to full names immediately
+        if (currentRoom) loadMessageHistory(currentRoom);
+    }
+
+
 
     console.log('[DEVICES] device_list recv', {
         socketConnected: !!socket?.connected,
@@ -1565,6 +1619,13 @@ function updateDeviceList(devices) {
         const isSelfId = devIdNorm === normalizeId(myId);
         if (isSelfId) sameIdCount += 1;
 
+        // ✅ No-flicker: do NOT render SELF until server provides fullName
+        if (isSelfId) {
+            const selfFull = (device.fullName || device.full_name || '').trim();
+            if (!selfFull) return;
+        }
+
+
 
         // If disconnected, hide our own Desktop entry (prevents showing stale self while offline)
         if (isSelfId && !(socket && socket.connected)) return;
@@ -1572,12 +1633,14 @@ function updateDeviceList(devices) {
 
 
         const name = isSelfId
-            ? (DEVICE_NAME || 'This device')
-            : (device.deviceName || device.name || 'Unknown');
+            ? (device.fullName || device.full_name || DEVICE_NAME || 'This device')
+            : (device.fullName || device.full_name || device.deviceName || device.name || 'Unknown');
+
+
 
         console.log(`[DEVICE] Adding device: ${name} (${device.xrId})`);
         const li = document.createElement('li');
-        li.textContent = `${name} (${device.xrId})`;
+        li.textContent = `${name}`;
         deviceListElement.appendChild(li);
 
         if (peerId && devIdNorm === normalizeId(peerId)) {
@@ -1639,17 +1702,27 @@ function sendMessage() {
     messageInput.value = '';
 }
 
+function fullNameForXrId(xrId) {
+    const id = normalizeId(xrId);
+    if (!id) return '';
+    return xrNameById.get(id) || '';
+}
+
 
 function normalizeMessage(message) {
+    const xrRaw = message?.xrId || message?.from || 'unknown';
+    const full = fullNameForXrId(xrRaw);
+
     return {
         text: message?.text || '',
         sender: message?.sender || message?.from || 'unknown',
-        xrId: message?.xrId || message?.from || 'unknown',
+        xrId: xrRaw, // ✅ keep XR ID for storage/debug (no behavior change)
+        displayName: full || (message?.sender || message?.from || xrRaw || 'unknown'), // ✅ for UI
         timestamp: message?.timestamp || new Date().toLocaleTimeString(),
-        priority:
-            message?.urgent || message?.priority === 'urgent' ? 'urgent' : 'normal',
+        priority: message?.urgent || message?.priority === 'urgent' ? 'urgent' : 'normal',
     };
 }
+
 
 
 function addMessageToHistory(message) {
@@ -1665,8 +1738,9 @@ function addMessageToHistory(message) {
     el.innerHTML = `
 <div class="message-header">
 <div class="sender-info">
-<span class="sender-name">${msg.sender}</span>
-<span class="xr-id">${msg.xrId}</span>
+<span class="sender-name">${fullNameForXrId(msg.xrId) || msg.displayName || msg.sender}</span>
+<span class="xr-id" style="display:none">${msg.xrId}</span>
+
 </div>
 <div class="message-time">${msg.timestamp}</div>
 </div>
@@ -1698,8 +1772,8 @@ function loadMessageHistory(roomId = null) {
         el.innerHTML = `
 <div class="message-header">
 <div class="sender-info">
-<span class="sender-name">${msg.sender}</span>
-<span class="xr-id">${msg.xrId}</span>
+<span class="sender-name">${fullNameForXrId(msg.xrId) || msg.displayName || msg.sender}</span>
+<span class="xr-id" style="display:none">${msg.xrId}</span>
 </div>
 <div class="message-time">${msg.timestamp}</div>
 </div>
@@ -1722,8 +1796,9 @@ function addToRecentMessages(message) {
     el.className = `recent-message ${msg.priority}`;
     el.innerHTML = `
     <div class="recent-message-header">
-      <span class="recent-sender">${msg.sender}</span>
-      <span class="recent-xr-id">${msg.xrId}</span>
+      <span class="recent-sender">${msg.displayName || msg.sender}</span>
+      <span class="recent-xr-id" style="display:none">${msg.xrId}</span>
+
       <span class="recent-time">${msg.timestamp}</span>
     </div>
     <div class="recent-message-content">${msg.text}</div>
@@ -1972,6 +2047,35 @@ window.addEventListener('load', async () => {
 
     // Initialize socket (handlers only; do not dial yet)
     initSocket();
+
+    // =========================
+    // AUTO CONNECT (cold open only)
+    // - Fetch logged-in xrId from Platform session
+    // - Fill input only if empty (never override manual)
+    // - Trigger existing connect path via toggleConnection()
+    // =========================
+    try {
+        const existing = normalizeId(xrIdInput.value);
+
+        if (!existing) {
+            const xrFromSession = await fetchLoggedInXrIdFromSession();
+            if (xrFromSession) {
+                xrIdInput.value = xrFromSession;
+                console.log('[AUTO-XR] Filled XR ID from session:', xrFromSession);
+            } else {
+                console.log('[AUTO-XR] No xrId in session (or not logged in). Manual entry stays.');
+            }
+        }
+
+        // Only auto-connect on cold open (not reload)
+        if (!isReload && normalizeId(xrIdInput.value)) {
+            console.log('[AUTO-XR] Cold open -> auto-connecting using existing toggleConnection()');
+            toggleConnection(); // ✅ same logic as clicking the connect pill
+            return;             // ✅ prevents the "stay disconnected" branch from running
+        }
+    } catch (e) {
+        console.warn('[AUTO-XR] Auto-connect skipped:', e);
+    }
 
     /* (5) Auto-reconnect on reload for any XR_ID (Option B) */
     let shouldAuto = false;

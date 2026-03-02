@@ -702,6 +702,29 @@ async function resolveXrIdByUserId(userId) {
   const xr = rows?.[0]?.xr_id;
   return xr ? String(xr).trim() : null;
 }
+
+async function resolveFullNameByXrId(xrId) {
+  const key = normXr(xrId);
+  if (!key) return null;
+
+  try {
+    const rows = await sequelize.query(
+      `
+        SELECT TOP 1 full_name
+        FROM System_Users
+        WHERE row_status = 1
+          AND LOWER(LTRIM(RTRIM(xr_id))) = :xr
+      `,
+      {
+        replacements: { xr: String(key).toLowerCase() },
+        type: Sequelize.QueryTypes.SELECT
+      }
+    );
+    return rows?.[0]?.full_name || null;
+  } catch {
+    return null;
+  }
+}
 async function findSocketByXrIdCI_Cluster(xrId, debugSocket = null) {
   const XR = normXr(xrId);
   if (!XR) {
@@ -995,12 +1018,46 @@ async function buildDeviceListGlobal() {
 // ✅ Build device list strictly for a given room (pair isolation)
 // ✅ FIX: do NOT use fetchSockets() (it is timing out with your adapter)
 // Instead: parse the canonical room name "pair:XR-A:XR-B" and use online maps.
+// Instead: parse the canonical room name "pair:XR-A:XR-B" and use online maps.
 async function buildDeviceListForRoom(roomId) {
   const stamp = new Date().toISOString();
   const inst = process.env.WEBSITE_INSTANCE_ID || process.env.COMPUTERNAME || 'local';
 
   dlog(`[DEVICE_LIST][${stamp}][${inst}] ▶ buildDeviceListForRoom called`, { roomId });
   dbgToRoom(roomId, "[DEVICE_LIST] buildDeviceListForRoom called", { roomId, inst });
+
+  // ✅ NEW: resolve full name for an xrId (DB) with simple in-function cache (per call)
+  const fullNameCache = new Map();
+  async function getFullNameForXrId(xrId) {
+    const key = normXr(xrId);
+    if (!key) return null;
+    if (fullNameCache.has(key)) return fullNameCache.get(key);
+
+    try {
+      // NOTE: uses sequelize already used in server.js elsewhere
+      const rows = await sequelize.query(
+        `
+          SELECT TOP 1 full_name
+          FROM System_Users
+          WHERE row_status = 1
+            AND LOWER(LTRIM(RTRIM(xr_id))) = :xr
+        `,
+        {
+          replacements: { xr: String(key).toLowerCase() },
+          type: Sequelize.QueryTypes.SELECT
+        }
+      );
+
+      const name = rows?.[0]?.full_name || null;
+      fullNameCache.set(key, name);
+      return name;
+    } catch (e) {
+      // Fail-safe: never break device_list if DB lookup fails
+      fullNameCache.set(key, null);
+      return null;
+    }
+  }
+
 
   if (!roomId || !roomId.startsWith('pair:')) {
     dwarn(`[DEVICE_LIST][${stamp}][${inst}] invalid or non-pair roomId`, { roomId });
@@ -1072,19 +1129,24 @@ async function buildDeviceListForRoom(roomId) {
       const b = normXr(parts[2] || '');
       const ids = [a, b].filter(Boolean).slice(0, 2);
 
-      const list = ids.map(id => {
-        const bRec = batteryByDevice?.get(id) || {};
-        const tRec = telemetryByDevice?.get(id) || null;
+      const list = await Promise.all(
+        ids.map(async (id) => {
+          const bRec = batteryByDevice?.get(id) || {};
+          const tRec = telemetryByDevice?.get(id) || null;
+          const fullName = await getFullNameForXrId(id);
 
-        return {
-          xrId: id,
-          deviceName: 'Unknown',
-          battery: (typeof bRec.pct === 'number') ? bRec.pct : null,
-          charging: !!bRec.charging,
-          batteryTs: bRec.ts || null,
-          ...(tRec ? { telemetry: tRec } : {}),
-        };
-      });
+          return {
+            xrId: id,
+            fullName, // ✅ NEW
+            deviceName: 'Unknown',
+            battery: (typeof bRec.pct === 'number') ? bRec.pct : null,
+            charging: !!bRec.charging,
+            batteryTs: bRec.ts || null,
+            ...(tRec ? { telemetry: tRec } : {}),
+          };
+        })
+      );
+
 
       dlog(`[DEVICE_LIST][${stamp}][${inst}] ✅ built (cluster-fallback stable)`, {
         roomId,
@@ -1135,19 +1197,25 @@ async function buildDeviceListForRoom(roomId) {
         const b = normXr(parts[2] || '');
         const ids = [a, b].filter(Boolean).slice(0, 2);
 
-        const list = ids.map(id => {
-          const bRec = batteryByDevice?.get(id) || {};
-          const tRec = telemetryByDevice?.get(id) || null;
+        const list = await Promise.all(
+          ids.map(async (id) => {
+            const bRec = batteryByDevice?.get(id) || {};
+            const tRec = telemetryByDevice?.get(id) || null;
+            const fullName = await getFullNameForXrId(id);
 
-          return {
-            xrId: id,
-            deviceName: 'Unknown',
-            battery: (typeof bRec.pct === 'number') ? bRec.pct : null,
-            charging: !!bRec.charging,
-            batteryTs: bRec.ts || null,
-            ...(tRec ? { telemetry: tRec } : {}),
-          };
-        });
+            return {
+              xrId: id,
+              fullName, // ✅ NEW
+              deviceName: 'Unknown',
+              battery: (typeof bRec.pct === 'number') ? bRec.pct : null,
+              charging: !!bRec.charging,
+              batteryTs: bRec.ts || null,
+              ...(tRec ? { telemetry: tRec } : {}),
+            };
+          })
+        );
+
+
 
         dlog(`[DEVICE_LIST][${stamp}][${inst}] ✅ built (empty-array fallback)`, {
           roomId,
@@ -1174,9 +1242,11 @@ async function buildDeviceListForRoom(roomId) {
 
         const bRec = batteryByDevice?.get(id) || {};
         const tRec = telemetryByDevice?.get(id) || null;
+        const fullName = await getFullNameForXrId(id);
 
         list.push({
           xrId: id,
+          fullName, // ✅ NEW
           deviceName: s.data?.deviceName || 'Unknown',
           battery: (typeof bRec.pct === 'number') ? bRec.pct : null,
           charging: !!bRec.charging,
@@ -1207,18 +1277,24 @@ async function buildDeviceListForRoom(roomId) {
           if (online) onlineIds.push(id);
         }
 
-        const fallbackList = onlineIds.map(id => {
-          const bRec = batteryByDevice?.get(id) || {};
-          const tRec = telemetryByDevice?.get(id) || null;
-          return {
-            xrId: id,
-            deviceName: 'Unknown',
-            battery: (typeof bRec.pct === 'number') ? bRec.pct : null,
-            charging: !!bRec.charging,
-            batteryTs: bRec.ts || null,
-            ...(tRec ? { telemetry: tRec } : {}),
-          };
-        });
+        const fallbackList = await Promise.all(
+          onlineIds.map(async (id) => {
+            const bRec = batteryByDevice?.get(id) || {};
+            const tRec = telemetryByDevice?.get(id) || null;
+            const fullName = await getFullNameForXrId(id);
+
+            return {
+              xrId: id,
+              fullName, // ✅ NEW
+              deviceName: 'Unknown',
+              battery: (typeof bRec.pct === 'number') ? bRec.pct : null,
+              charging: !!bRec.charging,
+              batteryTs: bRec.ts || null,
+              ...(tRec ? { telemetry: tRec } : {}),
+            };
+          })
+        );
+
 
         dlog(`[DEVICE_LIST][${stamp}][${inst}] ✅ built (cluster viewer-only fallback)`, {
           roomId,
@@ -1265,13 +1341,20 @@ async function buildDeviceListForRoom(roomId) {
       const b = normXr(parts[2] || '');
       const ids = [a, b].filter(Boolean).slice(0, 2);
 
-      const list = ids.map(id => ({
-        xrId: id,
-        deviceName: 'Unknown',
-        battery: null,
-        charging: false,
-        batteryTs: null,
-      }));
+      const list = await Promise.all(
+        ids.map(async (id) => {
+          const fullName = await getFullNameForXrId(id);
+          return {
+            xrId: id,
+            fullName, // ✅ NEW
+            deviceName: 'Unknown',
+            battery: null,
+            charging: false,
+            batteryTs: null,
+          };
+        })
+      );
+
 
       dlog(`[DEVICE_LIST][${stamp}][${inst}] ✅ built (non-array fallback)`, {
         roomId,
@@ -1305,8 +1388,11 @@ async function buildDeviceListForRoom(roomId) {
     const bRec = batteryByDevice?.get(id) || {};
     const tRec = telemetryByDevice?.get(id) || null;
 
+    const fullName = await getFullNameForXrId(id);
+
     list.push({
       xrId: id,
+      fullName, // ✅ NEW
       deviceName: s.data?.deviceName || 'Unknown',
       battery: (typeof bRec.pct === 'number') ? bRec.pct : null,
       charging: !!bRec.charging,
@@ -1329,6 +1415,7 @@ async function buildDeviceListForRoom(roomId) {
 
   return finalList;
 }
+
 
 const deviceListInFlight = new Map(); // roomId -> Promise
 
@@ -5270,9 +5357,11 @@ io.on('connection', (socket) => {
       // ✅ not paired yet → self-only list
       const b = batteryByDevice?.get(XR) || {};
       const t = telemetryByDevice?.get(XR) || null;
+      const fullName = await resolveFullNameByXrId(XR);   // ✅ ADD THIS
 
       socket.emit('device_list', [{
         xrId: XR,
+        fullName: fullName || null,   // ✅ add this
         deviceName: socket.data?.deviceName || 'Unknown',
         battery: (typeof b.pct === 'number') ? b.pct : null,
         charging: !!b.charging,
@@ -5287,8 +5376,10 @@ io.on('connection', (socket) => {
       try {
         const b = batteryByDevice?.get(XR) || {};
         const t = telemetryByDevice?.get(XR) || null;
+        const fullName = await resolveFullNameByXrId(XR);   // ✅ ADD
         socket.emit('device_list', [{
           xrId: XR,
+          fullName: fullName || null,
           deviceName: socket.data?.deviceName || 'Unknown',
           battery: (typeof b.pct === 'number') ? b.pct : null,
           charging: !!b.charging,
@@ -5407,9 +5498,11 @@ io.on('connection', (socket) => {
         try {
           const b = batteryByDevice?.get(XR) || {};
           const t = telemetryByDevice?.get(XR) || null;
+          const fullName = await resolveFullNameByXrId(XR);
 
           socket.emit('device_list', [{
             xrId: XR,
+            fullName: fullName || null,   // ✅ ADD THIS
             deviceName: primaryFinal.data?.deviceName || 'Unknown',
             battery: (typeof b.pct === 'number') ? b.pct : null,
             charging: !!b.charging,
@@ -5496,7 +5589,6 @@ io.on('connection', (socket) => {
     // ✅ Accept this socket
     socket.data.deviceName = deviceName || 'Unknown';
     socket.data.xrId = XR;
-    socket.data.clientType = clientType || 'device';  // 🔑 Store clientType for filtering
 
     // ✅ Option B: Redis owner lock (authoritative online/offline)
     try {
@@ -5530,6 +5622,7 @@ io.on('connection', (socket) => {
 
       socket.emit('device_list', [{
         xrId: XR,
+        fullName: socket.data?.fullName || null,
         deviceName: socket.data?.deviceName || 'Unknown',
         battery: (typeof b.pct === 'number') ? b.pct : null,
         charging: !!b.charging,
@@ -5546,6 +5639,7 @@ io.on('connection', (socket) => {
 
       await notifyCockpitsWatchingXr(XR, [{
         xrId: XR,
+        fullName: socket.data?.fullName || null,
         deviceName: socket.data?.deviceName || 'Unknown',
         battery: (typeof b.pct === 'number') ? b.pct : null,
         charging: !!b.charging,
@@ -5689,9 +5783,11 @@ io.on('connection', (socket) => {
             try {
               const b = batteryByDevice?.get(target) || {};
               const t = telemetryByDevice?.get(target) || null;
+              const fullName = await resolveFullNameByXrId(target);
 
               const one = [{
                 xrId: target,
+                fullName: fullName || null,   // ✅ ADD
                 deviceName: primaryFinal.data?.deviceName || 'Unknown',
                 battery: (typeof b.pct === 'number') ? b.pct : null,
                 charging: !!b.charging,
@@ -5700,7 +5796,9 @@ io.on('connection', (socket) => {
               }];
 
               // ✅ CHANGED: emit device_list ONLY if changed
-              const sig = JSON.stringify(one.map(d => [d?.xrId || '', d?.deviceName || '']));
+              const sig = JSON.stringify(
+                one.map(d => [d?.xrId || '', d?.fullName || '', d?.deviceName || ''])
+              );
               if (sig !== socket.data._lastDeviceListSig) {
                 socket.emit('device_list', one);
                 socket.data._lastDeviceListSig = sig;
@@ -5790,9 +5888,11 @@ io.on('connection', (socket) => {
 
       const b = batteryByDevice?.get(xrId) || {};
       const t = telemetryByDevice?.get(xrId) || null;
+      const fullName = await resolveFullNameByXrId(xrId);
 
       const one = [{
         xrId,
+        fullName: fullName || null,   // ✅ ADD
         deviceName: socket.data?.deviceName || 'Unknown',
         battery: (typeof b.pct === 'number') ? b.pct : null,
         charging: !!b.charging,
@@ -5800,7 +5900,9 @@ io.on('connection', (socket) => {
         ...(t ? { telemetry: t } : {}),
       }];
 
-      const sig = JSON.stringify(one.map(d => [d?.xrId || '', d?.deviceName || '']));
+      const sig = JSON.stringify(
+        one.map(d => [d?.xrId || '', d?.fullName || '', d?.deviceName || ''])
+      );
       if (sig !== socket.data._lastDeviceListSig) {
         socket.emit('device_list', one);
         socket.data._lastDeviceListSig = sig;

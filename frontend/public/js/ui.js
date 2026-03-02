@@ -23,6 +23,36 @@ function normalizeXrId(raw) {
     return trimmed;
 }
 
+// =======================
+// Auto XR-ID fetch (Platform session -> /device UI)
+// =======================
+async function fetchLoggedInXrIdFromSession() {
+    try {
+        const res = await fetch('/api/platform/me', {
+            method: 'GET',
+            credentials: 'include',
+            headers: { 'Accept': 'application/json' }
+        });
+
+        if (!res.ok) return null;
+
+        const data = await res.json();
+        // ✅ NEW: Seed fullName into UI map
+        try {
+            const myFullName = (data?.fullName || data?.full_name || data?.name || '').trim();
+            const myXrId = (data?.xrId || '').trim();
+            if (myFullName && myXrId) {
+                rememberXrName(myXrId, myFullName);
+            }
+        } catch { }
+        const xr = (data?.xrId || '').trim();
+        return xr ? xr : null;
+    } catch (e) {
+        console.warn('[AUTO-XR][DEVICE] Failed to fetch /api/platform/me:', e);
+        return null;
+    }
+}
+
 
 
 // ----------------- Constants (parity) -----------------
@@ -404,6 +434,9 @@ function loadState() {
 
 
 // ---- Auto-reload on disconnect (safe + interval-guarded) ----
+// Skip auto-connect once after a manual Disconnect (prevents reconnect loop after reload)
+const SKIP_AUTO_KEY = 'XR_DEVICE_SKIP_AUTOCONNECT_ONCE';
+const LAST_XR_UI_KEY = 'XR_DEVICE_LAST_XR_ID_UI';
 const AUTO_RELOAD_ON_DISCONNECT = true;
 const AUTO_RELOAD_ONLY_MANUAL = false;        // set true to reload only when user clicked Disconnect
 const RELOAD_GRACE_MS = 2000;
@@ -498,16 +531,115 @@ function applyMute(wantMuted) {
     setStatus(isServerConnected);
 }
 
+// ----------------- Full-name display (UI only; logic untouched) -----------------
+const xrNameById = new Map(); // xrId (upper) -> fullName
 
-function preferDesktop(listPairs) {
-    const ids = listPairs.map(p => String(p?.[1] || '').toUpperCase()).filter(Boolean);
+function rememberXrName(xrId, name) {
+    const id = String(xrId || '').toUpperCase();
+    const n = String(name || '').trim();
+    if (!id || !n) return;
+    // Prevent placeholder labels from becoming real names
+    const lower = n.toLowerCase();
+    if (lower === 'xr-web') return;
+    if (lower === 'androidxr') return;
+    if (lower === 'peer') return;
+
+    // Avoid storing obvious IDs as names
+    if (/^XR-\d+$/i.test(n)) return;
+    if (/^Desktop\d+$/i.test(n)) return;
+
+    xrNameById.set(id, n);
+}
+
+function fullNameForXrId(xrId) {
+    const id = String(xrId || '').toUpperCase();
+    return id ? (xrNameById.get(id) || '') : '';
+}
+
+// UI-only display filter: NEVER show XR-#### or Desktop####
+// If name not known yet, show neutral label
+function displayNameFor(xrId, fallback) {
+    if (!xrId) return 'Peer';
+
+    // 1️⃣ Always prefer real full name
+    const name = String(fullNameForXrId(xrId) || '').trim();
+    if (
+        name &&
+        name !== 'Peer' &&
+        !/^XR-\d+$/i.test(name) &&
+        !/^Desktop\d+$/i.test(name) &&
+        name !== 'XR-Web' &&
+        name !== 'AndroidXR'
+    ) {
+        return name;
+    }
+
+    // 2️⃣ Fallback handling (strict filtering)
+    const fb = String(fallback || '').trim();
+
+    if (
+        !fb ||
+        fb === 'Peer' ||
+        /^XR-\d+$/i.test(fb) ||
+        /^Desktop\d+$/i.test(fb) ||
+        fb === 'XR-Web' ||
+        fb === 'AndroidXR'
+    ) {
+        return xrId; // safe final fallback
+    }
+
+    return fb;
+}
+
+
+function preferDesktop(listPairsOrPayload) {
+
+    // ✅ Accept BOTH formats:
+    // A) old: [[nameOrLabel, xrId], ...]
+    // B) new: { roomId, devices: [{ xrId, fullName, deviceName, ...}, ...] }
+
+    const safePairs = Array.isArray(listPairsOrPayload)
+        ? listPairsOrPayload
+        : (Array.isArray(listPairsOrPayload?.devices)
+            ? listPairsOrPayload.devices.map(d => [
+                (d?.fullName || d?.full_name || ''),   // ✅ only fullName
+                (d?.xrId || '')
+            ])
+            : []);
+
+    // Build XR-ID -> FullName map (UI only)
+    try {
+
+        for (const p of safePairs) {
+            const name = String(p?.[0] || '').trim();
+            const id = String(p?.[1] || '').trim();
+
+            if (!id) continue;
+
+            // 🚫 Do NOT store junk labels
+            if (
+                !name ||
+                name === 'Peer' ||
+                /^XR-\d+/i.test(name) ||
+                /^Desktop\d+/i.test(name) ||
+                name === 'XR-Web' ||
+                name === 'AndroidXR'
+            ) {
+                continue;
+            }
+
+            rememberXrName(id, name);
+        }
+    } catch { }
+
+    const ids = safePairs.map(p => String(p?.[1] || '').toUpperCase()).filter(Boolean);
+
     connectedDesktops = [];
 
     // ✅ Option B: if paired desktop known, prefer ONLY that one (strict one-to-one)
     if (pairedDesktopId && ids.includes(String(pairedDesktopId).toUpperCase())) {
         connectedDesktops.push(String(pairedDesktopId).toUpperCase());
     } else if (ids.includes(String(DEFAULT_DESKTOP_ID).toUpperCase())) {
-        // fallback keeps old behavior for XR-1238 demo pairing
         connectedDesktops.push(String(DEFAULT_DESKTOP_ID).toUpperCase());
     } else {
         connectedDesktops.push(...ids);
@@ -516,6 +648,7 @@ function preferDesktop(listPairs) {
     persistedState.connectedDesktops = connectedDesktops.slice();
     saveState();
 }
+
 
 
 
@@ -537,6 +670,27 @@ function createSignaling() {
             console.log('[VISION DEVICE] ✅ Connected - Socket ID:', signaling?.socket?.id);
             console.log('[VISION DEVICE] ✅ onPlayAudio handler registered:', !!signaling.listener?.onPlayAudio);
             console.log('[VISION DEVICE] ✅ Socket play_audio listeners:', signaling?.socket?.listeners('play_audio')?.length || 0);
+
+            // ✅ Seed fullName map from authoritative device_list payload
+            // (UI-only; does NOT affect pairing, routing, Redis, or WebRTC)
+            try {
+                if (!signaling._nameSeedHooked && signaling?.socket?.on) {
+                    signaling._nameSeedHooked = true;
+
+                    signaling.socket.on('device_list', (payload) => {
+                        try {
+                            const devices = Array.isArray(payload?.devices) ? payload.devices : [];
+                            for (const d of devices) {
+                                const id = String(d?.xrId || '').trim().toUpperCase();
+                                const nm = String(d?.fullName || d?.full_name || d?.name || '').trim();
+                                if (id && nm) {
+                                    rememberXrName(id, nm);
+                                }
+                            }
+                        } catch { }
+                    });
+                }
+            } catch { }
 
             // start 12s telemetry
             telemetry = new TelemetryReporter({
@@ -596,10 +750,11 @@ function createSignaling() {
             signaling.currentDesktopId = other || null;
 
             if (other) {
-                msg('System', `🎯 Paired with Desktop [${other}] in room ${payload?.roomId || ''}`);
+                msg('System', `🎯 Paired with ${displayNameFor(other, null)}.`);
             } else {
-                msg('System', `🎯 Room joined: ${payload?.roomId || ''}`);
+                msg('System', `🎯 Room joined.`);
             }
+
         },
 
         // Same "signal" handling as MainActivity.kt
@@ -811,7 +966,7 @@ function createSignaling() {
 
             const shown = (pairedDesktopId || DEFAULT_DESKTOP_ID);
             if (isServerConnected && shown && connectedDesktops.map(x => x.toUpperCase()).includes(shown.toUpperCase()) && !hadBefore) {
-                msg('System', `System [${ANDROID_XR_ID}] sees Desktop [${shown}] online.`);
+                msg('System', `${displayNameFor(shown, null)} is online.`);
             }
 
             if (!hadDesktops && streamActive) {
@@ -829,7 +984,7 @@ function createSignaling() {
                 const id = (payload?.xrId || '').toUpperCase();
                 const expected = (pairedDesktopId || DEFAULT_DESKTOP_ID).toUpperCase();
                 if (id === expected) {
-                    msg('System', `Desktop [${expected}] left the room (${payload?.roomId || ''}).`);
+                    msg('System', `${displayNameFor(expected, null)} left the room.`);
                     connectedDesktops = connectedDesktops.filter(x => x.toUpperCase() !== expected);
                     if (streamActive) {
                         streamActive = false;
@@ -843,7 +998,7 @@ function createSignaling() {
 
             if (event === 'desktop_disconnected') {
                 const id = (payload?.xrId || DEFAULT_DESKTOP_ID).toUpperCase();
-                msg('System', `Desktop [${id}] disconnected.`);
+                msg('System', `${displayNameFor(id, null)} disconnected.`);
                 connectedDesktops = connectedDesktops.filter(x => x.toUpperCase() !== id);
                 if (streamActive) {
                     streamActive = false;
@@ -860,10 +1015,13 @@ function createSignaling() {
             const type = payload?.type || '';
             if (type === 'transcript') return;
 
-            const sender = payload?.sender || payload?.from || 'server';
+            const rawSender = payload?.sender || payload?.from || 'server';
+
             const text = payload?.text || payload?.message || payload?.data || JSON.stringify(payload);
             const timestamp = payload?.timestamp || nowIso();
             const xrId = payload?.xrId || (payload?.from || 'server');
+            const sender = displayNameFor(xrId, null);
+
             const urgent = !!(payload?.urgent || (payload?.priority === 'urgent'));
 
             appendMessage(elMsgList, new Message({ sender, text, timestamp, xrId, urgent }));
@@ -930,6 +1088,8 @@ elBtnConnect.addEventListener('click', async () => {
         hadDesktops = false;
 
         // NEW: true manual disconnect (disables reconnection)
+        // ✅ Prevent auto-connect after the upcoming auto-reload
+        try { localStorage.setItem(SKIP_AUTO_KEY, '1'); } catch { }
         if (typeof signaling?.disconnect === 'function') signaling.disconnect('user');
         else if (typeof signaling?.close === 'function') signaling.close();
 
@@ -946,7 +1106,7 @@ elBtnConnect.addEventListener('click', async () => {
         pairedDesktopId = null;
 
         // Clear the input back to blank
-        if (elDeviceXrIdInput) elDeviceXrIdInput.value = '';
+        // if (elDeviceXrIdInput) elDeviceXrIdInput.value = '';
 
         // Clear local UI state (do NOT delete per-XR localStorage history)
         connectedDesktops = [];
@@ -981,6 +1141,7 @@ elBtnConnect.addEventListener('click', async () => {
 
         ANDROID_XR_ID = normalized;          // will be XR-1234
         window.XR_DEVICE_ID = ANDROID_XR_ID;
+        try { sessionStorage.setItem(LAST_XR_UI_KEY, ANDROID_XR_ID); } catch { }
 
         // Load per-XR persisted state ONLY after explicit Connect
         // Reset in-memory state first
@@ -1019,7 +1180,7 @@ elBtnConnect.addEventListener('click', async () => {
         clearLegacyLocalXrId();
 
 
-        msg('System', `Using XR Device ID [${ANDROID_XR_ID}].`);
+        msg('System', 'Connected as XR Device.');
     }
 
     // Not connected → connect
@@ -1388,19 +1549,26 @@ elBtnSend.addEventListener('click', () => {
         msg('System', 'Message not sent - no desktops connected');
         return;
     }
+
     const timestamp = nowIso();
+
+    // ✅ Get real full name safely
+    const myFullName = fullNameForXrId(ANDROID_XR_ID) || '';
+
     for (const targetId of connectedDesktops) {
         emitSafe('message', {
             type: 'message',
             text,
-            sender: 'AndroidXR',
-            xrId: ANDROID_XR_ID,
+            sender: myFullName,      // display identity
+            xrId: ANDROID_XR_ID,     // routing identity
+            fullName: myFullName,    // explicit name field
             timestamp,
             urgent,
             to: targetId,
             from: ANDROID_XR_ID
         });
     }
+
     elMsgInput.value = '';
     elChkUrgent.checked = false;
 });
@@ -1458,21 +1626,65 @@ try {
 } finally {
     _rehydrating = false;
 }
-
 // reflect UI state
 setStatus(false);
 msg('System', "Disconnected. Tap 'Connect' or say 'connect' to join the server.");
 
-
 // Load XR Device permissions once and apply read-only UI if needed
 if (typeof window !== 'undefined') {
     loadDevicePermissionsOnce()
-        .then(() => {
+        .then(async () => {
             applyDeviceReadOnlyUI();
+
+            // ✅ Restore last XR ID for display (even when skipping auto-connect)
+            try {
+                if (elDeviceXrIdInput && !elDeviceXrIdInput.value.trim()) {
+                    const last = sessionStorage.getItem(LAST_XR_UI_KEY) || '';
+                    if (last) elDeviceXrIdInput.value = last;
+                }
+            } catch { }
+
+            // ✅ If user manually disconnected, skip auto-connect ONCE after reload
+            try {
+                const skip = localStorage.getItem(SKIP_AUTO_KEY);
+                if (skip === '1') {
+                    console.log('[AUTO-XR][DEVICE] Skipping auto-connect after manual disconnect.');
+                    localStorage.removeItem(SKIP_AUTO_KEY);
+                    return;
+                }
+            } catch { }
+
+            // =========================
+            // AUTO CONNECT (cold open)
+            // =========================
+            try {
+                if (xrDevicePermissions && !xrDevicePermissions.write) {
+                    console.log('[AUTO-XR][DEVICE] Read-only user; skipping auto-connect.');
+                    return;
+                }
+
+                const existing = (elDeviceXrIdInput?.value || '').trim();
+                if (!existing) {
+                    const xrFromSession = await fetchLoggedInXrIdFromSession();
+                    if (xrFromSession) {
+                        elDeviceXrIdInput.value = xrFromSession;
+                        try { sessionStorage.setItem(LAST_XR_UI_KEY, xrFromSession); } catch { }
+                        console.log('[AUTO-XR][DEVICE] Filled XR ID from session:', xrFromSession);
+                    } else {
+                        console.log('[AUTO-XR][DEVICE] No xrId in session (or not logged in). Manual entry stays.');
+                        return;
+                    }
+                }
+
+                if (!(elDeviceXrIdInput?.value || '').trim()) return;
+
+                console.log('[AUTO-XR][DEVICE] Auto-clicking Connect (reuses existing logic).');
+                elBtnConnect.click();
+            } catch (e) {
+                console.warn('[AUTO-XR][DEVICE] Auto-connect skipped:', e);
+            }
         })
         .catch((err) => {
             console.warn('[XRDEVICE] Permission bootstrap failed:', err);
         });
 }
-
-
