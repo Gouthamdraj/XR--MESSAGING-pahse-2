@@ -27,30 +27,62 @@ function normalizeXrId(raw) {
 // Auto XR-ID fetch (Platform session -> /device UI)
 // =======================
 async function fetchLoggedInXrIdFromSession() {
-    try {
-        const res = await fetch('/api/platform/me', {
-            method: 'GET',
-            credentials: 'include',
-            headers: { 'Accept': 'application/json' }
-        });
+    const MAX_ATTEMPTS = 3;
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-        if (!res.ok) return null;
-
-        const data = await res.json();
-        // ✅ NEW: Seed fullName into UI map
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
-            const myFullName = (data?.fullName || data?.full_name || data?.name || '').trim();
-            const myXrId = (data?.xrId || '').trim();
-            if (myFullName && myXrId) {
-                rememberXrName(myXrId, myFullName);
+            const res = await fetch('/api/platform/me', {
+                method: 'GET',
+                credentials: 'include',
+                cache: 'no-store', // ✅ prevent first-load cache issue
+                headers: {
+                    'Accept': 'application/json',
+                    'Cache-Control': 'no-cache'
+                }
+            });
+
+            // If session not ready yet (sometimes 401 on first load), retry
+            if (!res.ok) {
+                if ((res.status === 401 || res.status === 403) && attempt < MAX_ATTEMPTS) {
+                    await sleep(400 * attempt); // small retry delay
+                    continue;
+                }
+                return null;
             }
-        } catch { }
-        const xr = (data?.xrId || '').trim();
-        return xr ? xr : null;
-    } catch (e) {
-        console.warn('[AUTO-XR][DEVICE] Failed to fetch /api/platform/me:', e);
-        return null;
+
+            const data = await res.json();
+
+            // ✅ Keep your existing fullName seeding
+            try {
+                const myFullName = (data?.fullName || data?.full_name || data?.name || '').trim();
+                const myXrId = (data?.xrId || '').trim();
+                if (myFullName && myXrId) {
+                    rememberXrName(myXrId, myFullName);
+                }
+            } catch { }
+
+            const xr = (data?.xrId || '').trim();
+
+            // If response is OK but xrId missing briefly, retry
+            if (!xr && attempt < MAX_ATTEMPTS) {
+                await sleep(400 * attempt);
+                continue;
+            }
+
+            return xr || null;
+
+        } catch (e) {
+            if (attempt < MAX_ATTEMPTS) {
+                await sleep(400 * attempt);
+                continue;
+            }
+            console.warn('[AUTO-XR][DEVICE] Failed to fetch /api/platform/me:', e);
+            return null;
+        }
     }
+
+    return null;
 }
 
 
@@ -246,9 +278,9 @@ let recordingActive = false;
 let noteBuffer = '';
 let lastPartialSentAt = 0;
 
-// battery push timer (90s)
+// battery push timer (5s)
 let batteryTimer = null;
-const BATTERY_PUSH_MS = 90_000;
+const BATTERY_PUSH_MS = 5_000;   // 5 seconds
 
 // ----------------- Helpers -----------------
 function nowIso() { return new Date().toISOString(); }
@@ -1089,7 +1121,7 @@ elBtnConnect.addEventListener('click', async () => {
 
         // NEW: true manual disconnect (disables reconnection)
         // ✅ Prevent auto-connect after the upcoming auto-reload
-        try { localStorage.setItem(SKIP_AUTO_KEY, '1'); } catch { }
+        try { sessionStorage.setItem(SKIP_AUTO_KEY, '1'); } catch { }
         if (typeof signaling?.disconnect === 'function') signaling.disconnect('user');
         else if (typeof signaling?.close === 'function') signaling.close();
 
@@ -1643,13 +1675,13 @@ if (typeof window !== 'undefined') {
                     if (last) elDeviceXrIdInput.value = last;
                 }
             } catch { }
-
             // ✅ If user manually disconnected, skip auto-connect ONCE after reload
             try {
-                const skip = localStorage.getItem(SKIP_AUTO_KEY);
+                try { localStorage.removeItem(SKIP_AUTO_KEY); } catch { } // cleanup old buggy storage
+                const skip = sessionStorage.getItem(SKIP_AUTO_KEY);
                 if (skip === '1') {
                     console.log('[AUTO-XR][DEVICE] Skipping auto-connect after manual disconnect.');
-                    localStorage.removeItem(SKIP_AUTO_KEY);
+                    sessionStorage.removeItem(SKIP_AUTO_KEY);
                     return;
                 }
             } catch { }

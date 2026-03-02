@@ -4,6 +4,7 @@
 console.log('[INIT] Initializing DOM elements');
 const videoElement = document.getElementById('xrVideo');
 const statusElement = document.getElementById('status');
+const batteryElement = document.getElementById('dockBatteryLabel'); // (or 'battery' if you use that id)
 const deviceListElement = document.getElementById('deviceList');
 const messageInput = document.getElementById('messageInput');
 const sendButton = document.getElementById('sendButton');
@@ -519,6 +520,24 @@ function setStatus(status) {
     }
 }
 
+// ---------------- Battery label (Dock only) ----------------
+function setBattery(pct, charging) {
+    if (!batteryElement) return;
+
+    const n = Number(pct);
+    if (!Number.isFinite(n) || n < 0) {
+        batteryElement.textContent = 'Battery: --%';
+        return;
+    }
+
+    const bolt = charging ? ' ⚡' : '';
+    batteryElement.textContent = `Battery: ${Math.round(n)}%${bolt}`;
+}
+
+function clearBattery() {
+    if (!batteryElement) return;
+    batteryElement.textContent = 'Battery: --%';
+}
 
 
 // ---- Heartbeat helpers ----
@@ -706,6 +725,7 @@ function initSocket() {
         // ✅ IMPORTANT: clear UI, don’t re-render stale server list while disconnected
         lastDeviceList = [];
         updateDeviceList([]);
+        clearBattery(); // ✅ reset battery UI on disconnect
 
         announcePresence('idle');
 
@@ -776,6 +796,36 @@ function initSocket() {
             len: devices.length
         });
         updateDeviceList(devices);
+    });
+
+    // --- live battery updates (pair isolated) ---
+    socket.on('battery_update', (u = {}) => {
+        // expected: { xrId, pct, charging, ts } (sometimes batteryPct)
+        const id = normalizeId(u?.xrId);
+
+        // If we're not in a room, ignore (keeps Option B isolation)
+        if (!currentRoom || !id) return;
+
+        // ✅ If pairedPeerId not ready yet, auto-heal it from first battery packet
+        // This prevents "battery only updates when /device is opened/focused"
+        if (!pairedPeerId) {
+            pairedPeerId = u?.xrId;
+        }
+
+        const peerNorm = normalizeId(pairedPeerId);
+
+        // Strict isolation: only show battery for MY paired peer while I am in a room
+        if (!peerNorm) return;
+        if (id !== peerNorm) return;
+
+        // ✅ Accept pct from either field name
+        const pct = (typeof u?.pct === 'number')
+            ? u.pct
+            : (typeof u?.batteryPct === 'number' ? u.batteryPct : null);
+
+        if (pct == null) return;
+
+        setBattery(pct, !!u?.charging);
     });
 
     socket.on('control', handleControlCommand);
@@ -885,6 +935,7 @@ function initSocket() {
 
             // ✅ do NOT reuse lastDeviceList here
             updateDeviceList([]);
+            clearBattery(); // ✅ NEW: reset Dock battery when peer leaves
 
             // optional: only if connected
             if (socket?.connected) {
@@ -1603,6 +1654,21 @@ function updateDeviceList(devices) {
     }
 
     const peerId = pairedPeerId;
+    // // ---------------- Dock Battery Update (pair isolated) ----------------
+    // if (currentRoom && peerId) {
+    //     const peerNorm = normalizeId(peerId);
+    //     const peerDevice = devices.find(d => normalizeId(d?.xrId) === peerNorm);
+
+    //     if (peerDevice) {
+    //         setBattery(peerDevice.battery, peerDevice.charging);
+    //     } else {
+    //         // Peer not yet in list (race / reconnect)
+    //         clearBattery();
+    //     }
+    // } else {
+    //     // Not paired -> no provider battery
+    //     clearBattery();
+    // }
 
     // Restrict only after room_joined + peer known
     const wantOnlyPair = !!(currentRoom && peerId);
