@@ -1,0 +1,7 @@
+{
+  "rewrites": [
+    { "source": "/", "destination": "/views/index.html" },
+    { "source": "/device", "destination": "/views/device.html" },
+    { "source": "/platform", "destination": "/views/platform.html" }
+  ]
+}
